@@ -10,6 +10,7 @@ from lxml import etree
 from utils import (
     extract_track_number,
     extract_track_duration,
+    extract_still_image_time,
     read_file,
     enrich_fname,
     atomic_write,
@@ -124,6 +125,20 @@ class Muxer:
             semantic_attrib = item.attrib[const.ITEM_SEMANTIC]
             if semantic_attrib == semantic:
                 item.set(attribute, value)
+
+    def set_microvideo_tags(self, video_length: int):
+        """Legacy Google "MicroVideo" tags, read by older Google Photos/Gallery builds and
+        third-party viewers. MicroVideoOffset is the number of bytes from the END of the
+        file back to the start of the video, i.e. the length of the video item (the video
+        is the last item in the file, followed only by the Samsung trailer)."""
+        description = self.xmp.find(".//rdf:Description", const.NAMESPACES)
+        description.set(const.GCAMERA_MICROVIDEO, "1")
+        description.set(const.GCAMERA_MICROVIDEO_VERSION, "1")
+        description.set(const.GCAMERA_MICROVIDEO_OFFSET, str(video_length))
+        description.set(
+            const.GCAMERA_MICROVIDEO_TIMESTAMP_US,
+            description.get(const.GCAMER_TIMESTAMP_US, "-1"),
+        )
 
     def __validate_extension(self, fpath, metadata: dict = None) -> str:
         extension = Path(fpath).suffix
@@ -248,6 +263,7 @@ class Muxer:
                     "-n",
                     "-QuickTime:StillImageTime",
                     "-QuickTime:TrackDuration",
+                    "-SampleTime",
                     f"{self.video_fpath}",
                 ]
             )
@@ -256,7 +272,11 @@ class Muxer:
                 track_number = extract_track_number(result)
                 self.logger.info("Live Photo keyframe track number: %s", track_number)
 
-                track_duration = extract_track_duration(track_number, result)
+                # Prefer the time of the still-image-time sample (the key frame); the
+                # duration of that metadata track is only the fallback.
+                track_duration = extract_still_image_time(track_number, result)
+                if track_duration is None:
+                    track_duration = extract_track_duration(track_number, result)
                 self.logger.info("Live Photo keyframe: %sus", track_duration)
                 
                 self.xmp.find(".//rdf:Description", const.NAMESPACES).set(
@@ -278,6 +298,8 @@ class Muxer:
                 
             self.change_xmpresource(str(samsung_tail.get_video_size()), attribute=const.ITEM_LENGTH, semantic="MotionPhoto")
             self.change_xmpresource(str(samsung_tail.get_image_padding()), attribute=const.ITEM_PADDING, semantic="Primary")
+            if image_type == "jpg":
+                self.set_microvideo_tags(samsung_tail.get_video_size())
 
             xmp_updated = self.output_fpath + ".XMP"
             self._tmp_files.append(xmp_updated)

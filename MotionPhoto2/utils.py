@@ -19,6 +19,19 @@ def extract_track_number(metadata: str) -> str:
     return find.group(1)
 
 
+def extract_still_image_time(track_number: str, metadata: str):
+    """Presentation time (microseconds, as str) of the Live Photo key frame: the
+    SampleTime of the still-image-time sample in the exiftool -X output, which
+    exiftool lists just before that sample's own tags. None if not available."""
+    find = re.search(rf"<Track{track_number}:StillImageTime>-1<", metadata)
+    if find is None:
+        return None
+    times = re.findall(r"<(?:Track\d+|QuickTime):SampleTime>(\d+\.?\d*)<", metadata[:find.start()])
+    if not times:
+        return None
+    return str(round(float(times[-1]) * 1000000))
+
+
 def extract_track_duration(track_number: str, metadata: str) -> str:
     find = re.search(rf"\s*<Track{track_number}:TrackDuration>(\d+\.?\d*)<", metadata)
     track_duration = find.group(1)

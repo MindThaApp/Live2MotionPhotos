@@ -54,6 +54,10 @@ ITEM_SEMANTIC = "{" + NAMESPACES["Item"] + "}Semantic"
 ITEM_MIME = "{" + NAMESPACES["Item"] + "}Mime"
 ITEM_LENGTH = "{" + NAMESPACES["Item"] + "}Length"
 ITEM_PADDING = "{" + NAMESPACES["Item"] + "}Padding"
+GCAMERA_MICROVIDEO = "{" + NAMESPACES["GCamera"] + "}MicroVideo"
+GCAMERA_MICROVIDEO_VERSION = "{" + NAMESPACES["GCamera"] + "}MicroVideoVersion"
+GCAMERA_MICROVIDEO_OFFSET = "{" + NAMESPACES["GCamera"] + "}MicroVideoOffset"
+GCAMERA_MICROVIDEO_TIMESTAMP_US = "{" + NAMESPACES["GCamera"] + "}MicroVideoPresentationTimestampUs"
 GCAMER_TIMESTAMP_US = "{" + NAMESPACES["GCamera"] + "}MotionPhotoPresentationTimestampUs"
 
 MPVD_BOX_SIZE = 8
