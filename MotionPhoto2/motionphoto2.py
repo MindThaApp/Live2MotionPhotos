@@ -584,6 +584,10 @@ def main():
             ).mux()
 
 if __name__ == "__main__":
+    # Cancel from the web UI sends SIGTERM: exit normally so temp files are removed
+    # and the exiftool helper is shut down instead of being orphaned.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     if len(sys.argv) == 1:
         try:
             from gooey import Gooey

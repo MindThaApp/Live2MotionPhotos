@@ -73,6 +73,7 @@ class RunState:
         self.history: list = []
         self.skipped_files: list = []      # full paths of already-muxed photos
         self.input_dir: str = ""
+        self.cancel_requested = False
 
     def start(self, trigger: str) -> bool:
         with self._lock:
@@ -84,6 +85,7 @@ class RunState:
             self.lines = []
             self.stats = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
             self.skipped_files = []
+            self.cancel_requested = False
             return True
 
     def emit(self, raw: str):
@@ -408,6 +410,35 @@ def build_cmd(cfg: dict) -> list:
     return cmd
 
 
+def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
+    """Stop the MotionPhoto2 child and everything it started (notably its
+    exiftool helper) so cancelling leaves no orphans."""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        # /T = the whole tree; the child gets no chance to clean up on Windows
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                       capture_output=True, check=False)
+        return
+    import signal
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)       # lets the muxer clean up its temp files
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)       # anything still in the group (exiftool)
+    except ProcessLookupError:
+        pass
+
+
 def do_run(trigger: str = "manual"):
     if not run_state.start(trigger):
         return
@@ -423,11 +454,16 @@ def do_run(trigger: str = "manual"):
     try:
         # utf-8 + errors="replace": the child forces UTF-8 output, and non-ASCII
         # (e.g. Windows) filenames must not abort the read loop.
+        # Own process group/session so cancel can take down the whole tree.
+        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" \
+            else {"start_new_session": True}
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, **group,
         )
         run_state.process = proc
+        if run_state.cancel_requested:   # cancelled before the process existed
+            kill_process_tree(proc)
         for raw in proc.stdout:
             run_state.emit(raw.rstrip())
         proc.wait()
@@ -574,9 +610,11 @@ def api_run():
 
 @app.post("/api/cancel")
 def api_cancel():
-    proc = run_state.process
-    if proc:
-        proc.terminate()
+    if run_state.running:
+        run_state.cancel_requested = True
+        proc = run_state.process
+        if proc:
+            kill_process_tree(proc)
         return {"ok": True}
     return JSONResponse({"error": "Not running"}, status_code=400)
 
