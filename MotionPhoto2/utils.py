@@ -1,10 +1,8 @@
 import exiftool
 import json
-import logging
 import os
 import re
 import shutil
-import struct
 import tempfile
 
 from pathlib import Path

@@ -8,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "MotionPhoto2"))
 pytest.importorskip("exiftool")
 pytest.importorskip("lxml")
 
-from lxml import etree  # noqa: E402
 
 import constants as const  # noqa: E402
 import utils  # noqa: E402
