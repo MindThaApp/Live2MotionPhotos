@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,12 @@ DEFAULT_CONFIG = {
 
 WATCH_EXTS = {".heic", ".jpeg", ".jpg", ".mov", ".mp4"}
 
+# The run log kept in memory (and replayed to the browser) is capped to the most
+# recent lines; set LIVE2MOTION_LOG_FILE (or "log_file" in config.json) to also
+# keep the complete log on disk in a size-rotated file.
+MAX_LOG_LINES = int(os.environ.get("LIVE2MOTION_MAX_LOG_LINES") or 5000)
+LOG_FILE_BYTES = 5 * 1024 * 1024
+
 
 # ─── Shared run state ─────────────────────────────────────────────────────────
 
@@ -68,12 +75,15 @@ class RunState:
         self.process: Optional[subprocess.Popen] = None
         self.trigger: Optional[str] = None
         self.start_time: Optional[str] = None
-        self.lines: list = []
+        self.lines: deque = deque(maxlen=MAX_LOG_LINES)   # most recent lines only
+        self.line_total = 0                                # lines emitted so far (absolute index of the next one)
         self.stats: dict = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
         self.history: list = []
+        self.cancel_requested = False
+        self._file_log: Optional[logging.Logger] = None
+        self._file_log_path = ""
         self.skipped_files: list = []      # full paths of already-muxed photos
         self.input_dir: str = ""
-        self.cancel_requested = False
 
     def start(self, trigger: str) -> bool:
         with self._lock:
@@ -82,16 +92,52 @@ class RunState:
             self.running = True
             self.trigger = trigger
             self.start_time = datetime.now().isoformat()
-            self.lines = []
+            self.lines.clear()
+            self.line_total = 0
+            self.cancel_requested = False
             self.stats = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
             self.skipped_files = []
-            self.cancel_requested = False
             return True
 
+    def read_from(self, cursor: int):
+        """Lines at absolute index >= cursor that are still buffered, as
+        [(index, line)], the next cursor, and a stats copy. A reader that fell
+        behind the ring buffer silently skips to the oldest line kept."""
+        with self._lock:
+            first = self.line_total - len(self.lines)
+            cursor = max(cursor, first)
+            items = [(first + i, l) for i, l in enumerate(self.lines) if first + i >= cursor]
+            return items, self.line_total, dict(self.stats)
+
+    def _write_file_log(self, line: str):
+        path = os.environ.get("LIVE2MOTION_LOG_FILE") or load_config().get("log_file")
+        if not path:
+            return
+        try:
+            if self._file_log is None or self._file_log_path != path:
+                from logging.handlers import RotatingFileHandler
+                lg = logging.getLogger("live2motion.run")
+                lg.handlers.clear()
+                lg.propagate = False
+                lg.setLevel(logging.INFO)
+                h = RotatingFileHandler(path, maxBytes=LOG_FILE_BYTES, backupCount=3, encoding="utf-8")
+                h.setFormatter(logging.Formatter("%(message)s"))
+                lg.addHandler(h)
+                self._file_log, self._file_log_path = lg, path
+            self._file_log.info(line)
+        except OSError:
+            self._file_log = None   # unwritable path: keep running without a file
+
     def emit(self, raw: str):
+        with self._lock:
+            self._emit(raw)
+
+    def _emit(self, raw: str):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {raw}"
         self.lines.append(line)
+        self.line_total += 1
+        self._write_file_log(line)
         rawl = raw.lower()
         if re.match(r"=+\[", raw):
             m = re.search(r"\[(\d+)/(\d+)\]", raw)
@@ -143,7 +189,7 @@ class RunState:
             "trigger": self.trigger,
             "start_time": self.start_time,
             "stats": dict(self.stats),
-            "line_count": len(self.lines),
+            "line_count": self.line_total,
             "history": list(self.history),
         }
 
@@ -160,7 +206,7 @@ CONFIG_TYPES = {k: type(v) for k, v in DEFAULT_CONFIG.items()}
 MAX_STR_LEN = 4096
 
 # Server-side settings that live only in config.json / environment and are never
-# exposed or changed through the API: "host", "access_token", "browse_roots".
+# exposed or changed through the API: "host", "access_token", "browse_roots", "log_file".
 
 
 def load_config() -> dict:
@@ -641,19 +687,14 @@ async def api_progress(request: Request, from_line: int = 0):
                 break
 
             # Drain any new lines
-            lines = run_state.lines
-            while cursor < len(lines):
-                payload = json.dumps({
-                    "line": lines[cursor],
-                    "index": cursor,
-                    "stats": dict(run_state.stats),
-                })
-                yield f"data: {payload}\n\n"
-                cursor += 1
+            items, next_cursor, stats = run_state.read_from(cursor)
+            for index, line in items:
+                yield f"data: {json.dumps({'line': line, 'index': index, 'stats': stats})}\n\n"
+            cursor = next_cursor
 
             if run_state.running:
                 was_running = True
-            elif was_running and cursor >= len(run_state.lines):
+            elif was_running and cursor >= run_state.line_total:
                 # Run ended and all lines delivered
                 payload = json.dumps({
                     "done": True,
