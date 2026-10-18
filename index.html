@@ -66,6 +66,8 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .flag input[type=checkbox]{width:13px;height:13px;accent-color:var(--accent);cursor:pointer;flex-shrink:0}
 .flag .fn{font-size:13px;flex:1}
 .flag .ft{font-size:10px;color:var(--muted);font-family:var(--mono)}
+#video_removal_opts{cursor:default}
+#video_removal_opts select,#video_removal_opts input[type=text]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)}
 
 /* ── Tooltip system ── */
 #tooltip{
@@ -340,8 +342,19 @@ tr:hover td{background:var(--surface2)}
           <input type="checkbox" id="delete_video">
           <span class="fn">Delete Video After Mux</span>
           <span class="ft">-dv</span>
-          <span class="tip-icon" data-tip="Remove the original .MOV video file after it has been embedded into the Motion Photo. Frees up disk space. This cannot be undone — only enable if you are confident the mux succeeded.">ⓘ</span>
+          <span class="tip-icon" data-tip="Remove the original .MOV video file after it has been embedded into the Motion Photo. The output is verified first; if verification fails the video is kept. What happens to the file depends on the removal mode below.">ⓘ</span>
         </label>
+
+        <div class="flag" id="video_removal_opts" style="flex-wrap:wrap;gap:6px">
+          <span class="fn">Video Removal Mode</span>
+          <select id="video_removal_mode" onchange="onRemovalModeChange()">
+            <option value="trash">Move to recycle bin</option>
+            <option value="move">Move to a folder</option>
+            <option value="delete">Delete permanently</option>
+          </select>
+          <input type="text" id="video_removal_folder" placeholder="_deleted_videos (inside the input directory)" style="display:none;flex:1;min-width:200px">
+          <div id="video_removal_warn" style="display:none;width:100%;color:#f85149;font-size:12px"></div>
+        </div>
 
         <label class="flag">
           <input type="checkbox" id="keep_temp">
@@ -598,13 +611,22 @@ async function init() {
 async function loadConfig() {
   const c = await fetch('/api/config').then(r => r.json());
   for (const id of ['input_directory','output_directory','recursive','exif_match','incremental_mode',
-      'copy_unmuxed','overwrite','delete_video','keep_temp','no_xmp','verbose',
+      'copy_unmuxed','overwrite','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
       'schedule_enabled','schedule_cron','watch_enabled','watch_debounce']) {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
   }
   syncPreset(c.schedule_cron || '0 2 * * *');
-  checkOverwrite(); checkIncremental(); onScheduleToggle(); onWatchToggle();
+  checkOverwrite(); checkIncremental(); onRemovalModeChange(); onScheduleToggle(); onWatchToggle();
+}
+
+function onRemovalModeChange() {
+  const mode = gv('video_removal_mode');
+  document.getElementById('video_removal_folder').style.display = mode === 'move' ? '' : 'none';
+  const warn = document.getElementById('video_removal_warn');
+  warn.textContent = mode === 'delete'
+    ? 'Warning: videos will be deleted permanently and cannot be recovered. Make sure you have a backup.' : '';
+  warn.style.display = mode === 'delete' ? '' : 'none';
 }
 
 async function saveSettings() {
@@ -625,6 +647,8 @@ function formConfig() {
     copy_unmuxed:     gc('copy_unmuxed'),
     overwrite:        gc('overwrite'),
     delete_video:     gc('delete_video'),
+    video_removal_mode:   gv('video_removal_mode'),
+    video_removal_folder: gv('video_removal_folder').trim(),
     keep_temp:        gc('keep_temp'),
     no_xmp:           gc('no_xmp'),
     verbose:          gc('verbose'),

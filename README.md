@@ -183,10 +183,22 @@ sudo systemctl enable --now live2motion
 | Incremental Mode | `-im` | Skip files already converted. Requires an Output Directory |
 | Copy Unmuxed | `-cu` | Copy non-live photos unchanged to the Output Directory |
 | Overwrite Originals | `-o` | Replace source images in place. No Output Directory needed |
-| Delete Video After Mux | `-dv` | Remove the `.MOV` file after embedding it |
+| Delete Video After Mux | `-dv` | Remove the `.MOV` file after embedding it (only after the output is verified; see below) |
 | Keep Temp Files | `-kt` | Retain temporary files for debugging |
 | Skip XMP Metadata | `-nx` | Do not copy XMP tags to the output |
 | Verbose | `-v` | Detailed per-file log output |
+
+### Video removal
+
+When **Delete Video After Mux** is on, the output is checked first (it exists, is at least image + video in size, and contains the exact video bytes). If the check fails the `.MOV` is kept and a warning is logged. Otherwise the video is removed according to `video_removal_mode`:
+
+| Mode | Behaviour |
+|---|---|
+| `trash` | Send to the OS recycle bin (default outside Docker). If no bin is available it falls back to `move`, never to `delete` |
+| `move` | Move into `video_removal_folder` (default `_deleted_videos` inside the input directory, default in Docker), keeping the relative path. Name clashes get a numeric suffix. The folder is ignored by scans and the file watcher |
+| `delete` | Permanently delete |
+
+The Cleanup tool uses the same mode and only accepts video files inside the input directory. Configs that only have `delete_video` keep working and get the default mode.
 
 ### Schedule
 

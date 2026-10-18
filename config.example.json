@@ -7,6 +7,8 @@
   "copy_unmuxed": false,
   "overwrite": true,
   "delete_video": true,
+  "video_removal_mode": "move",
+  "video_removal_folder": "",
   "keep_temp": false,
   "no_xmp": false,
   "verbose": false,

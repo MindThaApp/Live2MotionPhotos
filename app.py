@@ -22,6 +22,8 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).parent
+sys.path.insert(0, str(BASE_DIR / "MotionPhoto2"))
+import video_removal  # noqa: E402  (shared with the muxer so all video removal goes through one helper)
 CONFIG_FILE = BASE_DIR / "config.json"
 
 # MOTIONPHOTO2_BIN can override with a path to a compiled binary; otherwise
@@ -40,6 +42,8 @@ DEFAULT_CONFIG = {
     "copy_unmuxed": False,
     "overwrite": True,
     "delete_video": False,
+    "video_removal_mode": video_removal.default_mode(),
+    "video_removal_folder": "",   # "move" mode only; empty = <input_directory>/_deleted_videos
     "keep_temp": False,
     "no_xmp": False,
     "verbose": False,
@@ -149,7 +153,10 @@ watch_observer: Optional[Observer] = None
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
-            return {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
+            cfg = {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
+            # Older configs have no mode (or a bad one); fall back to the default
+            cfg["video_removal_mode"] = video_removal.normalize_mode(cfg.get("video_removal_mode"))
+            return cfg
         except Exception:
             pass
     return DEFAULT_CONFIG.copy()
@@ -167,6 +174,10 @@ def build_cmd(cfg: dict) -> list:
         cmd += ["--input-directory", d]
     if d := cfg.get("output_directory"):
         cmd += ["--output-directory", d]
+    if cfg.get("delete_video"):
+        cmd += ["--video-removal-mode", video_removal.normalize_mode(cfg.get("video_removal_mode"))]
+        if cfg.get("video_removal_folder"):
+            cmd += ["--video-removal-folder", cfg["video_removal_folder"]]
     for key, flag in [
         ("recursive",       "--recursive"),
         ("exif_match",      "--exif-match"),
@@ -232,12 +243,15 @@ def apply_schedule(cfg: dict):
 # ─── File watcher ─────────────────────────────────────────────────────────────
 
 class MediaHandler(FileSystemEventHandler):
-    def __init__(self, debounce: int):
+    def __init__(self, debounce: int, skip_folder: Optional[Path] = None):
+        self._skip_folder = skip_folder
         self._debounce = max(debounce, 10)
         self._timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
 
     def _relevant(self, path: str) -> bool:
+        if self._skip_folder and video_removal.is_inside(path, self._skip_folder):
+            return False   # videos moved aside by "move" mode must not retrigger a run
         return Path(path).suffix.lower() in WATCH_EXTS
 
     def on_created(self, event):
@@ -265,7 +279,8 @@ def start_watcher(cfg: dict):
     path = cfg.get("input_directory", "")
     if path and os.path.isdir(path):
         watch_observer = Observer()
-        watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300)), path, recursive=True)
+        skip = video_removal.removal_folder(path, cfg.get("video_removal_folder"))
+        watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300), skip), path, recursive=True)
         watch_observer.start()
 
 
@@ -498,7 +513,9 @@ def _batch_durations(video_paths: list[str]) -> dict[str, float]:
 def _walk_media(input_dir: str) -> tuple[list[str], list[str]]:
     """Recursively collect (photo_paths, video_paths) under input_dir, any subfolder."""
     photo_paths, video_paths = [], []
+    skip = video_removal.removal_folder(input_dir, load_config().get("video_removal_folder"))
     for root, _dirs, files in os.walk(input_dir, followlinks=True):
+        _dirs[:] = [d for d in _dirs if Path(root, d).resolve() != skip]   # don't rescan removed videos
         try:
             for f in files:
                 fp = Path(root) / f
@@ -610,13 +627,18 @@ def api_cleanup_scan():
 
 @app.delete("/api/cleanup")
 async def api_cleanup(request: Request):
-    """Delete a list of video files by path."""
+    """Remove a list of video files by path (inside the input directory only),
+    using the configured video_removal_mode."""
     body = await request.json()
     paths = body.get("paths", [])
+    cfg = load_config()
+    root = cfg.get("input_directory", "")
+    if not root or not Path(root).is_dir():
+        return JSONResponse({"error": "Input directory not configured or not found"}, status_code=400)
     deleted, errors = [], []
     for path in paths:
         try:
-            Path(path).unlink()
+            video_removal.remove_video(path, cfg["video_removal_mode"], root, cfg.get("video_removal_folder"))
             deleted.append(path)
         except Exception as e:
             errors.append({"file": path, "error": str(e)})
