@@ -157,3 +157,23 @@ def test_bad_config_rejected(client, env, bad):
 def test_non_object_config_rejected(client):
     assert client.post("/api/config", json=[1, 2]).status_code == 400
     assert client.post("/api/config", content=b"{nope", headers={"Content-Type": "application/json"}).status_code == 400
+
+
+# ── config paths limited to browse roots ───────────────────────────────────────
+
+@pytest.mark.parametrize("key", ["input_directory", "output_directory", "video_removal_folder"])
+def test_config_paths_outside_roots_rejected(client, env, monkeypatch, key):
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(env / "ok"))
+    (env / "ok").mkdir()
+    r = client.post("/api/config", json=good(**{key: "/etc"}))
+    assert r.status_code == 400 and "outside" in r.json()["error"]
+    assert not (env / "config.json").exists()
+
+
+def test_config_paths_inside_roots_accepted(client, env, monkeypatch):
+    (env / "ok" / "in").mkdir(parents=True)
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(env / "ok"))
+    cfg = good(input_directory=str(env / "ok" / "in"), output_directory="", video_removal_folder="_moved")
+    assert client.post("/api/config", json=cfg).status_code == 200
+    cfg["video_removal_folder"] = "../../elsewhere"
+    assert client.post("/api/config", json=cfg).status_code == 400

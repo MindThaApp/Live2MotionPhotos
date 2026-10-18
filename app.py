@@ -319,6 +319,29 @@ def is_browsable(p: Path, roots: list) -> bool:
     return any(p == r or r in p.parents for r in roots)
 
 
+PATH_CONFIG_KEYS = ("input_directory", "output_directory", "video_removal_folder")
+
+
+def check_config_paths(clean: dict):
+    """Raise ValueError if a folder setting points outside the browse roots, so a
+    forged /api/config call cannot aim a run (or file removal) at e.g. /etc."""
+    roots = browse_roots()
+    base = clean.get("input_directory") or load_config().get("input_directory") or ""
+    for key in PATH_CONFIG_KEYS:
+        value = clean.get(key)
+        if not value:
+            continue
+        p = Path(value).expanduser()
+        if key == "video_removal_folder" and not p.is_absolute() and base:
+            p = Path(base).expanduser() / p     # relative = below the input folder
+        try:
+            p = p.resolve()
+        except (OSError, RuntimeError):
+            raise ValueError(f"'{key}' is not a valid path")
+        if not is_browsable(p, roots):
+            raise ValueError(f"'{key}' is outside the allowed folders")
+
+
 def warn_if_exposed(host: str):
     if host in LOOPBACK_HOSTS or get_token():
         return
@@ -500,6 +523,7 @@ def api_get_config():
 async def api_save_config(request: Request):
     try:
         cfg = validate_config(await request.json())
+        check_config_paths(cfg)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     # Keep server-side settings (host, access_token, browse_roots) the UI can't see
