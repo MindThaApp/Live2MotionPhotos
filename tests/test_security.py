@@ -126,11 +126,16 @@ def good(**kw):
     return {**appmod.DEFAULT_CONFIG, **kw}
 
 
-def test_valid_config_saved_and_server_keys_preserved(client, env):
+def test_valid_config_saved_and_server_keys_preserved(client, env, monkeypatch):
+    # DEFAULT_CONFIG's input_directory is machine specific (/home/<user>/shared), so
+    # pin the browse roots and use a folder inside them: independent of HOME / the CI user.
+    root = env / "photos"
+    root.mkdir()
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(root))
     (env / "config.json").write_text('{"access_token": "abc", "host": "127.0.0.1"}')
     h = {"X-Live2Motion-Token": "abc"}
-    r = client.post("/api/config", json=good(video_removal_mode="move"), headers=h)
-    assert r.status_code == 200
+    r = client.post("/api/config", json=good(input_directory=str(root), video_removal_mode="move"), headers=h)
+    assert r.status_code == 200, r.text
     saved = appmod.json.loads((env / "config.json").read_text())
     assert saved["video_removal_mode"] == "move" and saved["access_token"] == "abc"
 
