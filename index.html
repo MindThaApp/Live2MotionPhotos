@@ -520,6 +520,31 @@ tr:hover td{background:var(--surface2)}
 </div>
 
 <script>
+// ── Access token (only used when the server sets LIVE2MOTION_TOKEN) ───────────
+// Stored in localStorage and sent as a header on every /api call; the user is
+// asked for it the first time the server answers 401.
+const TOKEN_KEY = 'live2motion_token';
+const getToken = () => { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } };
+let tokenPrompt = null, tokenDeclined = false;
+function askToken() {
+  if (!tokenPrompt) tokenPrompt = Promise.resolve().then(() => {
+    const t = prompt('This Live2Motion server needs an access token:');
+    if (t === null || !t.trim()) { tokenDeclined = true; return false; }
+    try { localStorage.setItem(TOKEN_KEY, t.trim()); } catch {}
+    return true;
+  }).finally(() => { tokenPrompt = null; });
+  return tokenPrompt;
+}
+const _fetch = window.fetch.bind(window);
+window.fetch = async (url, opts = {}) => {
+  if (typeof url !== 'string' || !url.startsWith('/api/')) return _fetch(url, opts);
+  const send = () => _fetch(url, {...opts, headers: {...opts.headers, 'X-Live2Motion-Token': getToken()}});
+  let r = await send();
+  if (r.status === 401 && !tokenDeclined && await askToken()) r = await send();
+  return r;
+};
+const escHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 let sse = null, isRunning = false, startedAt = null, tickTimer = null;
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
@@ -559,45 +584,44 @@ function renderCrumb(path, sep) {
   if (sep === '\\') {
     // Windows: "C:\Users\ramin\Photos" -> root "C:\" is not splittable further
     const m = path.match(/^([A-Za-z]:\\)(.*)$/);
-    if (!m) return esc(path);
+    if (!m) return escHtml(path);
     const [, root, rest] = m;
     let acc = root;
-    let html = `<span onclick="browseTo('${escJs(root)}')">${esc(root)}</span>`;
+    let html = `<span onclick="browseTo('${escJs(root)}')">${escHtml(root)}</span>`;
     rest.split('\\').filter(Boolean).forEach(p => {
       acc = joinPath(acc, p, sep);
-      html += ` <span onclick="browseTo('${escJs(acc)}')">${p}</span> \\`;
+      html += ` <span onclick="browseTo('${escJs(acc)}')">${escHtml(p)}</span> \\`;
     });
     return html;
   }
   const parts = path.split('/').filter(Boolean);
   return `<span onclick="browseTo('/')">/</span>` +
-    parts.map((p, i) => ` <span onclick="browseTo('${escJs('/' + parts.slice(0, i + 1).join('/'))}')">${p}</span> /`).join('');
+    parts.map((p, i) => ` <span onclick="browseTo('${escJs('/' + parts.slice(0, i + 1).join('/'))}')">${escHtml(p)}</span> /`).join('');
 }
 async function browseTo(path) {
   const r = await fetch('/api/browse?path=' + encodeURIComponent(path)).then(r => r.json());
   if (r.error) {
     document.getElementById('browser-list').innerHTML =
-      `<div style="padding:12px 16px;color:var(--muted);font-size:12px">${esc(r.error)}: ${esc(path)}</div>`;
+      `<div style="padding:12px 16px;color:var(--muted);font-size:12px">${escHtml(r.error)}: ${escHtml(path)}</div>`;
     return;
   }
   browserPath = r.path;
   document.getElementById('browser-cur-path').textContent = r.path;
   document.getElementById('browser-crumb').innerHTML =
-    r.root_list ? esc(r.path) : renderCrumb(r.path, r.sep);
+    r.root_list ? escHtml(r.path) : renderCrumb(r.path, r.sep);
 
   // List
   const list = document.getElementById('browser-list');
   let html = r.parent ? `<div class="browser-item up" onclick="browseTo('${escJs(r.parent)}')">↑ ..</div>` : '';
   // Windows drive list ("This PC"): entries are already full paths (e.g. "D:\"),
   // not names to join onto the current one.
-  html += r.dirs.map(d => `<div class="browser-item" onclick="browseTo('${escJs(r.root_list ? d : joinPath(r.path, d, r.sep))}')">📁 ${d}</div>`).join('');
+  html += r.dirs.map(d => `<div class="browser-item" onclick="browseTo('${escJs(r.root_list ? d : joinPath(r.path, d, r.sep))}')">📁 ${escHtml(d)}</div>`).join('');
   list.innerHTML = html || '<div style="padding:12px 16px;color:var(--muted);font-size:12px">No subdirectories</div>';
 }
-const esc = s => s.replace(/'/g, "\\'");
 // Windows paths contain backslashes, which must be escaped before the quote
 // escape below, or a trailing "\" (e.g. "D:\") swallows the closing quote in
 // onclick="browseTo('...')" and silently breaks the handler.
-const escJs = s => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+const escJs = s => escHtml(s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r?\n/g, ' '));
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
@@ -678,7 +702,7 @@ async function cancelRun() { await fetch('/api/cancel', {method:'POST'}); }
 // ── SSE ───────────────────────────────────────────────────────────────────────
 function connectSSE(fromLine) {
   if (sse) { sse.close(); sse = null; }
-  sse = new EventSource(`/api/progress?from_line=${fromLine}`);
+  sse = new EventSource(`/api/progress?from_line=${fromLine}&token=${encodeURIComponent(getToken())}`);
   sse.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.done) {
@@ -795,9 +819,9 @@ function renderHistory(h) {
   if (!h.length) return;
   document.getElementById('hist-body').innerHTML = h.map(r => `
     <tr>
-      <td style="color:var(--muted)">${r.time}</td>
-      <td><span class="badge bk-${r.trigger}">${r.trigger}</span></td>
-      <td style="color:var(--muted)">${r.duration}</td>
+      <td style="color:var(--muted)">${escHtml(r.time)}</td>
+      <td><span class="badge bk-${escHtml(r.trigger)}">${escHtml(r.trigger)}</span></td>
+      <td style="color:var(--muted)">${escHtml(r.duration)}</td>
       <td style="color:var(--green)">${r.converted}</td>
       <td style="color:var(--yellow)">${r.skipped ?? 0}</td>
       <td style="color:${r.errors?'var(--red)':'var(--muted)'}">${r.errors}</td>
@@ -906,7 +930,7 @@ function _renderCuResults(d) {
     document.getElementById('cu-filelist').innerHTML = cuVideos.map((v, i) => `
       <div class="cu-file">
         <input type="checkbox" id="cu-f${i}" checked onchange="updateSelCount()">
-        <label for="cu-f${i}" title="${v.path}">${v.name}</label>
+        <label for="cu-f${i}" title="${escHtml(v.path)}">${escHtml(v.name)}</label>
         <span class="cu-fsz">${fmtBytes(v.size)}</span>
       </div>`).join('');
     document.getElementById('cu-select-all').checked = true;
@@ -991,7 +1015,7 @@ async function doDeleteSelected() {
       document.getElementById('cu-filelist').innerHTML = cuVideos.map((v, i) => `
         <div class="cu-file">
           <input type="checkbox" id="cu-f${i}" checked onchange="updateSelCount()">
-          <label for="cu-f${i}" title="${v.path}">${v.name}</label>
+          <label for="cu-f${i}" title="${escHtml(v.path)}">${escHtml(v.name)}</label>
           <span class="cu-fsz">${fmtBytes(v.size)}</span>
         </div>`).join('');
       btn.disabled = false; btn.textContent = 'Delete Selected';

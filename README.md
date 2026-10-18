@@ -61,9 +61,13 @@ No `docker-compose.yml` editing needed — just double-click:
 - **`Start Live2Motion (Docker).bat`** (Windows)
 - **`start-live2motion-docker.sh`** (Linux)
 
-This builds the image, mounts your home folder into the container at `/data` automatically (written to a local `.env` file, not the compose file), starts it in the background, and opens **http://localhost:7000**. From there, use the in-app folder browser to pick the exact photo folder under `/data` — everything is configured through the UI, nothing else to edit.
+The first run asks which photos folder to share (default `~/Pictures`); it is written to a local `.env` file as `HOST_MEDIA` together with your user/group ID, and mounted at `/data` in the container. Only that folder is visible to the app — your whole home folder is no longer mounted. The launcher then builds the image, starts it in the background, and opens **http://localhost:7000**. Use the in-app folder browser to pick the exact folder under `/data`.
 
-If your photos live outside your home folder (a different drive, an external volume), edit `HOST_MEDIA` in `.env` to point there instead — still no `docker-compose.yml` changes required.
+To use a different photos folder later, edit `HOST_MEDIA` in `.env` (an `.env` written by an older launcher may still point at your home folder — change it).
+
+**Permissions.** The container runs as a non-root user whose UID/GID come from `LIVE2MOTION_UID` / `LIVE2MOTION_GID` in `.env` (default 1000; the Linux/macOS launchers write your own `id -u` / `id -g`). That user must be able to write to `HOST_MEDIA` and to `config.json`: if you start with `docker compose` by hand, add those two lines to `.env` (`id -u`, `id -g`), or `chown`/`chmod` the folder for the UID you chose. On Windows/macOS Docker Desktop handles file ownership for you.
+
+**Network access.** The port is published on `127.0.0.1` only, so only the machine running Docker can open the UI. To reach it from other devices, set `LIVE2MOTION_BIND=0.0.0.0` in `.env` and also set `LIVE2MOTION_TOKEN` (see [Security](#security)).
 
 The container keeps running in the background after you close the launcher window (`restart: unless-stopped`). To stop it: `docker compose down`. To update after pulling new code: rerun the launcher (or `docker compose up -d --build`).
 
@@ -119,7 +123,7 @@ This installs both the web app's dependencies and MotionPhoto2's (the vendored `
 venv/bin/python app.py      # Windows: venv\Scripts\python app.py
 ```
 
-Then open **http://your-server-ip:7000** in a browser (port 7000 may already be taken by macOS Control Center on a Mac — use a different port for local dev, see below).
+Then open **http://localhost:7000** in a browser. To reach it from other devices as **http://your-server-ip:7000**, set `LIVE2MOTION_HOST=0.0.0.0` and `LIVE2MOTION_TOKEN` first (see [Security](#security)). (port 7000 may already be taken by macOS Control Center on a Mac — use a different port for local dev, see below).
 
 </details>
 
@@ -233,7 +237,18 @@ Skip detection parses the MotionPhoto2 log output for keywords (`skip`, `already
 
 ### Security
 
-The web UI has no authentication and exposes a folder browser for the server filesystem. It is intended for **trusted local network use only**. Do not expose port 7000 to the internet.
+By default the server listens on `127.0.0.1` (this computer only); in Docker the port is published on `127.0.0.1` only. To make it reachable on your network:
+
+- **Native:** set `LIVE2MOTION_HOST=0.0.0.0` (or `"host": "0.0.0.0"` in `config.json`).
+- **Docker:** set `LIVE2MOTION_BIND=0.0.0.0` in `.env`.
+
+When you do, also set an access token, via `LIVE2MOTION_TOKEN` or `"access_token"` in `config.json`. Every `/api` request must then carry it; the web UI asks for it once and remembers it in the browser. The app prints a warning at startup if it is reachable beyond localhost without a token. With no token and localhost-only, there is no prompt.
+
+Other protections: state-changing requests whose `Origin` doesn't match the `Host` are rejected (CSRF); the folder browser only enters allowed roots (home, the input/output folders and their parents up to two levels, Windows drives; override with `LIVE2MOTION_BROWSE_ROOTS` or `"browse_roots": [...]` in `config.json`) and does not follow symlinks out of them; `/api/config` validates every field; the Docker container runs as non-root. `host`, `access_token` and `browse_roots` can only be set in `config.json`/environment, never through the web UI.
+
+The token travels in plain HTTP on your LAN, so this is for trusted networks. Do not expose port 7000 to the internet; put a TLS reverse proxy in front if you need that.
+
+Development: `pip install -r requirements-dev.txt && pytest`.
 
 ---
 

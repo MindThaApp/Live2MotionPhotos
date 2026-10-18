@@ -2,6 +2,7 @@
 """Live2Motion Photos"""
 
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -12,11 +13,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -150,6 +152,14 @@ watch_observer: Optional[Observer] = None
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
+# Keys the web UI may read/write via /api/config (name -> expected type).
+CONFIG_TYPES = {k: type(v) for k, v in DEFAULT_CONFIG.items()}
+MAX_STR_LEN = 4096
+
+# Server-side settings that live only in config.json / environment and are never
+# exposed or changed through the API: "host", "access_token", "browse_roots".
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
@@ -164,6 +174,163 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def validate_config(data) -> dict:
+    """Return a cleaned copy of a config submitted to /api/config, or raise
+    ValueError with a user-facing message. Unknown keys are rejected."""
+    if not isinstance(data, dict):
+        raise ValueError("Config must be a JSON object")
+    unknown = sorted(set(data) - set(CONFIG_TYPES))
+    if unknown:
+        raise ValueError(f"Unknown config key(s): {', '.join(map(str, unknown))}")
+    clean = {}
+    for key, value in data.items():
+        expected = CONFIG_TYPES[key]
+        if expected is bool:
+            if not isinstance(value, bool):
+                raise ValueError(f"'{key}' must be true or false")
+        elif expected is int:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 86400:
+                raise ValueError(f"'{key}' must be a whole number between 0 and 86400")
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"'{key}' must be a string")
+            if len(value) > MAX_STR_LEN or "\0" in value:
+                raise ValueError(f"'{key}' is too long or contains invalid characters")
+        clean[key] = value
+    if "video_removal_mode" in clean and clean["video_removal_mode"] not in video_removal.MODES:
+        raise ValueError(f"'video_removal_mode' must be one of: {', '.join(video_removal.MODES)}")
+    if clean.get("schedule_cron"):
+        try:
+            CronTrigger.from_crontab(clean["schedule_cron"])
+        except ValueError:
+            raise ValueError("'schedule_cron' is not a valid 5-field cron expression")
+    return clean
+
+
+# ─── Security: bind address, access token, browse roots ──────────────────────
+
+IN_DOCKER = video_removal.in_docker()
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def get_host() -> str:
+    """Address to listen on. Docker needs 0.0.0.0 (the published port is what
+    limits exposure there); native runs default to loopback only."""
+    if IN_DOCKER:
+        return "0.0.0.0"
+    return str(os.environ.get("LIVE2MOTION_HOST") or load_config().get("host") or "127.0.0.1")
+
+
+def get_token() -> str:
+    return str(os.environ.get("LIVE2MOTION_TOKEN") or load_config().get("access_token") or "")
+
+
+class ApiDenied(Exception):
+    def __init__(self, status: int, message: str):
+        self.status, self.message = status, message
+
+
+def check_origin(request: Request):
+    """CSRF guard for state-changing requests: a browser always sends Origin on
+    cross-site POST/DELETE, so it must match the Host we were addressed as."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    origin = request.headers.get("origin")
+    if origin is None:
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            raise ApiDenied(403, "Cross-site request blocked")
+        return   # non-browser clients (curl, scripts) send no Origin
+    host = request.headers.get("host", "")
+    if urlsplit(origin).netloc.lower() != host.lower():
+        raise ApiDenied(403, "Origin does not match host")
+
+
+def check_token(request: Request):
+    token = get_token()
+    if not token:
+        return
+    supplied = request.headers.get("x-live2motion-token", "")
+    # EventSource cannot set headers, so the progress stream also accepts a query param
+    if not supplied and request.url.path == "/api/progress":
+        supplied = request.query_params.get("token", "")
+    if not hmac.compare_digest(supplied.encode(), token.encode()):
+        raise ApiDenied(401, "Access token required")
+
+
+def check_host_header(request: Request):
+    """Stop DNS-rebinding when only reachable locally: a loopback-bound server
+    only answers requests addressed to a loopback name."""
+    if IN_DOCKER or get_host() not in LOOPBACK_HOSTS:
+        return
+    name = urlsplit("//" + request.headers.get("host", "")).hostname or ""
+    if name not in LOOPBACK_HOSTS:
+        raise ApiDenied(403, "Unexpected Host header")
+
+
+def api_guard(request: Request):
+    if request.url.path.startswith("/api/"):
+        check_host_header(request)
+        check_origin(request)
+        check_token(request)
+
+
+def _existing(path) -> Optional[Path]:
+    try:
+        p = Path(path).expanduser().resolve()
+        return p if str(path).strip() and p.is_dir() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def browse_roots() -> list:
+    """Directories /api/browse may enter (and everything below them). Configurable
+    with LIVE2MOTION_BROWSE_ROOTS (os.pathsep separated) or "browse_roots" in
+    config.json; by default the input/output folders, their parents up to two
+    levels (never the filesystem root), and the home folder."""
+    cfg = load_config()
+    configured = os.environ.get("LIVE2MOTION_BROWSE_ROOTS", "").split(os.pathsep) \
+        if os.environ.get("LIVE2MOTION_BROWSE_ROOTS") else cfg.get("browse_roots")
+    if isinstance(configured, list) and configured:
+        candidates = configured
+    else:
+        candidates = [] if IN_DOCKER else [Path.home()]
+        if IN_DOCKER:
+            candidates.append("/data")
+        for key in ("input_directory", "output_directory"):
+            p = _existing(cfg.get(key) or "")
+            if p:
+                candidates.append(p)
+                for parent in list(p.parents)[:2]:
+                    if parent != parent.parent:   # skip "/" and drive roots
+                        candidates.append(parent)
+    roots = []
+    for c in candidates:
+        p = _existing(c) if isinstance(c, (str, Path)) else None
+        if p and p not in roots:
+            roots.append(p)
+    for drive in list_windows_drives():
+        roots.append(Path(drive))
+    return roots
+
+
+def is_browsable(p: Path, roots: list) -> bool:
+    return any(p == r or r in p.parents for r in roots)
+
+
+def warn_if_exposed(host: str):
+    if host in LOOPBACK_HOSTS or get_token():
+        return
+    # docker-compose tells us where it publishes the port; loopback there is safe
+    if IN_DOCKER and os.environ.get("LIVE2MOTION_PUBLISH_ADDR") in LOOPBACK_HOSTS:
+        return
+    bar = "!" * 72
+    print(f"\n{bar}\n SECURITY WARNING: listening on {host} with NO access token.\n"
+          " Anyone who can reach this port can browse folders and delete videos.\n"
+          " Set LIVE2MOTION_TOKEN (or \"access_token\" in config.json), or bind to\n"
+          f" 127.0.0.1 / publish the Docker port on 127.0.0.1 only.\n{bar}\n",
+          file=sys.stderr, flush=True)
 
 
 # ─── Run logic ────────────────────────────────────────────────────────────────
@@ -310,7 +477,12 @@ async def lifespan(application: FastAPI):
     scheduler.shutdown(wait=False)
     stop_watcher()
 
-app = FastAPI(title="Live2Motion Photos", lifespan=lifespan)
+app = FastAPI(title="Live2Motion Photos", lifespan=lifespan, dependencies=[Depends(api_guard)])
+
+
+@app.exception_handler(ApiDenied)
+async def api_denied_handler(request: Request, exc: ApiDenied):
+    return JSONResponse({"error": exc.message}, status_code=exc.status)
 
 
 @app.get("/")
@@ -320,12 +492,18 @@ def root():
 
 @app.get("/api/config")
 def api_get_config():
-    return load_config()
+    cfg = load_config()
+    return {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
 
 
 @app.post("/api/config")
 async def api_save_config(request: Request):
-    cfg = await request.json()
+    try:
+        cfg = validate_config(await request.json())
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    # Keep server-side settings (host, access_token, browse_roots) the UI can't see
+    cfg = {**load_config(), **cfg}
     save_config(cfg)
     apply_schedule(cfg)
     if cfg.get("watch_enabled"):
@@ -420,32 +598,42 @@ def list_windows_drives() -> list:
 
 @app.get("/api/browse")
 def api_browse(path: str = ""):
+    roots = browse_roots()
+    if not roots:
+        return JSONResponse({"error": "No browsable folders configured"}, status_code=403)
     if path == THIS_PC:
-        return {"path": THIS_PC, "parent": None, "dirs": list_windows_drives(),
-                "sep": os.sep, "root_list": True}
+        drives = list_windows_drives()
+        if drives:
+            return {"path": THIS_PC, "parent": None, "dirs": drives,
+                    "sep": os.sep, "root_list": True}
+        path = ""
     try:
-        p = (Path(path) if path else Path.home()).resolve()
+        p = (Path(path) if path else roots[0]).resolve()   # resolves symlinks and ".."
     except Exception:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     if not p.exists() or not p.is_dir():
         # Saved config paths are sometimes POSIX-style (e.g. "/data" from the
         # Docker default) and don't exist as-is on Windows, where a leading
         # "/" resolves to the root of the current drive. Fall back to the
-        # user's home directory instead of leaving the browser dead-ended.
-        home = Path.home().resolve()
-        if p != home:
-            return api_browse(str(home))
+        # first allowed folder instead of leaving the browser dead-ended.
+        if p != roots[0]:
+            return api_browse(str(roots[0]))
         return JSONResponse({"error": "Not a directory"}, status_code=404)
+    if not is_browsable(p, roots):
+        return JSONResponse({"error": "Folder is outside the allowed locations"}, status_code=403)
     def is_accessible_dir(entry: Path) -> bool:
         try:
-            return entry.is_dir()
-        except OSError:
+            # symlinks pointing outside the allowed roots are hidden, not followed
+            return entry.is_dir() and is_browsable(entry.resolve(), roots)
+        except (OSError, RuntimeError):
             return False   # e.g. macOS ~/.Trash has an ACL that blocks stat entirely
 
     # On Windows, a drive's parent is itself (there's no shared root across
     # drives) - send the user to the virtual drive list instead of a dead end.
     at_windows_drive_root = p == p.parent and sys.platform == "win32"
     parent = THIS_PC if at_windows_drive_root else (str(p.parent) if p != p.parent else None)
+    if parent and parent != THIS_PC and not is_browsable(p.parent, roots):
+        parent = None   # don't offer a way up out of the allowed roots
 
     try:
         dirs = sorted(
@@ -649,7 +837,7 @@ DEFAULT_PORT = 7000
 PORT_FILE = BASE_DIR / ".port"
 
 
-def find_available_port(preferred: int, host: str = "0.0.0.0", attempts: int = 50) -> int:
+def find_available_port(preferred: int, host: str = "127.0.0.1", attempts: int = 50) -> int:
     """Return `preferred` if free, otherwise the next free port after it."""
     for port in range(preferred, preferred + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -663,12 +851,14 @@ def find_available_port(preferred: int, host: str = "0.0.0.0", attempts: int = 5
 
 
 if __name__ == "__main__":
-    port = find_available_port(DEFAULT_PORT)
+    host = get_host()
+    port = find_available_port(DEFAULT_PORT, host)
     if port != DEFAULT_PORT:
         print(f"Port {DEFAULT_PORT} is already in use - using port {port} instead.")
     try:
         PORT_FILE.write_text(str(port), encoding="utf-8")
     except OSError:
         pass
-    print(f"Live2Motion Photos will be available at http://localhost:{port}")
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    print(f"Live2Motion Photos will be available at http://localhost:{port} (listening on {host})")
+    warn_if_exposed(host)
+    uvicorn.run("app:app", host=host, port=port, reload=False, log_level="info")

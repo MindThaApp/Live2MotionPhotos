@@ -1,7 +1,8 @@
 @echo off
+setlocal EnableDelayedExpansion
 REM Double-click this file (Windows) to start Live2Motion Photos in Docker. No
-REM editing of docker-compose.yml is needed - your user folder is mounted
-REM automatically, and everything (including which folder to convert) is
+REM editing of docker-compose.yml is needed - only the photos folder you choose is
+REM mounted, and everything (including which folder to convert) is
 REM configured from the web UI.
 cd /d "%~dp0"
 
@@ -18,7 +19,15 @@ if not exist config.json (
 )
 
 if not exist .env (
-  echo HOST_MEDIA=%USERPROFILE%> .env
+  REM Mount only the photos folder (not the whole user folder).
+  set "MEDIA=%USERPROFILE%\Pictures"
+  set /p "MEDIA=Photos folder to give Live2Motion access to [%USERPROFILE%\Pictures]: "
+  if not exist "!MEDIA!\" (
+    echo Folder not found: !MEDIA!
+    pause
+    exit /b 1
+  )
+  echo HOST_MEDIA=!MEDIA!> .env
 )
 
 docker compose up -d --build
@@ -27,7 +36,7 @@ start "" cmd /c "timeout /t 3 >nul && start http://localhost:7000"
 
 echo.
 echo Live2Motion is running in the background ^(Docker^).
-echo Your user folder ^(%USERPROFILE%^) is mounted at /data - pick the exact photo folder from the in-app folder browser.
-echo If your photos live outside your user folder, edit HOST_MEDIA in .env instead of docker-compose.yml.
+echo Your photos folder is mounted at /data - pick the exact photo folder under it from the in-app folder browser.
+echo To use a different photos folder, edit HOST_MEDIA in .env ^(not docker-compose.yml^).
 echo To stop it later: docker compose down
 pause

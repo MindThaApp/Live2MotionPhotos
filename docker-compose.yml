@@ -1,13 +1,26 @@
 services:
   live2motion:
-    build: .
+    build:
+      context: .
+      args:
+        UID: ${LIVE2MOTION_UID:-1000}
+        GID: ${LIVE2MOTION_GID:-1000}
     container_name: live2motion
+    # Runs as your host user (written to .env by the launchers) so the mounted
+    # photo folder stays writable. Override LIVE2MOTION_UID/GID in .env if needed.
+    user: "${LIVE2MOTION_UID:-1000}:${LIVE2MOTION_GID:-1000}"
     ports:
-      - "7000:7000"
+      # Localhost only by default. To reach it from other devices on your LAN,
+      # set LIVE2MOTION_BIND=0.0.0.0 in .env (or change this to "7000:7000")
+      # AND set LIVE2MOTION_TOKEN so the UI is password protected.
+      - "${LIVE2MOTION_BIND:-127.0.0.1}:7000:7000"
+    environment:
+      LIVE2MOTION_TOKEN: ${LIVE2MOTION_TOKEN:-}
+      LIVE2MOTION_PUBLISH_ADDR: ${LIVE2MOTION_BIND:-127.0.0.1}
     volumes:
       - ./config.json:/app/config.json
-      # HOST_MEDIA is written to .env automatically by the Docker launcher script
-      # (defaults to your home folder) - no manual editing needed. Everything under
-      # it is browsable/selectable from the in-app folder browser at /data.
-      - ${HOST_MEDIA:-.}:/data
+      # HOST_MEDIA is the ONE photos folder the app can see (mounted at /data).
+      # The Docker launchers ask for it and write it to .env; no default on
+      # purpose, so your whole home folder is never mounted by accident.
+      - ${HOST_MEDIA:?Set HOST_MEDIA in .env to your photos folder}:/data
     restart: unless-stopped
