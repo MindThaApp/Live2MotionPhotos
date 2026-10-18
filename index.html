@@ -265,6 +265,7 @@ tr:hover td{background:var(--surface2)}
   <span class="pill pill-idle" id="status-pill">Idle</span>
   <span class="pill pill-watch" id="watch-pill" style="display:none">Watching</span>
   <button class="btn" onclick="openCu()" title="Find and delete video files for already-muxed photos">🗑 Clean Up</button>
+  <button class="btn" id="preview-btn" onclick="startRun(true)" title="List what would be converted and removed, without changing any file">🔍 Preview</button>
   <button class="btn btn-primary" id="run-btn" onclick="startRun()">▶ Run Now</button>
   <button class="btn btn-danger" id="cancel-btn" onclick="cancelRun()" style="display:none">⬛ Cancel</button>
 </header>
@@ -355,6 +356,13 @@ tr:hover td{background:var(--surface2)}
           <input type="text" id="video_removal_folder" placeholder="_deleted_videos (inside the input directory)" style="display:none;flex:1;min-width:200px">
           <div id="video_removal_warn" style="display:none;width:100%;color:#f85149;font-size:12px"></div>
         </div>
+
+        <label class="flag">
+          <input type="checkbox" id="dry_run">
+          <span class="fn">Dry Run (preview only)</span>
+          <span class="ft">--dry-run</span>
+          <span class="tip-icon" data-tip="List which photos would be converted and which videos would be removed, without writing, moving or deleting anything. Applies to Run Now, the schedule and the folder watcher.">ⓘ</span>
+        </label>
 
         <label class="flag">
           <input type="checkbox" id="keep_temp">
@@ -641,7 +649,7 @@ async function init() {
 async function loadConfig() {
   const c = await fetch('/api/config').then(r => r.json());
   for (const id of ['input_directory','output_directory','recursive','exif_match','incremental_mode',
-      'copy_unmuxed','overwrite','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
+      'copy_unmuxed','overwrite','dry_run','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
       'schedule_enabled','schedule_cron','watch_enabled','watch_debounce','watch_stable_seconds']) {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
@@ -676,6 +684,7 @@ function formConfig() {
     incremental_mode: gc('incremental_mode'),
     copy_unmuxed:     gc('copy_unmuxed'),
     overwrite:        gc('overwrite'),
+    dry_run:          gc('dry_run'),
     delete_video:     gc('delete_video'),
     video_removal_mode:   gv('video_removal_mode'),
     video_removal_folder: gv('video_removal_folder').trim(),
@@ -693,12 +702,12 @@ const gv = id => document.getElementById(id)?.value ?? '';
 const gc = id => document.getElementById(id)?.checked ?? false;
 
 // ── Run control ───────────────────────────────────────────────────────────────
-async function startRun() {
+async function startRun(dryRun) {
   // Save the currently displayed settings first, so a folder just picked in
   // the browser (but not yet saved) doesn't get silently ignored in favor of
   // stale settings still on disk.
   await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
-  const r = await fetch('/api/run', {method:'POST'});
+  const r = await fetch('/api/run' + (dryRun === true ? '?dry_run=true' : ''), {method:'POST'});
   if (r.status === 409) { flash('Already running', true); return; }
   clearTerm();
   setRunning(true);
@@ -765,6 +774,7 @@ function classLine(l) {
   if (l.includes('[ERROR]'))             return 'ln-err';
   if (l.includes('[WARNING]'))           return 'ln-warn';
   if (l.includes('Writing output file')) return 'ln-ok';
+  if (l.includes('[DRY-RUN]'))           return 'ln-ok';
   if (/\] \$ /.test(l))                 return 'ln-cmd';
   if (l.includes('▶ Triggered'))        return 'ln-trigger';
   if (/=+\[/.test(l))                   return 'ln-prog';
@@ -827,7 +837,7 @@ function renderHistory(h) {
   document.getElementById('hist-body').innerHTML = h.map(r => `
     <tr>
       <td style="color:var(--muted)">${escHtml(r.time)}</td>
-      <td><span class="badge bk-${escHtml(r.trigger)}">${escHtml(r.trigger)}</span></td>
+      <td><span class="badge bk-${escHtml(r.trigger)}">${escHtml(r.trigger)}</span>${r.dry_run ? ' <span class="badge">dry run</span>' : ''}</td>
       <td style="color:var(--muted)">${escHtml(r.duration)}</td>
       <td style="color:var(--green)">${r.converted}</td>
       <td style="color:var(--yellow)">${r.skipped ?? 0}</td>
@@ -840,6 +850,7 @@ function renderHistory(h) {
 function setRunning(v) {
   isRunning = v;
   document.getElementById('run-btn').style.display    = v ? 'none' : '';
+  document.getElementById('preview-btn').style.display = v ? 'none' : '';
   document.getElementById('cancel-btn').style.display = v ? '' : 'none';
   if (v) {
     startedAt = Date.now(); setStatus('running');

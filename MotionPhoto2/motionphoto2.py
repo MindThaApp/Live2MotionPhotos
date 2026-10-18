@@ -47,7 +47,7 @@ except ImportError:
 
 from Muxer import Muxer, MuxerInputError
 from video_removal import normalize_mode, removal_folder
-from utils import is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
+from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
 
 logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
@@ -67,6 +67,23 @@ class Unbuffered(object):
        self.stream.flush()
    def __getattr__(self, attr):
        return getattr(self.stream, attr)
+
+def planned_output(args, image: str, output_directory, output_file=None) -> str:
+    """Where Muxer would write the result (mirrors Muxer.__init__)."""
+    if output_directory is not None:
+        return os.path.join(str(output_directory), os.path.basename(image))
+    if args.overwrite:
+        return str(image)
+    return output_file or enrich_fname(str(image), "LIVE")
+
+
+def report_dry_run(args, name, image: str, video: str, output_directory, removal_kwargs, output_file=None):
+    """--dry-run: say what a real run would do for this pair, touch nothing."""
+    out = planned_output(args, image, output_directory, output_file)
+    print(f"[DRY-RUN] Would convert {name} + {video} -> {out}")
+    if args.delete_video:
+        print(f"[DRY-RUN] Would remove video {video} ({removal_kwargs['video_removal_mode']})")
+
 
 def main():
     
@@ -162,6 +179,13 @@ def main():
         "--video-removal-folder",
         default=None,
         help="Folder for --video-removal-mode move (default: <input directory>/_deleted_videos)",
+        gooey_options={'visible':False}
+    )
+
+    settings_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be converted and removed without writing, moving or deleting anything",
         gooey_options={'visible':False}
     )
 
@@ -324,7 +348,8 @@ def main():
     defaults['input_video']=args.input_video
     defaults['output_file']=args.output_file
     defaults['no_xmp']=args.no_xmp
-    save_defaults(defaults)
+    if not args.dry_run:
+        save_defaults(defaults)
             
     # Where --delete-video sends videos; in directory mode they must stay inside the input directory
     removal_root = f"{Path(args.input_directory).resolve()}" if args.input_directory is not None else None
@@ -413,7 +438,7 @@ def main():
                                 # Preserve directory structure in output
                                 output_subdirectory = Path(output_subdirectory) / image_path.parent
                                 output_subdirectory = output_subdirectory.resolve()
-                                if not output_subdirectory.exists():
+                                if not output_subdirectory.exists() and not args.dry_run:
                                     output_subdirectory.mkdir(parents=True, exist_ok=True)
 
                             if args.incremental_mode:
@@ -423,18 +448,21 @@ def main():
                                     break
                             
                             try:
-                                Muxer(
-                                    image_fpath=str(input_image),
-                                    video_fpath=str(input_video),
-                                    exiftool=et,
-                                    output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                    delete_video=args.delete_video,
-                                    **removal_kwargs,
-                                    delete_temp=not args.keep_temp,
-                                    overwrite=args.overwrite,
-                                    no_xmp=args.no_xmp,
-                                    verbose=args.verbose,
-                                ).mux()
+                                if args.dry_run:
+                                    report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
+                                else:
+                                    Muxer(
+                                        image_fpath=str(input_image),
+                                        video_fpath=str(input_video),
+                                        exiftool=et,
+                                        output_directory=str(output_subdirectory) if output_subdirectory else None,
+                                        delete_video=args.delete_video,
+                                        **removal_kwargs,
+                                        delete_temp=not args.keep_temp,
+                                        overwrite=args.overwrite,
+                                        no_xmp=args.no_xmp,
+                                        verbose=args.verbose,
+                                    ).mux()
                             except MuxerInputError as e:
                                 print(f"[WARNING] Skipping {image}: {e}")
                                 failed_pairs.append((image, str(e)))
@@ -496,7 +524,7 @@ def main():
                             image_path = Path(img)
                             output_subdirectory = Path(output_subdirectory) / image_path.parent
                             output_subdirectory = output_subdirectory.resolve()
-                            if not output_subdirectory.exists():
+                            if not output_subdirectory.exists() and not args.dry_run:
                                 output_subdirectory.mkdir(parents=True, exist_ok=True)
 
                         if args.incremental_mode:
@@ -523,18 +551,21 @@ def main():
                                         continue
                         
                         try:
-                            Muxer(
-                                image_fpath=str(input_image),
-                                video_fpath=str(input_video),
-                                exiftool=et,
-                                output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                delete_video=args.delete_video,
-                                **removal_kwargs,
-                                delete_temp=not args.keep_temp,
-                                overwrite=args.overwrite,
-                                no_xmp=args.no_xmp,
-                                verbose=args.verbose,
-                            ).mux()
+                            if args.dry_run:
+                                report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
+                            else:
+                                Muxer(
+                                    image_fpath=str(input_image),
+                                    video_fpath=str(input_video),
+                                    exiftool=et,
+                                    output_directory=str(output_subdirectory) if output_subdirectory else None,
+                                    delete_video=args.delete_video,
+                                    **removal_kwargs,
+                                    delete_temp=not args.keep_temp,
+                                    overwrite=args.overwrite,
+                                    no_xmp=args.no_xmp,
+                                    verbose=args.verbose,
+                                ).mux()
                         except MuxerInputError as e:
                             print(f"[WARNING] Skipping {img}: {e}")
                             failed_pairs.append((img, str(e)))
@@ -554,8 +585,11 @@ def main():
                         file_path = Path(file)
                         output_subdirectory = Path(output_subdirectory) / file_path.parent
                         output_subdirectory = output_subdirectory.resolve()
-                        if not output_subdirectory.exists():
+                        if not output_subdirectory.exists() and not args.dry_run:
                             output_subdirectory.mkdir(parents=True, exist_ok=True)
+                    if args.dry_run:
+                        print(f"[DRY-RUN] Would copy {file} to {output_subdirectory}")
+                        continue
                     print(f"Copying {file} to {output_subdirectory}")
                     if os.path.exists(output_subdirectory / file_path.name) and filecmp.cmp(input_directory / file, output_subdirectory / file_path.name):
                         if args.verbose:
@@ -568,6 +602,9 @@ def main():
                 print(f"[SUMMARY] {len(failed_pairs)} file(s) skipped due to missing pair:")
                 for name, reason in failed_pairs:
                     print(f"  - {name}: {reason}")
+        elif args.dry_run:
+            report_dry_run(args, args.input_image, args.input_image, args.input_video,
+                           None, removal_kwargs, output_file=args.output_file)
         else:
             Muxer(
                 image_fpath=args.input_image,

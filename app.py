@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     "incremental_mode": False,
     "copy_unmuxed": False,
     "overwrite": False,
+    "dry_run": False,             # list what would be converted/removed; write nothing
     "delete_video": False,
     "video_removal_mode": video_removal.default_mode(),
     "video_removal_folder": "",   # "move" mode only; empty = <input_directory>/_deleted_videos
@@ -82,6 +83,7 @@ class RunState:
         self.stats: dict = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
         self.history: list = []
         self.cancel_requested = False
+        self.dry_run = False
         self._file_log: Optional[logging.Logger] = None
         self._file_log_path = ""
         self.skipped_files: list = []      # full paths of already-muxed photos
@@ -146,7 +148,7 @@ class RunState:
             if m:
                 self.stats["current"] = int(m.group(1))
                 self.stats["total"] = int(m.group(2))
-        elif "Writing output file" in raw:
+        elif "Writing output file" in raw or "[DRY-RUN] Would convert" in raw:
             self.stats["converted"] += 1
         elif "[ERROR]" in raw:
             self.stats["errors"] += 1
@@ -175,6 +177,7 @@ class RunState:
             self.history.insert(0, {
                 "time": (self.start_time or "")[:19].replace("T", " "),
                 "trigger": self.trigger,
+                "dry_run": self.dry_run,
                 "duration": elapsed,
                 "converted": self.stats["converted"],
                 "skipped": self.stats["skipped"],
@@ -449,6 +452,7 @@ def build_cmd(cfg: dict) -> list:
         ("copy_unmuxed",    "--copy-unmuxed"),
         ("overwrite",       "--overwrite"),
         ("delete_video",    "--delete-video"),
+        ("dry_run",         "--dry-run"),
         ("keep_temp",       "--keep-temp"),
         ("no_xmp",          "--no-xmp"),
         ("verbose",         "--verbose"),
@@ -487,13 +491,16 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
         pass
 
 
-def do_run(trigger: str = "manual"):
+def do_run(trigger: str = "manual", dry_run: Optional[bool] = None):
     if not run_state.start(trigger):
         return
     cfg = load_config()
+    if dry_run is not None:
+        cfg["dry_run"] = dry_run      # per-request override of the config toggle
+    run_state.dry_run = bool(cfg.get("dry_run"))
     run_state.input_dir = cfg.get("input_directory", "")
     cmd = build_cmd(cfg)
-    run_state.emit(f"▶ Triggered by: {trigger}")
+    run_state.emit(f"▶ Triggered by: {trigger}" + (" (DRY RUN - nothing will be changed)" if run_state.dry_run else ""))
     run_state.emit("$ " + " ".join(cmd))
     if not Path(BIN[-1]).exists():
         run_state.emit(f"✗ MotionPhoto2 entry point not found: {BIN[-1]}")
@@ -729,10 +736,11 @@ async def api_save_config(request: Request):
 
 
 @app.post("/api/run")
-def api_run():
+def api_run(dry_run: Optional[bool] = None):
+    """dry_run=true|false overrides the saved "dry_run" setting for this run."""
     if run_state.running:
         return JSONResponse({"error": "Already running"}, status_code=409)
-    threading.Thread(target=do_run, args=("manual",), daemon=True).start()
+    threading.Thread(target=do_run, args=("manual", dry_run), daemon=True).start()
     return {"ok": True}
 
 
