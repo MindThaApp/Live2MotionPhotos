@@ -92,6 +92,8 @@ Everything — the Python runtime, dependencies, and ExifTool — lives inside t
 - **`Start Live2Motion.bat`** (Windows)
 - **`start-live2motion.sh`** (Linux)
 
+> **Windows troubleshooting:** the `.bat` launcher looks for `py -3`/`python` (the Microsoft Store "python" placeholder is ignored) and offers to install Python 3.12 and ExifTool via `winget`. If setup fails it removes the half-built `venv` so the next run retries. If Windows keeps opening the Store, turn off the `python.exe` alias under Settings > Apps > Advanced app settings > App execution aliases.
+
 That's the whole install. First run creates the Python virtual environment, installs dependencies, creates `config.json`, and tries to install ExifTool automatically if it's missing (Homebrew on macOS, apt/dnf on Linux, winget on Windows) — then opens the app in your browser. Every run after that just starts the server and reopens the browser tab. Requires Python 3.9+ to already be installed ([python.org/downloads](https://www.python.org/downloads/)) — the script checks for it and tells you if it's missing. If ExifTool can't be auto-installed on your system, the script prints the exact manual steps.
 
 <details>
