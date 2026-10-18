@@ -421,9 +421,11 @@ def do_run(trigger: str = "manual"):
         run_state.finish(127)
         return
     try:
+        # utf-8 + errors="replace": the child forces UTF-8 output, and non-ASCII
+        # (e.g. Windows) filenames must not abort the read loop.
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
         run_state.process = proc
         for raw in proc.stdout:
