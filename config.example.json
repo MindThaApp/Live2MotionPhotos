@@ -5,7 +5,7 @@
   "exif_match": true,
   "incremental_mode": false,
   "copy_unmuxed": false,
-  "overwrite": true,
+  "overwrite": false,
   "delete_video": true,
   "video_removal_mode": "move",
   "video_removal_folder": "",

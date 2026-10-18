@@ -42,7 +42,7 @@ DEFAULT_CONFIG = {
     "exif_match": True,
     "incremental_mode": False,
     "copy_unmuxed": False,
-    "overwrite": True,
+    "overwrite": False,
     "delete_video": False,
     "video_removal_mode": video_removal.default_mode(),
     "video_removal_folder": "",   # "move" mode only; empty = <input_directory>/_deleted_videos

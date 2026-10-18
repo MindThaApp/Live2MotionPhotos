@@ -304,10 +304,11 @@ def main():
         elif os.path.isfile(output_directory):
             print("[ERROR] Output directory cannot be a file")
             sys.exit(1)
-        elif args.copy_unmuxed is not None:
+        elif args.copy_unmuxed:
             input_directory = f"{Path(args.input_directory).resolve()}"
             if os.path.samefile(input_directory, output_directory): # Input directory and output directory cannot be same if copying unmuxed files
                 print("[ERROR] Output directory cannot be the same as input directory")
+                sys.exit(1)
 
     defaults['input_directory']=args.input_directory
     defaults['recursive']=args.recursive
