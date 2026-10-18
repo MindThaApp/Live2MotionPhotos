@@ -47,7 +47,7 @@ except ImportError:
             return group
 
 from Muxer import Muxer, MuxerInputError
-from extract import ExtractError, exiftool_available, run_extract
+from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
 from video_removal import normalize_mode, removal_folder
 from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
 
@@ -116,7 +116,8 @@ def run_extract_mode(args) -> int:
             et = None
     try:
         run_extract(args.input_directory, args.input_image, args.output_directory, args.recursive,
-                    args.extract_mov, args.extract_still, args.dry_run, emit_result, et)
+                    args.extract_mov, args.extract_still, args.dry_run, emit_result, et,
+                    force=args.extract_force)
     except ExtractError as e:
         print(f"[ERROR] {e}")
         return 1
@@ -264,7 +265,7 @@ def main():
     extract_group.add_argument(
         "--extract",
         action="store_true",
-        help="Split Motion Photos into a still image and a separate video (uses the input directory or --input-image; --output-directory is optional, default: next to the photo)",
+        help="Split Motion Photos into a still image and a separate video (uses the input directory or --input-image; --output-directory is optional, default: an _extracted folder next to each photo)",
         gooey_options={'visible':False}
     )
 
@@ -279,6 +280,13 @@ def main():
         "--extract-still",
         action="store_true",
         help="With --extract: also write <name>_still.jpg, the image without the video and motion photo XMP flags (the original is never modified)",
+        gooey_options={'visible':False}
+    )
+
+    extract_group.add_argument(
+        "--extract-force",
+        action="store_true",
+        help="With --extract: extract again even if the video was already extracted (the new file gets a _1 suffix)",
         gooey_options={'visible':False}
     )
 
@@ -447,7 +455,8 @@ def main():
                 # Recursive mode: walk through all subdirectories
                 for root, dirnames, filenames in os.walk(input_directory):
                     # never rescan videos that were moved aside by --delete-video
-                    dirnames[:] = [d for d in dirnames if not (skip_folder and (Path(root) / d).resolve() == skip_folder)]
+                    dirnames[:] = [d for d in dirnames if d != EXTRACT_DIRNAME
+                                   and not (skip_folder and (Path(root) / d).resolve() == skip_folder)]
                     for filename in filenames:
                         full_path = Path(root) / filename
                         rel_path = full_path.relative_to(input_directory)

@@ -513,6 +513,7 @@ def build_extract_cmd(cfg: dict) -> list:
         ("recursive",     "--recursive"),
         ("extract_mov",   "--extract-mov"),
         ("extract_still", "--extract-still"),
+        ("extract_force", "--extract-force"),
         ("dry_run",       "--dry-run"),
         ("verbose",       "--verbose"),
     ]:
@@ -647,6 +648,8 @@ class MediaHandler(FileSystemEventHandler):
         if self._skip_folder and video_removal.is_inside(path, self._skip_folder):
             return False   # videos moved aside by "move" mode must not retrigger a run
         p = Path(path)
+        if "_extracted" in p.parts:
+            return False   # Extract mode output, never input for the converter
         return p.suffix.lower() in WATCH_EXTS and not is_temp_name(p.name)
 
     def _touch(self, path: str):
@@ -807,7 +810,7 @@ def api_run(dry_run: Optional[bool] = None):
 
 
 EXTRACT_KEYS = {"input_directory": str, "input_file": str, "output_directory": str, "recursive": bool,
-                "extract_mov": bool, "extract_still": bool, "dry_run": bool}
+                "extract_mov": bool, "extract_still": bool, "extract_force": bool, "dry_run": bool}
 
 
 def validate_extract_request(data) -> dict:

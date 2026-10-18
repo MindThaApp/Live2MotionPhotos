@@ -196,10 +196,37 @@ def test_cli_extract_emits_results(tmp_path, video):
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     results = [json.loads(l[len("@@RESULT "):]) for l in proc.stdout.splitlines() if l.startswith("@@RESULT ")]
-    assert results[0]["status"] == "planned" and results[0]["output"].endswith("good.mp4")
+    assert results[0]["status"] == "planned" and results[0]["output"].endswith("_extracted/good.mp4")
     assert not (tmp_path / "good.mp4").exists()
     real = subprocess.run([sys.executable, str(ROOT / "MotionPhoto2" / "motionphoto2.py"), "--extract",
                            "--input-image", str(tmp_path / "good.jpg"), "--extract-mov"],
                           capture_output=True, text=True, timeout=60)
     assert real.returncode == 0, real.stdout + real.stderr
-    assert (tmp_path / "good.mov").read_bytes() == video
+    assert (tmp_path / "_extracted" / "good.mov").read_bytes() == video
+
+
+def test_default_output_is_extracted_subfolder_and_rerun_skips(tmp_path, video):
+    write(tmp_path, "IMG_1.jpg", v1_photo(video))
+    counts = extract.run_extract(str(tmp_path), None, None, True)
+    assert counts["extracted"] == 1
+    assert (tmp_path / "_extracted" / "IMG_1.mp4").read_bytes() == video
+    assert not (tmp_path / "IMG_1.mp4").exists()
+    results = []
+    counts = extract.run_extract(str(tmp_path), None, None, True, emit=lambda *a: results.append(a))
+    assert counts == {"extracted": 0, "skipped": 1, "errors": 0}
+    assert results[0][2] == "already extracted"
+    assert sorted(os.listdir(tmp_path / "_extracted")) == ["IMG_1.mp4"]
+    counts = extract.run_extract(str(tmp_path), None, None, True, force=True)
+    assert counts["extracted"] == 1 and (tmp_path / "_extracted" / "IMG_1_1.mp4").exists()
+
+
+def test_converter_ignores_extracted_folder(tmp_path, video):
+    pytest.importorskip("exiftool")
+    write(tmp_path, "IMG_1.jpg", v1_photo(video))
+    extract.run_extract(str(tmp_path), None, None, True)
+    # a stray photo + same-name video inside _extracted/ must not be paired
+    write(tmp_path / "_extracted", "IMG_1.jpg", jpeg())
+    proc = subprocess.run([sys.executable, str(ROOT / "MotionPhoto2" / "motionphoto2.py"),
+                           "--input-directory", str(tmp_path), "--recursive", "--dry-run"],
+                          capture_output=True, text=True, timeout=120)
+    assert "_extracted" not in proc.stdout.replace(str(tmp_path), "")

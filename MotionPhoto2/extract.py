@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 from video_removal import find_embedded_video
 
+EXTRACT_DIRNAME = "_extracted"   # default output folder; the converter and watcher never scan it
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".avif"}
 SAMSUNG_MARKER = b"MotionPhoto_Data"
 # ftyp brands that belong to an image (a HEIC/AVIF motion photo starts with one)
@@ -334,7 +335,7 @@ def _collect_images(root: Path, recursive: bool) -> list:
     out = []
     if recursive:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != EXTRACT_DIRNAME]
             out += [str((Path(dirpath) / f).relative_to(root)) for f in filenames]
     else:
         out = [f for f in os.listdir(root) if (root / f).is_file()]
@@ -342,7 +343,8 @@ def _collect_images(root: Path, recursive: bool) -> list:
 
 
 def run_extract(input_directory=None, input_image=None, output_directory=None, recursive=True,
-                make_mov=False, strip_still=False, dry_run=False, emit: Callable = None, et=None) -> dict:
+                make_mov=False, strip_still=False, dry_run=False, emit: Callable = None, et=None,
+                force=False) -> dict:
     """CLI/API driver. Prints progress lines the web UI understands and reports one
     result per file through emit(name, status, reason, output)."""
     emit = emit or (lambda *a, **k: None)
@@ -362,7 +364,16 @@ def run_extract(input_directory=None, input_image=None, output_directory=None, r
         photo = str(root / rel)
         print(f"=========================[{i}/{len(files)}]")
         print(f"- Processing {rel}")
-        out_dir = str((Path(output_directory).resolve() / Path(rel).parent) if output_directory else Path(photo).parent)
+        # Default: an _extracted subfolder, so NAME.mp4 never sits next to NAME.jpg where
+        # the converter could pair it with the photo again.
+        out_dir = str((Path(output_directory).resolve() / Path(rel).parent) if output_directory
+                      else Path(photo).parent / EXTRACT_DIRNAME)
+        done = [n for n in (Path(rel).stem + ".mp4", Path(rel).stem + ".mov") if (Path(out_dir) / n).exists()]
+        if done and not force:
+            print(f"{rel} already extracted ({done[0]}), skipping...")
+            counts["skipped"] += 1
+            emit(rel, "skipped", "already extracted")
+            continue
         try:
             data, loc = plan_extract(photo, et)
             res = extract_one(photo, out_dir, make_mov, strip_still, et, dry_run, data, loc)

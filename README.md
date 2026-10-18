@@ -209,9 +209,9 @@ The Cleanup tool uses the same mode and only accepts video files inside the inpu
 The reverse direction: split an existing Motion Photo into a still image and a separate video. Supports Google Motion Photo v1, legacy MicroVideo and the Samsung trailer format. The video is cut out byte for byte (no re-encoding, no ffmpeg) and must start with an MP4 `ftyp` box; if the offsets in the metadata are wrong, the file is scanned for one.
 
 - UI: the **Extract Video** section in the sidebar (Preview = dry run). CLI: `motionphoto2.py --extract --input-directory DIR` (or `--input-image FILE`), plus `--output-directory`, `--extract-mov`, `--extract-still`, `--dry-run`. API: `POST /api/extract[?dry_run=true]`.
-- Output: `NAME.mp4` next to the photo (or in the Output Directory). `--extract-mov` names it `.mov` only when the container can be renamed unchanged (plain isom/QuickTime file), otherwise it stays `.mp4`. `--extract-still` also writes `NAME_still.jpg` (JPEG only) without the video and, if exiftool is installed, without the Motion Photo XMP flags.
+- Output: `NAME.mp4` in an `_extracted` folder next to each photo, or in the Output Directory (the converter and watcher never scan `_extracted`, so the video is not muxed back into the photo). `--extract-mov` names it `.mov` only when the container can be renamed unchanged (plain isom/QuickTime file), otherwise it stays `.mp4`. `--extract-still` also writes `NAME_still.jpg` (JPEG only) without the video and, if exiftool is installed, without the Motion Photo XMP flags.
 - With exiftool installed, the capture date and GPS are copied onto the video; without it that step is skipped.
-- Originals are never modified and existing files are never overwritten (a taken name becomes `NAME_1.mp4`). Re-running extracts again under a new suffix.
+- Originals are never modified and existing files are never overwritten (a taken name becomes `NAME_1.mp4`). Photos whose `NAME.mp4`/`.mov` already exists in the output folder are skipped on re-run; `--extract-force` extracts again under a new suffix.
 
 ### Schedule
 
