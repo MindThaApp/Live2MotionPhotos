@@ -4,6 +4,7 @@
 import asyncio
 import hmac
 import json
+import logging
 import os
 import re
 import socket
@@ -342,6 +343,29 @@ def check_config_paths(clean: dict):
             raise ValueError(f"'{key}' is outside the allowed folders")
 
 
+TOKEN_IN_QUERY = re.compile(r"([?&]token=)[^&\s\"']*", re.IGNORECASE)
+
+
+class RedactTokenFilter(logging.Filter):
+    """Keep ?token=... (used by the progress event stream) out of access logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(TOKEN_IN_QUERY.sub(r"\1***", a) if isinstance(a, str) else a
+                                for a in record.args)
+        if isinstance(record.msg, str):
+            record.msg = TOKEN_IN_QUERY.sub(r"\1***", record.msg)
+        return True
+
+
+def install_log_redaction():
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, RedactTokenFilter) for f in access.filters):
+        access.addFilter(RedactTokenFilter())
+
+
+install_log_redaction()
+
+
 def warn_if_exposed(host: str):
     if host in LOOPBACK_HOSTS or get_token():
         return
@@ -491,6 +515,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    install_log_redaction()   # uvicorn may have reset logging config after import
     scheduler.start()
     cfg = load_config()
     apply_schedule(cfg)

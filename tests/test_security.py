@@ -177,3 +177,14 @@ def test_config_paths_inside_roots_accepted(client, env, monkeypatch):
     assert client.post("/api/config", json=cfg).status_code == 200
     cfg["video_removal_folder"] = "../../elsewhere"
     assert client.post("/api/config", json=cfg).status_code == 400
+
+
+# ── access log redaction ───────────────────────────────────────────────────────
+
+def test_access_log_redacts_token():
+    import logging
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                            ("1.2.3.4:5", "GET", "/api/progress?from_line=0&token=s3cret&x=1", "1.1", 200), None)
+    assert appmod.RedactTokenFilter().filter(rec)
+    out = rec.getMessage()
+    assert "s3cret" not in out and "token=***&x=1" in out
