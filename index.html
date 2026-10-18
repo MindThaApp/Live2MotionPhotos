@@ -289,9 +289,10 @@ tr:hover td{background:var(--surface2)}
       <div class="field">
         <label>Input Directory</label>
         <div class="dir-row">
-          <input type="text" id="input_directory" placeholder="/home/ramin/shared">
+          <input type="text" id="input_directory" placeholder="Pictures folder">
           <button class="btn btn-sm" onclick="openBrowser('input_directory')" data-tip="Browse the server filesystem to pick the folder containing your Live Photos.">📁</button>
         </div>
+        <div id="missing_warn" style="display:none;color:var(--yellow);font-size:11px;margin-top:4px"></div>
       </div>
 
       <div class="field">
@@ -616,12 +617,16 @@ let browserTarget = null, browserPath = '';
 function openBrowser(target) {
   browserTarget = target;
   document.getElementById('browser-bg').style.display = 'flex';
+  // empty/missing value: the server opens at the last-used or default folder
   browseTo(document.getElementById(target).value || '');
 }
 function closeBrowser() { document.getElementById('browser-bg').style.display = 'none'; }
 function selectFolder() {
   document.getElementById(browserTarget).value = browserPath;
   closeBrowser();
+  if (browserPath && browserPath !== 'This PC')
+    fetch('/api/last-folder', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key: browserTarget, path: browserPath})}).catch(() => {});
   checkIncremental();
 }
 function joinPath(base, name, sep) {
@@ -688,6 +693,9 @@ async function loadConfig() {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
   }
+  const mw = document.getElementById('missing_warn'), miss = c.missing_paths || [];
+  mw.textContent = miss.length ? 'Warning: saved folder not found: ' + miss.map(k => c[k]).join(', ') + '. Pick another folder.' : '';
+  mw.style.display = miss.length ? '' : 'none';
   syncPreset(c.schedule_cron || '0 2 * * *');
   checkOverwrite(); checkIncremental(); onRemovalModeChange(); onScheduleToggle(); onWatchToggle();
 }

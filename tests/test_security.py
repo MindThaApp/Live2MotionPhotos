@@ -193,3 +193,66 @@ def test_access_log_redacts_token():
     assert appmod.RedactTokenFilter().filter(rec)
     out = rec.getMessage()
     assert "s3cret" not in out and "token=***&x=1" in out
+
+
+# ── default / last-used folder ─────────────────────────────────────────────────
+
+def test_default_input_under_home(env, monkeypatch):
+    home = env / "home"
+    (home / "Pictures").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    assert appmod.default_input_dir() == str(home / "Pictures")
+    assert appmod.load_config()["input_directory"] == str(home / "Pictures")
+    assert appmod.is_browsable(Path(appmod.default_input_dir()).resolve(), appmod.browse_roots())
+
+
+def test_default_falls_back_to_home_without_pictures(env, monkeypatch):
+    home = env / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    assert appmod.default_input_dir() == str(home)
+    assert appmod.is_browsable(home.resolve(), appmod.browse_roots())
+
+
+def test_default_in_docker_is_data(env, monkeypatch):
+    monkeypatch.setattr(appmod, "IN_DOCKER", True)
+    assert appmod.default_input_dir() == "/data"
+
+
+def test_empty_saved_input_resolves_to_default(env, monkeypatch):
+    monkeypatch.setattr(appmod, "IN_DOCKER", True)
+    (env / "config.json").write_text('{"input_directory": ""}')
+    assert appmod.load_config()["input_directory"] == "/data"
+
+
+def test_last_folder_autosaved_and_reloaded(client, env, monkeypatch):
+    home = env / "home"
+    (home / "Pictures" / "trip").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    trip = str((home / "Pictures" / "trip").resolve())
+    r = client.post("/api/last-folder", json={"key": "input_directory", "path": trip})
+    assert r.status_code == 200
+    assert appmod.json.loads((env / "config.json").read_text())["input_directory"] == trip
+    assert not (env / "config.json.tmp").exists()
+    assert client.get("/api/config").json()["input_directory"] == trip
+    # the folder dialog opens there
+    assert client.get("/api/browse").json()["path"] == trip
+
+
+def test_last_folder_rejects_outside_or_missing(client, env, monkeypatch):
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(env))
+    for bad in ("/etc", str(env / "nope")):
+        assert client.post("/api/last-folder", json={"key": "input_directory", "path": bad}).status_code == 400
+    assert client.post("/api/last-folder", json={"key": "host", "path": str(env)}).status_code == 400
+    assert not (env / "config.json").exists()
+
+
+def test_missing_saved_folder_flagged_not_fatal(client, env, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: env)
+    (env / "config.json").write_text(f'{{"input_directory": "{env}/gone"}}')
+    body = client.get("/api/config").json()
+    assert body["missing_paths"] == ["input_directory"]
+    assert client.get("/api/browse").status_code == 200

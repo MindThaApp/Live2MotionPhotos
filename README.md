@@ -138,7 +138,7 @@ uvicorn.run(app.app, host='127.0.0.1', port=7099)
 "
 ```
 
-To point at a different (or fake) photo library, edit `input_directory` in `config.json`. To use a pre-built binary instead of the vendored source (e.g. for speed), set `MOTIONPHOTO2_BIN=/path/to/binary` in the environment before starting.
+The input folder defaults to your Pictures folder (`/data` in Docker) and the app remembers the last folder you picked or ran. To point at a different (or fake) photo library, edit `input_directory` in `config.json`. To use a pre-built binary instead of the vendored source (e.g. for speed), set `MOTIONPHOTO2_BIN=/path/to/binary` in the environment before starting.
 
 ---
 

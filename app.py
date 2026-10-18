@@ -38,8 +38,52 @@ BIN = [os.environ["MOTIONPHOTO2_BIN"]] if os.environ.get("MOTIONPHOTO2_BIN") els
     sys.executable, str(BASE_DIR / "MotionPhoto2" / "motionphoto2.py")
 ]
 
+IN_DOCKER = video_removal.in_docker()
+
+
+def windows_pictures_dir() -> Optional[Path]:
+    """The real Pictures known folder on Windows (may be redirected to OneDrive)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD),
+                        ("d", ctypes.c_ubyte * 8)]
+
+        # FOLDERID_Pictures {33E28130-4E1E-4676-835A-98395C3BC3BB}
+        fid = GUID(0x33E28130, 0x4E1E, 0x4676, (ctypes.c_ubyte * 8)(0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB))
+        out = ctypes.c_wchar_p()
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                                                  ctypes.POINTER(ctypes.c_wchar_p)]
+        if shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(out)) != 0:
+            return None
+        try:
+            return Path(out.value) if out.value else None
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:
+        return None
+
+
+def default_input_dir() -> str:
+    """Docker: /data. Native: the user's Pictures folder, else the home folder."""
+    if IN_DOCKER:
+        return "/data"
+    pics = windows_pictures_dir() or (Path.home() / "Pictures")
+    try:
+        if pics.is_dir():
+            return str(pics)
+    except OSError:
+        pass
+    return str(Path.home())
+
+
 DEFAULT_CONFIG = {
-    "input_directory": "/home/ramin/shared",
+    "input_directory": default_input_dir(),
     "output_directory": "",
     "recursive": True,
     "exif_match": True,
@@ -258,14 +302,39 @@ def load_config() -> dict:
             cfg = {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
             # Older configs have no mode (or a bad one); fall back to the default
             cfg["video_removal_mode"] = video_removal.normalize_mode(cfg.get("video_removal_mode"))
+            if not str(cfg.get("input_directory") or "").strip():
+                cfg["input_directory"] = default_input_dir()
             return cfg
         except Exception:
             pass
-    return DEFAULT_CONFIG.copy()
+    return {**DEFAULT_CONFIG, "input_directory": default_input_dir()}
 
 
 def save_config(cfg: dict):
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    """Atomic write: a crash mid-save never leaves a truncated config.json."""
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def remember_folder(key: str, path: str) -> bool:
+    """Persist a folder the user picked/used as input_directory/output_directory.
+    Validated like /api/config; returns False (nothing saved) if it is not an
+    existing, allowed folder."""
+    if key not in ("input_directory", "output_directory") or not isinstance(path, str) \
+            or not path.strip() or len(path) > MAX_STR_LEN or "\0" in path:
+        return False
+    p = _existing(path)
+    if p is None:
+        return False
+    try:
+        check_config_paths({key: str(p)})
+    except ValueError:
+        return False
+    cfg = load_config()
+    if cfg.get(key) != str(p):
+        save_config({**cfg, key: str(p)})
+    return True
 
 
 def validate_config(data) -> dict:
@@ -303,7 +372,6 @@ def validate_config(data) -> dict:
 
 # ─── Security: bind address, access token, browse roots ──────────────────────
 
-IN_DOCKER = video_removal.in_docker()
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -390,6 +458,8 @@ def browse_roots() -> list:
         candidates = [] if IN_DOCKER else [Path.home()]
         if IN_DOCKER:
             candidates.append("/data")
+        else:
+            candidates.append(default_input_dir())   # Pictures may be redirected outside home (OneDrive)
         for key in ("input_directory", "output_directory"):
             p = _existing(cfg.get(key) or "")
             if p:
@@ -779,7 +849,23 @@ def root():
 @app.get("/api/config")
 def api_get_config():
     cfg = load_config()
-    return {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
+    out = {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
+    # folders that no longer exist (drive unplugged, renamed...): the UI shows a warning
+    out["missing_paths"] = [k for k in ("input_directory", "output_directory")
+                            if cfg.get(k) and _existing(cfg[k]) is None]
+    return out
+
+
+@app.post("/api/last-folder")
+async def api_last_folder(request: Request):
+    """Remember a folder picked in the browser dialog (no Save press needed)."""
+    try:
+        data = await request.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not remember_folder(data.get("key"), data.get("path")):
+        return JSONResponse({"error": "Not an existing, allowed folder"}, status_code=400)
+    return {"ok": True}
 
 
 @app.post("/api/config")
@@ -853,6 +939,9 @@ async def api_extract(request: Request, dry_run: Optional[bool] = None):
         overrides = validate_extract_request(json.loads(raw) if raw.strip() else {})
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    for key in ("input_directory", "output_directory"):
+        if overrides.get(key):
+            remember_folder(key, overrides[key])
     if dry_run is None:
         dry_run = overrides.pop("dry_run", None)
     else:
@@ -950,6 +1039,17 @@ def list_windows_drives() -> list:
     return [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase) if bitmask & (1 << i)]
 
 
+def _browse_start(roots: list) -> Path:
+    """Where the folder dialog opens: the current/last-used input folder, else
+    the default folder, else the first allowed root."""
+    cfg = load_config()
+    for cand in (cfg.get("input_directory"), default_input_dir()):
+        p = _existing(cand or "")
+        if p and is_browsable(p, roots):
+            return p
+    return roots[0]
+
+
 @app.get("/api/browse")
 def api_browse(path: str = ""):
     roots = browse_roots()
@@ -961,8 +1061,9 @@ def api_browse(path: str = ""):
             return {"path": THIS_PC, "parent": None, "dirs": drives,
                     "sep": os.sep, "root_list": True}
         path = ""
+    start = _browse_start(roots)
     try:
-        p = (Path(path) if path else roots[0]).resolve()   # resolves symlinks and ".."
+        p = (Path(path) if path else start).resolve()   # resolves symlinks and ".."
     except Exception:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     if not p.exists() or not p.is_dir():
@@ -970,8 +1071,8 @@ def api_browse(path: str = ""):
         # Docker default) and don't exist as-is on Windows, where a leading
         # "/" resolves to the root of the current drive. Fall back to the
         # first allowed folder instead of leaving the browser dead-ended.
-        if p != roots[0]:
-            return api_browse(str(roots[0]))
+        if p != start:
+            return api_browse(str(start))
         return JSONResponse({"error": "Not a directory"}, status_code=404)
     if not is_browsable(p, roots):
         return JSONResponse({"error": "Folder is outside the allowed locations"}, status_code=403)

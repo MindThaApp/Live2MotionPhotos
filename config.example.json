@@ -1,5 +1,5 @@
 {
-  "input_directory": "/data",
+  "input_directory": "",
   "output_directory": "",
   "recursive": true,
   "exif_match": true,

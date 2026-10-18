@@ -17,7 +17,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download embeddable Python
         shell: pwsh
@@ -93,13 +93,13 @@ jobs:
         run: Compress-Archive -Path bundle/* -DestinationPath Live2Motion-Portable-Windows.zip
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Live2Motion-Portable-Windows
           path: Live2Motion-Portable-Windows.zip
 
       - name: Attach to release (tag builds)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: Live2Motion-Portable-Windows.zip
