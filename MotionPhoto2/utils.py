@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import constants as const
+from video_removal import find_embedded_video
 
 
 def extract_track_number(metadata: str) -> str:
@@ -58,12 +59,18 @@ def enrich_fname(fpath: str, enrich: str) -> str:
     return os.path.join(p.parent, fname)
 
 def is_motion_photo(fpath: str, et: exiftool.ExifToolHelper) -> bool:
+    # 1. Samsung trailer (also what this tool writes): a few bytes from the end of
+    #    the file, no exiftool and no video extraction.
+    if find_embedded_video(fpath, use_xmp=False):
+        return True
+    # 2. Read just the Google flags. Plain photos (the common case) stop here
+    #    without exiftool ever pulling out an embedded video.
+    flags = et.execute("-s3", "-XMP-GCamera:MotionPhoto", "-XMP-GCamera:MicroVideo", fpath)
+    if not str(flags).strip():
+        return False
+    # 3. Flagged: confirm that the embedded data really is a video.
     video_in_image = extract_video_from_image(fpath, et)
-
-    # Check if the data received is actually a video file
-    if video_in_image and  verify_video_in_image(video_in_image):
-                return True
-    return False
+    return bool(video_in_image and verify_video_in_image(video_in_image))
 
 def verify_video_in_image(video_in_image: bytes) -> bool :
     if video_in_image and any([video_in_image.find(sig, 0, 15) != -1 for sig in const.VIDEO_SIGNATURE["VIDEO"]]):

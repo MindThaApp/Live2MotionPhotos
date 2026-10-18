@@ -945,8 +945,8 @@ def _pair_by_content_id(photo_paths: list[str], video_paths: list[str]) -> list[
 
 def _filter_deletable(pairs: list[tuple[str, str]]) -> tuple[list[dict], int]:
     """Given (photo, video) pairs matched by ContentIdentifier, keep only those where
-    the video is short enough to be a Live Photo clip AND the photo is confirmed (via
-    exiftool) to already have the video embedded — only then is the standalone video
+    the video is short enough to be a Live Photo clip AND the photo is confirmed to
+    contain an identical copy of it — only then is the standalone video
     truly redundant and safe to offer for deletion."""
     if not pairs:
         return [], 0
@@ -959,26 +959,18 @@ def _filter_deletable(pairs: list[tuple[str, str]]) -> tuple[list[dict], int]:
     if not pairs:
         return [], 0
 
-    # Always verify via exiftool that the photo actually has the video embedded
-    # before offering the paired video for deletion — a ContentIdentifier match alone
-    # doesn't guarantee the mux has actually happened yet.
-    photo_paths = list({p for p, _ in pairs})
-    muxed: set[str] = set()
-    chunk = 500
-    for i in range(0, len(photo_paths), chunk):
-        try:
-            r = subprocess.run(
-                ["exiftool", "-q", "-m", "-if", "$MotionPhoto",
-                 "-p", "$SourceFile"] + photo_paths[i:i + chunk],
-                capture_output=True, text=True, timeout=60,
-            )
-            muxed.update(l.strip() for l in r.stdout.splitlines() if l.strip())
-        except Exception:
-            pass
+    # Offer a video only if the photo really contains it: the embedded video must
+    # equal the standalone one in size and SHA-256 (a ContentIdentifier match, or
+    # a different clip that shares one, is not proof).
+    muxed: set[tuple[str, str]] = set()
+    for photo, vid in pairs:
+        problem = video_removal.verify_embedded_video(photo, vid)
+        if problem == "":
+            muxed.add((photo, vid))
 
     videos, total_bytes, seen = [], 0, set()
     for photo, vid in pairs:
-        if photo in muxed and vid not in seen:
+        if (photo, vid) in muxed and vid not in seen:
             seen.add(vid)
             try:
                 size = Path(vid).stat().st_size
