@@ -622,6 +622,7 @@ function openBrowser(target) {
 }
 function closeBrowser() { document.getElementById('browser-bg').style.display = 'none'; }
 function selectFolder() {
+  if (!browserPath || browserPath === 'This PC') return;   // virtual drive list is not a folder
   document.getElementById(browserTarget).value = browserPath;
   closeBrowser();
   if (browserPath && browserPath !== 'This PC')
@@ -651,10 +652,21 @@ function renderCrumb(path, sep) {
     parts.map((p, i) => ` <span onclick="browseTo('${escJs('/' + parts.slice(0, i + 1).join('/'))}')">${escHtml(p)}</span> /`).join('');
 }
 async function browseTo(path) {
-  const r = await fetch('/api/browse?path=' + encodeURIComponent(path)).then(r => r.json());
+  let r;
+  try {
+    const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
+    const text = await resp.text();
+    try { r = JSON.parse(text); } catch { r = {error: `Server error (${resp.status})`}; }
+    if (!resp.ok && !r.error) r.error = `Server error (${resp.status})`;
+  } catch (e) {
+    r = {error: 'Cannot reach the server'};
+  }
   if (r.error) {
+    // never leave the dialog a dead end: offer a way back to a known-good place
     document.getElementById('browser-list').innerHTML =
-      `<div style="padding:12px 16px;color:var(--muted);font-size:12px">${escHtml(r.error)}: ${escHtml(path)}</div>`;
+      `<div style="padding:12px 16px;color:var(--muted);font-size:12px">${escHtml(r.error)}: ${escHtml(path)}</div>` +
+      (browserPath ? `<div class="browser-item up" onclick="browseTo('${escJs(browserPath)}')">↩ Back to ${escHtml(browserPath)}</div>` : '') +
+      `<div class="browser-item up" onclick="browseTo('')">⌂ Start folder</div>`;
     return;
   }
   browserPath = r.path;

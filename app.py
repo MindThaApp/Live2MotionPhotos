@@ -452,7 +452,8 @@ def browse_roots() -> list:
     cfg = load_config()
     configured = os.environ.get("LIVE2MOTION_BROWSE_ROOTS", "").split(os.pathsep) \
         if os.environ.get("LIVE2MOTION_BROWSE_ROOTS") else cfg.get("browse_roots")
-    if isinstance(configured, list) and configured:
+    explicit = isinstance(configured, list) and bool(configured)
+    if explicit:
         candidates = configured
     else:
         candidates = [] if IN_DOCKER else [Path.home()]
@@ -472,8 +473,11 @@ def browse_roots() -> list:
         p = _existing(c) if isinstance(c, (str, Path)) else None
         if p and p not in roots:
             roots.append(p)
-    for drive in list_windows_drives():
-        roots.append(Path(drive))
+    if not explicit:
+        # Native Windows: the restriction exists for Docker / network exposure, so
+        # every local drive stays browsable unless roots were configured explicitly.
+        for drive in list_windows_drives():
+            roots.append(Path(drive))
     return roots
 
 
@@ -1066,7 +1070,11 @@ def api_browse(path: str = ""):
         p = (Path(path) if path else start).resolve()   # resolves symlinks and ".."
     except Exception:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
-    if not p.exists() or not p.is_dir():
+    try:
+        is_dir = p.is_dir()
+    except OSError:   # e.g. PermissionError on protected Windows folders
+        return JSONResponse({"error": "Permission denied"}, status_code=403)
+    if not is_dir:
         # Saved config paths are sometimes POSIX-style (e.g. "/data" from the
         # Docker default) and don't exist as-is on Windows, where a leading
         # "/" resolves to the root of the current drive. Fall back to the

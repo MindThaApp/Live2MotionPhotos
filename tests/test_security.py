@@ -18,6 +18,7 @@ def env(tmp_path, monkeypatch):
     """Isolated config file + loopback app with no token."""
     monkeypatch.setattr(appmod, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(appmod, "IN_DOCKER", False)
+    monkeypatch.setattr(appmod, "list_windows_drives", lambda: [])   # hermetic on Windows
     for var in ("LIVE2MOTION_TOKEN", "LIVE2MOTION_HOST", "LIVE2MOTION_BROWSE_ROOTS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(appmod, "apply_schedule", lambda cfg: None)
@@ -102,7 +103,8 @@ def test_browse_inside_root(client, tree):
 def test_browse_outside_root_rejected(client, tree):
     _, outside = tree
     assert client.get("/api/browse", params={"path": str(outside)}).status_code == 403
-    assert client.get("/api/browse", params={"path": "/etc"}).status_code == 403
+    if sys.platform != "win32":   # on Windows "/etc" is a missing path that falls back to the start folder
+        assert client.get("/api/browse", params={"path": "/etc"}).status_code == 403
 
 
 def test_browse_dotdot_and_symlink_escape_rejected(client, tree):
@@ -114,7 +116,7 @@ def test_browse_dotdot_and_symlink_escape_rejected(client, tree):
 def test_default_roots_follow_config(env):
     inp = env / "home" / "me" / "photos" / "2024"
     inp.mkdir(parents=True)
-    (env / "config.json").write_text(f'{{"input_directory": "{inp}"}}')
+    (env / "config.json").write_text(appmod.json.dumps({"input_directory": str(inp)}))
     roots = appmod.browse_roots()
     assert inp.resolve() in roots and inp.parent.resolve() in roots
     assert Path("/") not in roots
@@ -252,7 +254,33 @@ def test_last_folder_rejects_outside_or_missing(client, env, monkeypatch):
 
 def test_missing_saved_folder_flagged_not_fatal(client, env, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: env)
-    (env / "config.json").write_text(f'{{"input_directory": "{env}/gone"}}')
+    (env / "config.json").write_text(appmod.json.dumps({"input_directory": str(env / "gone")}))
     body = client.get("/api/config").json()
     assert body["missing_paths"] == ["input_directory"]
     assert client.get("/api/browse").status_code == 200
+
+
+def test_windows_drives_browsable_by_default_but_not_when_roots_set(env, monkeypatch):
+    drive = env / "fakedrive"
+    drive.mkdir()
+    monkeypatch.setattr(appmod, "list_windows_drives", lambda: [str(drive)])
+    assert drive.resolve() in appmod.browse_roots()
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(env / "home"))
+    (env / "home").mkdir()
+    assert drive.resolve() not in appmod.browse_roots()
+
+
+def test_browse_permission_error_is_json_403(client, env, monkeypatch):
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(env))
+    target = env / "locked"
+    target.mkdir()
+    orig = Path.is_dir
+
+    def boom(self, *a, **k):
+        if self.name == "locked":
+            raise PermissionError("denied")
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(Path, "is_dir", boom)
+    r = client.get("/api/browse", params={"path": str(target)})
+    assert r.status_code == 403 and r.json()["error"]
