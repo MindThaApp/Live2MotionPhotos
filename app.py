@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "exif_match": True,
     "incremental_mode": False,
     "copy_unmuxed": False,
-    "overwrite": True,
+    "overwrite": False,
     "delete_video": False,
     "keep_temp": False,
     "no_xmp": False,

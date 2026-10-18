@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
+import tempfile
 
 from pathlib import Path
 from typing import Dict, Any
@@ -27,6 +29,27 @@ def extract_track_duration(track_number: str, metadata: str) -> str:
 def read_file(fpath: str) -> bytes:
     with open(fpath, "rb") as f:
         return f.read()
+
+
+def atomic_write(target: str, data: bytes, stat_from: str = None) -> None:
+    """Write data to target atomically: temp file in the same directory,
+    flush + fsync, then os.replace. The target is untouched if anything fails."""
+    directory = os.path.dirname(os.path.abspath(target))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mp2tmp.", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if stat_from is not None:
+            shutil.copystat(stat_from, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def enrich_fname(fpath: str, enrich: str) -> str:

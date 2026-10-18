@@ -12,6 +12,7 @@ from utils import (
     extract_track_duration,
     read_file,
     enrich_fname,
+    atomic_write,
 )
 
 import constants as const
@@ -138,6 +139,10 @@ class Muxer:
 
         if extension.lower() in [".heic", ".heif", ".avif"]:
             image_type = "heic"  # Default is already with mimetype image/heic
+            if extension.lower() == ".heif":
+                self.change_xmpresource("image/heif", semantic="Primary")
+            elif extension.lower() == ".avif":
+                self.change_xmpresource("image/avif", semantic="Primary")
         else:
             if extension.lower() not in [".jpg", ".jpeg"]:
                 self.logger.warning(
@@ -184,7 +189,9 @@ class Muxer:
         try:
             xmp = etree.fromstring(xmp)
             xmp_description = xmp.find(".//rdf:Description", const.NAMESPACES)
-            for child in xmp_description:
+            # Copy to a list: append() moves the child out of the source tree,
+            # which would otherwise make the iteration skip every other element.
+            for child in list(xmp_description):
                 # Just in case there are already MotionPhoto data, do not duplicate the Directory attribute
                 if child.tag != const.CONTAINER_DIRECTORY:
                     self.logger.info("XMP metadata - copying %s", child)
@@ -192,11 +199,28 @@ class Muxer:
             for attr in xmp_description.attrib:
                 self.logger.info("XMP metadata - copying attribute %s", attr)
                 self.xmp.find(".//rdf:Description", const.NAMESPACES).attrib[attr] = xmp_description.attrib.get(attr)
-        except:
-            self.logger.info("Could not copy (some of?) the XMP metadata tags from source.")
+        except (etree.XMLSyntaxError, AttributeError, TypeError, ValueError) as e:
+            self.logger.warning("Could not copy (some of?) the XMP metadata tags from source: %s", e)
 
     def mux(self):
+        self._tmp_files = []
+        try:
+            self._mux()
+        finally:
+            # Remove intermediate files (also on error), unless the user asked to keep them
+            if self.delete_temp is True:
+                for tmp in self._tmp_files:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        self.logger.warning("Could not delete %s: %s", tmp, e)
+
+    def _mux(self):
         self.logger.info("Processing %s", self.image_fpath)
+        xmp_updated = None
+        xmp_image = None
 
         image_metadata, video_metadata = self.exiftool.get_metadata(
             [self.image_fpath, self.video_fpath]
@@ -249,10 +273,12 @@ class Muxer:
             self.change_xmpresource(str(samsung_tail.get_image_padding()), attribute=const.ITEM_PADDING, semantic="Primary")
 
             xmp_updated = self.output_fpath + ".XMP"
+            self._tmp_files.append(xmp_updated)
             with open(xmp_updated, "wb") as f:
                 f.write(etree.tostring(self.xmp, pretty_print=True))
 
             xmp_image = enrich_fname(self.output_fpath, "XMP")
+            self._tmp_files.append(xmp_image)
             shutil.copyfile(self.image_fpath, xmp_image)
             self.exiftool.execute(
                 *[
@@ -274,11 +300,9 @@ class Muxer:
         merged_bytes += video_footer
 
         self.logger.info("Writing output file: %s", self.output_fpath)
-        with open(self.output_fpath, "wb") as binary_file:
-            binary_file.write(merged_bytes)
-        shutil.copystat(self.image_fpath, self.output_fpath)
+        atomic_write(self.output_fpath, merged_bytes, stat_from=self.image_fpath)
 
-        if self.delete_temp is True:
+        if self.delete_temp is True and xmp_updated is not None:
             os.remove(xmp_updated)
             self.logger.debug("Delete: %s", xmp_updated)
             os.remove(xmp_image)
