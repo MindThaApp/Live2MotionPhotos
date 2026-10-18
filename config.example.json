@@ -15,5 +15,6 @@
   "schedule_enabled": false,
   "schedule_cron": "0 2 * * *",
   "watch_enabled": false,
-  "watch_debounce": 3000
+  "watch_debounce": 3000,
+  "watch_stable_seconds": 10
 }

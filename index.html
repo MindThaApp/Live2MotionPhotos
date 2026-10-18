@@ -430,6 +430,12 @@ tr:hover td{background:var(--surface2)}
           </label>
           <input type="number" id="watch_debounce" value="300" min="10" max="3600">
         </div>
+        <div class="field">
+          <label>Stable for (seconds)
+            <span class="tip-icon" data-tip="A new or changed file is only processed once its size and modified time have stayed the same for this long. Raise it for slow network shares or iCloud/OneDrive syncing. 0 turns the check off.">ⓘ</span>
+          </label>
+          <input type="number" id="watch_stable_seconds" value="10" min="0" max="3600">
+        </div>
         <div class="info-box" id="watch-info" style="display:none">
           Watching Input Directory for new .HEIC / .JPEG / .MOV / .MP4 files. Triggers after the debounce period of inactivity.
         </div>
@@ -636,7 +642,7 @@ async function loadConfig() {
   const c = await fetch('/api/config').then(r => r.json());
   for (const id of ['input_directory','output_directory','recursive','exif_match','incremental_mode',
       'copy_unmuxed','overwrite','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
-      'schedule_enabled','schedule_cron','watch_enabled','watch_debounce']) {
+      'schedule_enabled','schedule_cron','watch_enabled','watch_debounce','watch_stable_seconds']) {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
   }
@@ -680,6 +686,7 @@ function formConfig() {
     schedule_cron:    preset === 'custom' ? gv('schedule_cron') : preset,
     watch_enabled:    gc('watch_enabled'),
     watch_debounce:   parseInt(gv('watch_debounce')) || 300,
+    watch_stable_seconds: Math.max(0, parseInt(gv('watch_stable_seconds')) || 0),
   };
 }
 const gv = id => document.getElementById(id)?.value ?? '';

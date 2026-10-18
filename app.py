@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,7 @@ DEFAULT_CONFIG = {
     "schedule_cron": "0 2 * * *",
     "watch_enabled": False,
     "watch_debounce": 300,
+    "watch_stable_seconds": 10,   # a file must keep the same size + mtime this long before a run
 }
 
 WATCH_EXTS = {".heic", ".jpeg", ".jpg", ".mov", ".mp4"}
@@ -540,35 +542,115 @@ def apply_schedule(cfg: dict):
 
 # ─── File watcher ─────────────────────────────────────────────────────────────
 
+TEMP_SUFFIXES = (".tmp", ".part", ".partial", ".crdownload", ".download", ".filepart", ".temp", ".icloud")
+
+
+def is_temp_name(name: str) -> bool:
+    """Partial/temporary files that sync clients (iCloud, OneDrive, browsers)
+    and the muxer itself create next to real media; never worth a run."""
+    low = name.lower()
+    return (low.startswith((".", "~"))               # .IMG_1.HEIC.icloud, ~$x, .mp2tmp.* ...
+            or low.endswith(TEMP_SUFFIXES)
+            or Path(low).stem.endswith(".xmp"))       # muxer's IMG.XMP.heic intermediates
+
+
+MAX_STABLE_WAIT = 1800   # give up waiting for a never-settling file after 30 min
+
+
 class MediaHandler(FileSystemEventHandler):
-    def __init__(self, debounce: int, skip_folder: Optional[Path] = None):
+    """Triggers a run once new/changed media has stopped changing: events are
+    debounced, then every touched file must keep the same size and mtime for
+    `stable_seconds` (so half-copied or still-syncing files are not processed)."""
+
+    def __init__(self, debounce: int, skip_folder: Optional[Path] = None,
+                 stable_seconds: int = 10, poll: float = 1.0, on_ready=None):
         self._skip_folder = skip_folder
         self._debounce = max(debounce, 10)
+        self._stable = max(stable_seconds, 0)
+        self._poll = poll
+        self._on_ready = on_ready or (lambda: threading.Thread(target=do_run, args=("watch",), daemon=True).start())
         self._timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
+        self._pending: set = set()
+        self._waiting = False
 
     def _relevant(self, path: str) -> bool:
         if self._skip_folder and video_removal.is_inside(path, self._skip_folder):
             return False   # videos moved aside by "move" mode must not retrigger a run
-        return Path(path).suffix.lower() in WATCH_EXTS
+        p = Path(path)
+        return p.suffix.lower() in WATCH_EXTS and not is_temp_name(p.name)
+
+    def _touch(self, path: str):
+        # Our own output/removals during a run are not new arrivals
+        if run_state.running or not self._relevant(path):
+            return
+        with self._lock:
+            self._pending.add(path)
+        self._reset()
 
     def on_created(self, event):
-        if not event.is_directory and self._relevant(event.src_path):
-            self._reset()
+        if not event.is_directory:
+            self._touch(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._touch(event.src_path)
 
     def on_moved(self, event):
-        if not event.is_directory and self._relevant(event.dest_path):
-            self._reset()
+        if not event.is_directory:
+            self._touch(event.dest_path)
 
     def _reset(self):
         with self._lock:
             if self._timer:
                 self._timer.cancel()
-            self._timer = threading.Timer(
-                self._debounce,
-                lambda: threading.Thread(target=do_run, args=("watch",), daemon=True).start(),
-            )
+            self._timer = threading.Timer(self._debounce, self._fire)
+            self._timer.daemon = True
             self._timer.start()
+
+    def _fire(self):
+        with self._lock:
+            if self._waiting:
+                return          # the active wait re-reads _pending, so it covers this event
+            self._waiting = True
+        try:
+            ready = self.wait_until_stable()
+        finally:
+            with self._lock:
+                self._waiting = False
+        if ready:
+            self._on_ready()
+
+    def wait_until_stable(self) -> bool:
+        """Block until all pending files are unchanged for `stable_seconds`.
+        Returns True if at least one file is ready to process."""
+        seen: dict = {}          # path -> ((size, mtime_ns), time first seen with that signature)
+        deadline = time.monotonic() + MAX_STABLE_WAIT
+        while True:
+            with self._lock:
+                paths = set(self._pending)
+            now = time.monotonic()
+            unstable, alive = False, 0
+            for p in paths:
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    with self._lock:
+                        self._pending.discard(p)   # deleted or renamed away again
+                    seen.pop(p, None)
+                    continue
+                alive += 1
+                sig = (st.st_size, st.st_mtime_ns)
+                if p not in seen or seen[p][0] != sig:
+                    seen[p] = (sig, now)
+                    unstable = unstable or self._stable > 0
+                elif now - seen[p][1] < self._stable:
+                    unstable = True
+            if not unstable or now >= deadline:
+                with self._lock:
+                    self._pending.clear()
+                return alive > 0
+            time.sleep(self._poll)
 
 
 def start_watcher(cfg: dict):
@@ -578,7 +660,7 @@ def start_watcher(cfg: dict):
     if path and os.path.isdir(path):
         watch_observer = Observer()
         skip = video_removal.removal_folder(path, cfg.get("video_removal_folder"))
-        watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300), skip), path, recursive=True)
+        watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300), skip, cfg.get("watch_stable_seconds", 10)), path, recursive=True)
         watch_observer.start()
 
 
