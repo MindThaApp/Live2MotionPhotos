@@ -204,6 +204,15 @@ When **Delete Video After Mux** is on, the output is checked first (it exists, i
 
 The Cleanup tool uses the same mode and only accepts video files inside the input directory. Configs that only have `delete_video` keep working and get the default mode.
 
+### Extract (Motion Photo to photo + video)
+
+The reverse direction: split an existing Motion Photo into a still image and a separate video. Supports Google Motion Photo v1, legacy MicroVideo and the Samsung trailer format. The video is cut out byte for byte (no re-encoding, no ffmpeg) and must start with an MP4 `ftyp` box; if the offsets in the metadata are wrong, the file is scanned for one.
+
+- UI: the **Extract Video** section in the sidebar (Preview = dry run). CLI: `motionphoto2.py --extract --input-directory DIR` (or `--input-image FILE`), plus `--output-directory`, `--extract-mov`, `--extract-still`, `--dry-run`. API: `POST /api/extract[?dry_run=true]`.
+- Output: `NAME.mp4` next to the photo (or in the Output Directory). `--extract-mov` names it `.mov` only when the container can be renamed unchanged (plain isom/QuickTime file), otherwise it stays `.mp4`. `--extract-still` also writes `NAME_still.jpg` (JPEG only) without the video and, if exiftool is installed, without the Motion Photo XMP flags.
+- With exiftool installed, the capture date and GPS are copied onto the video; without it that step is skipped.
+- Originals are never modified and existing files are never overwritten (a taken name becomes `NAME_1.mp4`). Re-running extracts again under a new suffix.
+
 ### Schedule
 
 Enable **scheduled runs** and choose a preset (hourly / daily 2 AM / weekly Sunday 2 AM) or enter a custom [cron expression](https://crontab.guru/). The next scheduled run time is shown below the selector.

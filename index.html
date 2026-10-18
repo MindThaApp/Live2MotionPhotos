@@ -396,6 +396,29 @@ tr:hover td{background:var(--surface2)}
     <hr>
 
     <section>
+      <div class="sec-title">✂ Extract Video</div>
+      <div class="sub-label" style="margin-bottom:8px">Split existing Motion Photos (Google, MicroVideo, Samsung) into the photo and a separate video. Uses the Input / Output Directory and Recursive settings above; empty Output Directory = next to each photo. Originals are never changed and existing files are never overwritten.</div>
+      <label class="flag">
+        <input type="checkbox" id="extract_mov">
+        <span class="fn">Save video as .mov</span>
+        <span class="ft">--extract-mov</span>
+        <span class="tip-icon" data-tip="Name the video .mov instead of .mp4 when the container can safely be renamed without changing a single byte (no re-encoding). Otherwise it stays .mp4.">ⓘ</span>
+      </label>
+      <label class="flag">
+        <input type="checkbox" id="extract_still">
+        <span class="fn">Also save a still image</span>
+        <span class="ft">--extract-still</span>
+        <span class="tip-icon" data-tip="Write NAME_still.jpg: the JPEG without the embedded video and, when exiftool is installed, without the Motion Photo XMP flags. JPEG only. The original is untouched.">ⓘ</span>
+      </label>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button class="btn" id="extract-preview-btn" onclick="startExtract(true)" style="flex:1" title="List what would be extracted without writing anything">🔍 Preview</button>
+        <button class="btn btn-primary" id="extract-btn" onclick="startExtract()" style="flex:1">✂ Extract</button>
+      </div>
+    </section>
+
+    <hr>
+
+    <section>
       <div class="sec-title">🕐 Schedule</div>
       <label class="flag" style="margin-bottom:8px">
         <input type="checkbox" id="schedule_enabled" onchange="onScheduleToggle()">
@@ -568,6 +591,7 @@ window.fetch = async (url, opts = {}) => {
 };
 const escHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+let lastRunExtract = false;
 let sse = null, isRunning = false, startedAt = null, tickTimer = null;
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
@@ -659,7 +683,7 @@ async function init() {
 async function loadConfig() {
   const c = await fetch('/api/config').then(r => r.json());
   for (const id of ['input_directory','output_directory','recursive','exif_match','incremental_mode',
-      'copy_unmuxed','overwrite','dry_run','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
+      'copy_unmuxed','overwrite','dry_run','extract_mov','extract_still','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
       'schedule_enabled','schedule_cron','watch_enabled','watch_debounce','watch_stable_seconds']) {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
@@ -696,6 +720,8 @@ function formConfig() {
     overwrite:        gc('overwrite'),
     dry_run:          gc('dry_run'),
     delete_video:     gc('delete_video'),
+    extract_mov:      gc('extract_mov'),
+    extract_still:    gc('extract_still'),
     video_removal_mode:   gv('video_removal_mode'),
     video_removal_folder: gv('video_removal_folder').trim(),
     keep_temp:        gc('keep_temp'),
@@ -712,7 +738,18 @@ const gv = id => document.getElementById(id)?.value ?? '';
 const gc = id => document.getElementById(id)?.checked ?? false;
 
 // ── Run control ───────────────────────────────────────────────────────────────
+async function startExtract(dryRun) {
+  await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
+  const r = await fetch('/api/extract' + (dryRun === true ? '?dry_run=true' : ''), {method:'POST'});
+  if (r.status === 409) { flash('Already running', true); return; }
+  if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Extract failed', true); return; }
+  lastRunExtract = true;
+  clearTerm();
+  setRunning(true);
+  connectSSE(0);
+}
 async function startRun(dryRun) {
+  lastRunExtract = false;
   // Save the currently displayed settings first, so a folder just picked in
   // the browser (but not yet saved) doesn't get silently ignored in favor of
   // stale settings still on disk.
@@ -739,7 +776,7 @@ function connectSSE(fromLine) {
       setRunning(false);
       setStatus(d.stats?.errors > 0 ? 'error' : 'done');
       document.getElementById('sp-file').style.display = 'none';
-      if (d.stats?.skipped > 0) checkCleanup();
+      if (d.stats?.skipped > 0 && !lastRunExtract) checkCleanup();
       return;
     }
     if (d.result) { addResult(d.result); return; }
@@ -903,6 +940,8 @@ function setRunning(v) {
   isRunning = v;
   document.getElementById('run-btn').style.display    = v ? 'none' : '';
   document.getElementById('preview-btn').style.display = v ? 'none' : '';
+  document.getElementById('extract-btn').disabled = v;
+  document.getElementById('extract-preview-btn').disabled = v;
   document.getElementById('cancel-btn').style.display = v ? '' : 'none';
   if (v) {
     startedAt = Date.now(); setStatus('running');

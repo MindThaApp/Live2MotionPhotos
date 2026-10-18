@@ -50,6 +50,8 @@ DEFAULT_CONFIG = {
     "delete_video": False,
     "video_removal_mode": video_removal.default_mode(),
     "video_removal_folder": "",   # "move" mode only; empty = <input_directory>/_deleted_videos
+    "extract_mov": False,         # Extract mode: save the video as .mov when that is safe
+    "extract_still": False,       # Extract mode: also write a still image without the video
     "keep_temp": False,
     "no_xmp": False,
     "verbose": False,
@@ -181,8 +183,11 @@ class RunState:
             if m:
                 self.stats["current"] = int(m.group(1))
                 self.stats["total"] = int(m.group(2))
-        elif "Writing output file" in raw or "[DRY-RUN] Would convert" in raw:
+        elif "Writing output file" in raw or "[DRY-RUN] Would convert" in raw \
+                or "[DRY-RUN] Would extract" in raw or raw.startswith("Extracted "):
             self.stats["converted"] += 1
+        elif "is not a motion photo, skipping" in rawl:
+            self.stats["skipped"] += 1
         elif "[ERROR]" in raw:
             self.stats["errors"] += 1
         elif "is already a motion photo, skipping" in rawl:
@@ -495,6 +500,27 @@ def build_cmd(cfg: dict) -> list:
     return cmd
 
 
+def build_extract_cmd(cfg: dict) -> list:
+    """Extract mode: split Motion Photos into still + video (MotionPhoto2 --extract)."""
+    cmd = list(BIN) + ["--extract"]
+    if f := cfg.get("input_file"):
+        cmd += ["--input-image", f]
+    elif d := cfg.get("input_directory"):
+        cmd += ["--input-directory", d]
+    if d := cfg.get("output_directory"):
+        cmd += ["--output-directory", d]
+    for key, flag in [
+        ("recursive",     "--recursive"),
+        ("extract_mov",   "--extract-mov"),
+        ("extract_still", "--extract-still"),
+        ("dry_run",       "--dry-run"),
+        ("verbose",       "--verbose"),
+    ]:
+        if cfg.get(key):
+            cmd.append(flag)
+    return cmd
+
+
 def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
     """Stop the MotionPhoto2 child and everything it started (notably its
     exiftool helper) so cancelling leaves no orphans."""
@@ -524,15 +550,18 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
         pass
 
 
-def do_run(trigger: str = "manual", dry_run: Optional[bool] = None):
+def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Optional[dict] = None):
+    """extract: None for the normal mux run, else the per-request overrides for an Extract run."""
     if not run_state.start(trigger):
         return
     cfg = load_config()
+    if extract is not None:
+        cfg.update(extract)
     if dry_run is not None:
         cfg["dry_run"] = dry_run      # per-request override of the config toggle
     run_state.dry_run = bool(cfg.get("dry_run"))
-    run_state.input_dir = cfg.get("input_directory", "")
-    cmd = build_cmd(cfg)
+    run_state.input_dir = "" if extract is not None else cfg.get("input_directory", "")
+    cmd = build_extract_cmd(cfg) if extract is not None else build_cmd(cfg)
     run_state.emit(f"▶ Triggered by: {trigger}" + (" (DRY RUN - nothing will be changed)" if run_state.dry_run else ""))
     run_state.emit("$ " + " ".join(cmd))
     if not Path(BIN[-1]).exists():
@@ -774,6 +803,64 @@ def api_run(dry_run: Optional[bool] = None):
     if run_state.running:
         return JSONResponse({"error": "Already running"}, status_code=409)
     threading.Thread(target=do_run, args=("manual", dry_run), daemon=True).start()
+    return {"ok": True}
+
+
+EXTRACT_KEYS = {"input_directory": str, "input_file": str, "output_directory": str, "recursive": bool,
+                "extract_mov": bool, "extract_still": bool, "dry_run": bool}
+
+
+def validate_extract_request(data) -> dict:
+    """Clean per-request overrides for /api/extract (ValueError with a user-facing
+    message). Every path must be inside the browse roots, like the saved settings."""
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object")
+    unknown = sorted(set(data) - set(EXTRACT_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown key(s): {', '.join(map(str, unknown))}")
+    for key, value in data.items():
+        if not isinstance(value, EXTRACT_KEYS[key]):
+            raise ValueError(f"'{key}' must be a {'string' if EXTRACT_KEYS[key] is str else 'true/false value'}")
+        if EXTRACT_KEYS[key] is str and (len(value) > MAX_STR_LEN or "\0" in value):
+            raise ValueError(f"'{key}' is too long or contains invalid characters")
+    check_config_paths({k: v for k, v in data.items() if k in PATH_CONFIG_KEYS})
+    if f := data.get("input_file"):
+        try:
+            p = Path(f).expanduser().resolve()
+        except (OSError, RuntimeError):
+            raise ValueError("'input_file' is not a valid path")
+        if not is_browsable(p, browse_roots()):
+            raise ValueError("'input_file' is outside the allowed folders")
+        if not p.is_file():
+            raise ValueError("'input_file' is not a file")
+        data = {**data, "input_file": str(p)}
+    return data
+
+
+@app.post("/api/extract")
+async def api_extract(request: Request, dry_run: Optional[bool] = None):
+    """Extract mode: split Motion Photos into a still image and a video file.
+    Optional JSON body overrides the saved settings for this run (input_directory,
+    input_file, output_directory, recursive, extract_mov, extract_still, dry_run);
+    ?dry_run=true|false overrides both."""
+    if run_state.running:
+        return JSONResponse({"error": "Already running"}, status_code=409)
+    try:
+        raw = await request.body()
+        overrides = validate_extract_request(json.loads(raw) if raw.strip() else {})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if dry_run is None:
+        dry_run = overrides.pop("dry_run", None)
+    else:
+        overrides.pop("dry_run", None)
+    # The saved settings must also point inside the browse roots (a hand-edited config.json might not)
+    try:
+        check_config_paths({k: v for k, v in load_config().items()
+                                  if k in ("input_directory", "output_directory") and k not in overrides})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    threading.Thread(target=do_run, args=("extract", dry_run, overrides), daemon=True).start()
     return {"ok": True}
 
 

@@ -47,6 +47,7 @@ except ImportError:
             return group
 
 from Muxer import Muxer, MuxerInputError
+from extract import ExtractError, exiftool_available, run_extract
 from video_removal import normalize_mode, removal_folder
 from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
 
@@ -91,6 +92,38 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
     emit_result(name, "planned", "dry run" + (", video would be removed" if args.delete_video else ""), out)
     if args.delete_video:
         print(f"[DRY-RUN] Would remove video {video} ({removal_kwargs['video_removal_mode']})")
+
+
+def run_extract_mode(args) -> int:
+    """--extract: split Motion Photos into still + video (see extract.py)."""
+    if (args.input_directory is None) == (args.input_image is None):
+        print("[ERROR] --extract needs exactly one of --input-directory or --input-image")
+        return 1
+    if args.input_video is not None or args.copy_unmuxed or args.incremental_mode or args.overwrite:
+        print("[ERROR] --extract cannot be combined with input-video, copy-unmuxed, incremental or overwrite (existing files are never overwritten)")
+        return 1
+    source = args.input_directory if args.input_directory is not None else args.input_image
+    if not os.path.exists(source):
+        print(f"[ERROR] Input does not exist: {source}")
+        return 1
+    et = None
+    if exiftool_available():
+        try:
+            et = exiftool.ExifToolHelper(encoding="utf-8")
+            et.run()
+        except Exception as e:
+            print(f"[WARNING] exiftool could not be started: {e}")
+            et = None
+    try:
+        run_extract(args.input_directory, args.input_image, args.output_directory, args.recursive,
+                    args.extract_mov, args.extract_still, args.dry_run, emit_result, et)
+    except ExtractError as e:
+        print(f"[ERROR] {e}")
+        return 1
+    finally:
+        if et is not None:
+            et.terminate()
+    return 0
 
 
 def main():
@@ -224,6 +257,31 @@ def main():
         gooey_options={'initial_value':defaults['verbose']}
     )
 
+    extract_group = parser.add_argument_group(
+        "Extract Mode"
+    )
+
+    extract_group.add_argument(
+        "--extract",
+        action="store_true",
+        help="Split Motion Photos into a still image and a separate video (uses the input directory or --input-image; --output-directory is optional, default: next to the photo)",
+        gooey_options={'visible':False}
+    )
+
+    extract_group.add_argument(
+        "--extract-mov",
+        action="store_true",
+        help="With --extract: save the video as .mov (container renamed, bytes unchanged) when that is safe, otherwise .mp4",
+        gooey_options={'visible':False}
+    )
+
+    extract_group.add_argument(
+        "--extract-still",
+        action="store_true",
+        help="With --extract: also write <name>_still.jpg, the image without the video and motion photo XMP flags (the original is never modified)",
+        gooey_options={'visible':False}
+    )
+
     file_group = parser.add_argument_group(
         "Process a Single File"
     )
@@ -293,6 +351,9 @@ def main():
         sys.stdout = Unbuffered(codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict'))
     if sys.stderr.encoding != 'UTF-8':
         sys.stderr = Unbuffered(codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict'))    
+
+    if args.extract:
+        sys.exit(run_extract_mode(args))
 
     if args.input_directory is not None and (
         args.input_image is not None or args.input_video is not None
