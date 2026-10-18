@@ -6,6 +6,7 @@ import codecs
 import exiftool
 import filecmp
 import itertools
+import json
 import logging
 import os
 import shutil
@@ -68,6 +69,12 @@ class Unbuffered(object):
    def __getattr__(self, attr):
        return getattr(self.stream, attr)
 
+def emit_result(name, status: str, reason: str = "", output: str = ""):
+    """One machine-readable line per file for the web UI's results table."""
+    print("@@RESULT " + json.dumps({"file": str(name), "status": status,
+                                    "reason": reason, "output": str(output)}), flush=True)
+
+
 def planned_output(args, image: str, output_directory, output_file=None) -> str:
     """Where Muxer would write the result (mirrors Muxer.__init__)."""
     if output_directory is not None:
@@ -81,6 +88,7 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
     """--dry-run: say what a real run would do for this pair, touch nothing."""
     out = planned_output(args, image, output_directory, output_file)
     print(f"[DRY-RUN] Would convert {name} + {video} -> {out}")
+    emit_result(name, "planned", "dry run" + (", video would be removed" if args.delete_video else ""), out)
     if args.delete_video:
         print(f"[DRY-RUN] Would remove video {video} ({removal_kwargs['video_removal_mode']})")
 
@@ -418,6 +426,7 @@ def main():
                     # Check if source image is already a motion photo
                     if is_motion_photo(input_directory / image, et):
                         print(f"Input {image} is already a motion photo, skipping muxing...")
+                        emit_result(image, "skipped", "already a motion photo")
                         if args.copy_unmuxed:
                             unmatched_images.append(image)
                         continue
@@ -445,13 +454,14 @@ def main():
                                 output_image_path = output_subdirectory / image_path.name
                                 if os.path.exists(output_image_path) and input_output_binary_compare(input_video,output_image_path):
                                     print(f"Destination {image} is already a motion photo, skipping...")
+                                    emit_result(image, "skipped", "already converted in the output folder")
                                     break
                             
                             try:
                                 if args.dry_run:
                                     report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
                                 else:
-                                    Muxer(
+                                    muxer = Muxer(
                                         image_fpath=str(input_image),
                                         video_fpath=str(input_video),
                                         exiftool=et,
@@ -462,13 +472,17 @@ def main():
                                         overwrite=args.overwrite,
                                         no_xmp=args.no_xmp,
                                         verbose=args.verbose,
-                                    ).mux()
+                                    )
+                                    muxer.mux()
+                                    emit_result(image, "converted", output=muxer.output_fpath)
                             except MuxerInputError as e:
                                 print(f"[WARNING] Skipping {image}: {e}")
+                                emit_result(image, "error", str(e))
                                 failed_pairs.append((image, str(e)))
                             break
                     else:
                         print(f"No matching video found for {image}")
+                        emit_result(image, "skipped", "no matching video")
                         if args.copy_unmuxed:
                             unmatched_images.append(image)
 
@@ -498,6 +512,7 @@ def main():
                     # Check if source image is already a motion photo
                     if is_motion_photo(input_directory / img, et):
                         print(f"Input {img} is already a motion photo, skipping muxing...")
+                        emit_result(img, "skipped", "already a motion photo")
                         if args.copy_unmuxed:
                             unmatched_images.append(img)
                         continue
@@ -543,18 +558,20 @@ def main():
                                         if args.verbose:
                                             print(f"[DEBUG] ContentIdentifier '{content_id.strip()}' of the source {input_image} and {output_image_path} destination matches")
                                         print(f"Destination {img} as it is already a motion photo, skipping...")
+                                        emit_result(img, "skipped", "already converted in the output folder")
                                         continue
                                 else:
                                     # Do binary comparison to check input and output
                                     if input_output_binary_compare(input_video,output_image_path):
                                         print(f"Destination {img} is already a motion photo, skipping...")
+                                        emit_result(img, "skipped", "already converted in the output folder")
                                         continue
                         
                         try:
                             if args.dry_run:
                                 report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
                             else:
-                                Muxer(
+                                muxer = Muxer(
                                     image_fpath=str(input_image),
                                     video_fpath=str(input_video),
                                     exiftool=et,
@@ -565,12 +582,16 @@ def main():
                                     overwrite=args.overwrite,
                                     no_xmp=args.no_xmp,
                                     verbose=args.verbose,
-                                ).mux()
+                                )
+                                muxer.mux()
+                                emit_result(img, "converted", output=muxer.output_fpath)
                         except MuxerInputError as e:
                             print(f"[WARNING] Skipping {img}: {e}")
+                            emit_result(img, "error", str(e))
                             failed_pairs.append((img, str(e)))
                     else:
                         print(f"No matching video found for {img}")
+                        emit_result(img, "skipped", "no matching video")
                         if args.copy_unmuxed:
                             unmatched_images.append(img)
 
@@ -606,7 +627,7 @@ def main():
             report_dry_run(args, args.input_image, args.input_image, args.input_video,
                            None, removal_kwargs, output_file=args.output_file)
         else:
-            Muxer(
+            muxer = Muxer(
                 image_fpath=args.input_image,
                 video_fpath=args.input_video,
                 exiftool=et,
@@ -618,7 +639,9 @@ def main():
                 overwrite=args.overwrite,
                 no_xmp=args.no_xmp,
                 verbose=args.verbose,
-            ).mux()
+            )
+            muxer.mux()
+            emit_result(args.input_image, "converted", output=muxer.output_fpath)
 
 if __name__ == "__main__":
     # Cancel from the web UI sends SIGTERM: exit normally so temp files are removed

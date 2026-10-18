@@ -68,3 +68,27 @@ def test_popen_decodes_utf8_filenames(monkeypatch, tmp_path):
     appmod.do_run("test")
     assert any("café 日本" in l for l in st.lines)
     assert st.history and st.history[0]["exit_code"] == 0
+
+
+def test_result_lines_feed_results_table_not_log():
+    st = appmod.RunState()
+    st.start("manual")
+    st.emit('@@RESULT {"file": "a<b>.heic", "status": "converted", "reason": "", "output": "/o/a.heic"}')
+    st.emit('@@RESULT {"file": "b.heic", "status": "weird", "reason": "x"}')
+    st.emit("@@RESULT not json")
+    st.emit("normal line")
+    items, total = st.read_results(0)
+    assert total == 2 and items[0][1]["file"] == "a<b>.heic"
+    assert items[1][1]["status"] == "error"          # unknown statuses are coerced
+    assert len(st.lines) == 1 and st.stats["converted"] == 0
+
+
+def test_results_endpoint_and_stream(monkeypatch):
+    from fastapi.testclient import TestClient
+    st = appmod.RunState()
+    monkeypatch.setattr(appmod, "run_state", st)
+    st.start("manual")
+    st.emit('@@RESULT {"file": "a.heic", "status": "skipped", "reason": "no matching video", "output": ""}')
+    st.finish(0)
+    c = TestClient(appmod.app, base_url="http://localhost:7000")
+    assert c.get("/api/results").json()["results"][0]["reason"] == "no matching video"

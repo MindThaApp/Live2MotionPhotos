@@ -67,6 +67,9 @@ WATCH_EXTS = {".heic", ".jpeg", ".jpg", ".mov", ".mp4"}
 # keep the complete log on disk in a size-rotated file.
 MAX_LOG_LINES = int(os.environ.get("LIVE2MOTION_MAX_LOG_LINES") or 5000)
 LOG_FILE_BYTES = 5 * 1024 * 1024
+MAX_RESULTS = 20000          # per-file result rows kept for the results table
+RESULT_PREFIX = "@@RESULT "    # machine-readable lines printed by motionphoto2.py
+RESULT_STATUSES = {"converted", "skipped", "error", "planned"}
 
 
 # ─── Shared run state ─────────────────────────────────────────────────────────
@@ -80,6 +83,8 @@ class RunState:
         self.start_time: Optional[str] = None
         self.lines: deque = deque(maxlen=MAX_LOG_LINES)   # most recent lines only
         self.line_total = 0                                # lines emitted so far (absolute index of the next one)
+        self.results: deque = deque(maxlen=MAX_RESULTS)    # per-file outcomes (dicts)
+        self.result_total = 0
         self.stats: dict = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
         self.history: list = []
         self.cancel_requested = False
@@ -98,6 +103,8 @@ class RunState:
             self.start_time = datetime.now().isoformat()
             self.lines.clear()
             self.line_total = 0
+            self.results.clear()
+            self.result_total = 0
             self.cancel_requested = False
             self.stats = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
             self.skipped_files = []
@@ -112,6 +119,29 @@ class RunState:
             cursor = max(cursor, first)
             items = [(first + i, l) for i, l in enumerate(self.lines) if first + i >= cursor]
             return items, self.line_total, dict(self.stats)
+
+    def read_results(self, cursor: int):
+        """Like read_from, for the per-file results: ([(index, result)], next cursor)."""
+        with self._lock:
+            first = self.result_total - len(self.results)
+            cursor = max(cursor, first)
+            return [(first + i, r) for i, r in enumerate(self.results) if first + i >= cursor], self.result_total
+
+    def _add_result(self, raw: str):
+        try:
+            r = json.loads(raw[len(RESULT_PREFIX):])
+        except ValueError:
+            return
+        if not isinstance(r, dict):
+            return
+        status = r.get("status")
+        self.results.append({
+            "file": str(r.get("file", ""))[:1024],
+            "status": status if status in RESULT_STATUSES else "error",
+            "reason": str(r.get("reason", ""))[:1024],
+            "output": str(r.get("output", ""))[:1024],
+        })
+        self.result_total += 1
 
     def _write_file_log(self, line: str):
         path = os.environ.get("LIVE2MOTION_LOG_FILE") or load_config().get("log_file")
@@ -137,6 +167,9 @@ class RunState:
             self._emit(raw)
 
     def _emit(self, raw: str):
+        if raw.startswith(RESULT_PREFIX):     # goes to the results table, not the log
+            self._add_result(raw)
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {raw}"
         self.lines.append(line)
@@ -764,12 +797,20 @@ def api_status():
     return snap
 
 
+@app.get("/api/results")
+def api_results():
+    """Per-file outcomes of the current/last run (the table in the UI)."""
+    items, total = run_state.read_results(0)
+    return {"results": [r for _, r in items], "total": total}
+
+
 @app.get("/api/progress")
 async def api_progress(request: Request, from_line: int = 0):
     """SSE stream — delivers all lines for the current (or next) run."""
     async def generate():
         yield "retry: 2000\n\n"
         cursor = from_line
+        rcursor = 0
         was_running = False
 
         while True:
@@ -781,10 +822,13 @@ async def api_progress(request: Request, from_line: int = 0):
             for index, line in items:
                 yield f"data: {json.dumps({'line': line, 'index': index, 'stats': stats})}\n\n"
             cursor = next_cursor
+            results, rcursor = run_state.read_results(rcursor)
+            for index, result in results:
+                yield f"data: {json.dumps({'result': result, 'rindex': index})}\n\n"
 
             if run_state.running:
                 was_running = True
-            elif was_running and cursor >= run_state.line_total:
+            elif was_running and cursor >= run_state.line_total and rcursor >= run_state.result_total:
                 # Run ended and all lines delivered
                 payload = json.dumps({
                     "done": True,

@@ -521,6 +521,15 @@ tr:hover td{background:var(--surface2)}
 
     </div>
 
+    <!-- Per-file results (filled from the progress stream; all text set via textContent) -->
+    <div class="hist-wrap" id="res-wrap">
+      <div class="hist-hdr">Results <span id="res-count" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+      <table>
+        <thead><tr><th>File</th><th>Status</th><th>Reason</th><th>Output</th></tr></thead>
+        <tbody id="res-body"><tr id="res-empty"><td colspan="4" style="color:var(--muted);text-align:center;padding:10px 16px">No results yet</td></tr></tbody>
+      </table>
+    </div>
+
     <!-- History -->
     <div class="hist-wrap">
       <div class="hist-hdr">Run History</div>
@@ -642,6 +651,7 @@ async function init() {
   await loadConfig();
   const s = await fetchStatus().catch(() => null);
   if (s?.running) { setRunning(true); connectSSE(0); }
+  else loadResults();
   setInterval(pollStatus, 5000);
 }
 
@@ -717,6 +727,7 @@ async function cancelRun() { await fetch('/api/cancel', {method:'POST'}); }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
 function connectSSE(fromLine) {
+  if (fromLine === 0) clearResults();   // the stream replays every result from the start
   if (sse) { sse.close(); sse = null; }
   sse = new EventSource(`/api/progress?from_line=${fromLine}&token=${encodeURIComponent(getToken())}`);
   sse.onmessage = e => {
@@ -731,6 +742,7 @@ function connectSSE(fromLine) {
       if (d.stats?.skipped > 0) checkCleanup();
       return;
     }
+    if (d.result) { addResult(d.result); return; }
     if (d.line != null) { appendLine(d.line); updateStats(d.stats); }
   };
   sse.onerror = () => {};
@@ -829,6 +841,46 @@ function setSeg(id, pct, offset) {
   const el = document.getElementById(id);
   el.setAttribute('stroke-dasharray', `${pct.toFixed(2)} ${(100-pct).toFixed(2)}`);
   el.setAttribute('stroke-dashoffset', offset.toFixed(2));
+}
+
+// ── Per-file results ──────────────────────────────────────────────────────────
+const RES_MAX_ROWS = 2000;   // rendered rows; the run itself is unaffected
+let resRows = 0;
+function clearResults() {
+  resRows = 0;
+  const body = document.getElementById('res-body');
+  body.textContent = '';
+  const tr = document.createElement('tr'); tr.id = 'res-empty';
+  const td = document.createElement('td');
+  td.colSpan = 4; td.textContent = 'No results yet';
+  td.style.cssText = 'color:var(--muted);text-align:center;padding:10px 16px';
+  tr.appendChild(td); body.appendChild(tr);
+  document.getElementById('res-count').textContent = '';
+}
+function addResult(r) {
+  document.getElementById('res-empty')?.remove();
+  resRows++;
+  document.getElementById('res-count').textContent = `(${resRows})`;
+  if (resRows > RES_MAX_ROWS) return;
+  const tr = document.createElement('tr');
+  const cell = (text, style) => {
+    const td = document.createElement('td');
+    td.textContent = text ?? '';
+    if (style) td.style.cssText = style;
+    tr.appendChild(td); return td;
+  };
+  cell(r.file, 'word-break:break-all;white-space:normal');
+  const colors = {converted:'var(--green)', planned:'var(--blue)', skipped:'var(--yellow)', error:'var(--red)'};
+  cell(r.status, 'color:' + (colors[r.status] || 'var(--muted)'));
+  cell(r.reason, 'color:var(--muted)');
+  cell(r.output, 'color:var(--muted);word-break:break-all;white-space:normal');
+  document.getElementById('res-body').appendChild(tr);
+}
+async function loadResults() {
+  const d = await fetch('/api/results').then(r => r.json()).catch(() => null);
+  if (!d) return;
+  clearResults();
+  d.results.forEach(addResult);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
