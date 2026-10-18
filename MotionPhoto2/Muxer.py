@@ -13,6 +13,7 @@ from utils import (
     read_file,
     enrich_fname,
 )
+from video_removal import verify_muxed_output, remove_video
 
 import constants as const
 from SamsungTags import SamsungTags
@@ -40,6 +41,9 @@ class Muxer:
         output_fpath: str = None,
         output_directory: str = None,
         delete_video: bool = False,
+        video_removal_mode: str = None,
+        video_removal_folder: str = None,
+        video_removal_root: str = None,
         delete_temp: bool = True,
         overwrite: bool = False,
         no_xmp: bool = False,
@@ -57,6 +61,9 @@ class Muxer:
         self.output_directory = output_directory
         self.overwrite = overwrite
         self.delete_video = delete_video
+        self.video_removal_mode = video_removal_mode
+        self.video_removal_folder = video_removal_folder
+        self.video_removal_root = video_removal_root
         self.no_xmp = no_xmp
         self.exiftool = exiftool
 
@@ -270,6 +277,8 @@ class Muxer:
             samsung_tail = SamsungTags(video_data, image_type)
             merged_bytes = read_file(self.image_fpath)
         samsung_tail.set_image_size(len(merged_bytes))
+        image_size = os.path.getsize(self.image_fpath)  # before an overwrite replaces it
+        video_offset = len(merged_bytes) + samsung_tail.get_image_padding()
         video_footer = samsung_tail.video_footer()
         merged_bytes += video_footer
 
@@ -285,8 +294,17 @@ class Muxer:
             self.logger.debug("Delete: %s", xmp_image)
 
         if self.delete_video is True:
-            os.remove(self.video_fpath)
-            self.logger.debug("Delete: %s", self.video_fpath)
+            problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size)
+            if problem:
+                self.logger.warning("Keeping video %s, output verification failed: %s", self.video_fpath, problem)
+            else:
+                action = remove_video(
+                    self.video_fpath,
+                    mode=self.video_removal_mode,
+                    root=self.video_removal_root,
+                    folder=self.video_removal_folder,
+                )
+                self.logger.debug("Video removal (%s): %s", action, self.video_fpath)
             
         if self.overwrite is True and self.output_fpath != self.org_outfpath:
             os.remove(self.org_outfpath)

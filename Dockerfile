@@ -15,4 +15,6 @@ COPY . .
 
 EXPOSE 7000
 
+ENV LIVE2MOTION_DOCKER=1
+
 CMD ["python", "app.py"]

@@ -46,6 +46,7 @@ except ImportError:
             return group
 
 from Muxer import Muxer, MuxerInputError
+from video_removal import normalize_mode, removal_folder
 from utils import is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
 
 logging.basicConfig(
@@ -149,6 +150,21 @@ def main():
         gooey_options={'initial_value':defaults['delete_video']}
     )
     
+    settings_group.add_argument(
+        "--video-removal-mode",
+        choices=["trash", "move", "delete"],
+        default=None,
+        help="How --delete-video removes the video (default: move in Docker, otherwise trash)",
+        gooey_options={'visible':False}
+    )
+
+    settings_group.add_argument(
+        "--video-removal-folder",
+        default=None,
+        help="Folder for --video-removal-mode move (default: <input directory>/_deleted_videos)",
+        gooey_options={'visible':False}
+    )
+
     settings_group.add_argument(
         "-o",
         "--overwrite",
@@ -309,6 +325,15 @@ def main():
     defaults['no_xmp']=args.no_xmp
     save_defaults(defaults)
             
+    # Where --delete-video sends videos; in directory mode they must stay inside the input directory
+    removal_root = f"{Path(args.input_directory).resolve()}" if args.input_directory is not None else None
+    removal_kwargs = {
+        'video_removal_mode': normalize_mode(args.video_removal_mode),
+        'video_removal_folder': args.video_removal_folder,
+        'video_removal_root': removal_root,
+    }
+    skip_folder = removal_folder(removal_root, args.video_removal_folder) if removal_root else None
+
     logger = logging.getLogger("ExifTool")
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     
@@ -325,7 +350,9 @@ def main():
             files = []
             if args.recursive:
                 # Recursive mode: walk through all subdirectories
-                for root, _, filenames in os.walk(input_directory):
+                for root, dirnames, filenames in os.walk(input_directory):
+                    # never rescan videos that were moved aside by --delete-video
+                    dirnames[:] = [d for d in dirnames if not (skip_folder and (Path(root) / d).resolve() == skip_folder)]
                     for filename in filenames:
                         full_path = Path(root) / filename
                         rel_path = full_path.relative_to(input_directory)
@@ -401,6 +428,7 @@ def main():
                                     exiftool=et,
                                     output_directory=str(output_subdirectory) if output_subdirectory else None,
                                     delete_video=args.delete_video,
+                                    **removal_kwargs,
                                     delete_temp=not args.keep_temp,
                                     overwrite=args.overwrite,
                                     no_xmp=args.no_xmp,
@@ -500,6 +528,7 @@ def main():
                                 exiftool=et,
                                 output_directory=str(output_subdirectory) if output_subdirectory else None,
                                 delete_video=args.delete_video,
+                                **removal_kwargs,
                                 delete_temp=not args.keep_temp,
                                 overwrite=args.overwrite,
                                 no_xmp=args.no_xmp,
@@ -546,6 +575,7 @@ def main():
                 output_fpath=args.output_file,
                 output_directory=args.output_directory,
                 delete_video=args.delete_video,
+                **removal_kwargs,
                 delete_temp=not args.keep_temp,
                 overwrite=args.overwrite,
                 no_xmp=args.no_xmp,

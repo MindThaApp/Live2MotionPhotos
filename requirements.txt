@@ -10,3 +10,4 @@ watchdog>=3.0.0
 lxml
 PyExifTool
 six
+send2trash>=1.8.0
