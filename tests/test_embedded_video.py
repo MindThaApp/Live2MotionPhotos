@@ -42,7 +42,7 @@ def test_identical_video_verifies(pair):
 def test_different_video_rejected(pair):
     photo, vid = pair
     vid.write_bytes(VIDEO[:-1] + b"\x01")          # same size, different content
-    assert "differs" in vr.verify_embedded_video(photo, vid)
+    assert "differ" in vr.verify_embedded_video(photo, vid)
     vid.write_bytes(VIDEO + b"x")                  # different size
     assert "bytes" in vr.verify_embedded_video(photo, vid)
 
