@@ -114,9 +114,11 @@ WATCH_EXTS = {".heic", ".jpeg", ".jpg", ".mov", ".mp4"}
 # keep the complete log on disk in a size-rotated file.
 MAX_LOG_LINES = int(os.environ.get("LIVE2MOTION_MAX_LOG_LINES") or 5000)
 LOG_FILE_BYTES = 5 * 1024 * 1024
-MAX_RESULTS = 20000          # per-file result rows kept for the results table
+MAX_RESULTS = 100000         # per-file result rows kept for the results table
 RESULT_PREFIX = "@@RESULT "    # machine-readable lines printed by motionphoto2.py
 RESULT_STATUSES = {"converted", "skipped", "error", "planned"}
+# Finer per-row classification the Preview filters on (see classify_row).
+ROW_KINDS = ("ready", "motion_leftover", "motion_only", "no_mov", "no_photo", "skipped", "error", "missing")
 
 
 # ─── Shared run state ─────────────────────────────────────────────────────────
@@ -187,6 +189,8 @@ class RunState:
             "status": status if status in RESULT_STATUSES else "error",
             "reason": str(r.get("reason", ""))[:1024],
             "output": str(r.get("output", ""))[:1024],
+            "kind": r.get("kind") if r.get("kind") in ROW_KINDS else "",
+            "video": str(r.get("video", ""))[:1024],
         })
         self.result_total += 1
 
@@ -639,6 +643,34 @@ last_preview: dict = {}      # {"id", "fingerprint", "names", "rows", "created",
 _preview_lock = threading.Lock()
 
 
+def classify_row(r: dict) -> str:
+    """The row's kind; rows without one (older Previews, plain runs) are derived from status/reason."""
+    if r.get("kind") in ROW_KINDS:
+        return r["kind"]
+    st, why = r.get("status"), str(r.get("reason", "")).lower()
+    if st == "planned":
+        return "ready"
+    if st == "error":
+        return "error"
+    if "already a motion photo" in why:
+        return "motion_only"
+    if "no matching video" in why:
+        return "no_mov"
+    if "no matching photo" in why:
+        return "no_photo"
+    return "skipped"
+
+
+def _norm_row(r: dict) -> dict:
+    out = {k: str(r.get(k, "")) for k in ("file", "status", "reason", "output", "video")}
+    out["kind"] = classify_row(r)
+    return out
+
+
+def _actionable(r: dict, done: set) -> bool:
+    return (r["kind"] == "ready" and r["file"] not in done) or r["kind"] == "motion_leftover"
+
+
 def preview_file() -> Path:
     return CONFIG_FILE.with_name("preview.json")
 
@@ -659,6 +691,7 @@ def set_preview(fingerprint: dict, rows: list):
         last_preview.clear()
         last_preview.update({"id": uuid.uuid4().hex, "fingerprint": fingerprint, "created": time.time(),
                              "rows": rows, "names": {r["file"] for r in rows}, "done": set()})
+        last_preview["rows"] = [_norm_row(r) for r in rows]
         try:
             _save_preview()
         except OSError:
@@ -678,7 +711,7 @@ def load_preview():
     """Restore the saved Preview after a restart (no-op if none or unreadable)."""
     try:
         d = json.loads(preview_file().read_text(encoding="utf-8"))
-        rows = [{k: str(r.get(k, "")) for k in ("file", "status", "reason", "output")} for r in d["rows"]]
+        rows = [_norm_row(r) for r in d["rows"]]
         with _preview_lock:
             last_preview.clear()
             last_preview.update({"id": str(d["id"]), "fingerprint": dict(d["fingerprint"]),
@@ -694,7 +727,11 @@ def mark_preview_done(preview_id: str, converted):
         if not last_preview or last_preview.get("id") != preview_id:
             return
         last_preview["done"] |= (set(converted) & last_preview["names"])
-        left = last_preview["names"] - last_preview["done"]
+        rows = last_preview.get("rows")
+        if rows:
+            left = [r for r in rows if _actionable(r, last_preview["done"])]
+        else:
+            left = last_preview["names"] - last_preview["done"]
         if left:
             try:
                 _save_preview()
@@ -702,6 +739,22 @@ def mark_preview_done(preview_id: str, converted):
                 pass
             return
     clear_preview()
+
+
+def mark_preview_missing(preview_id: str, files):
+    """A run reported these files as gone: the rows stop being selectable."""
+    with _preview_lock:
+        if not last_preview or last_preview.get("id") != preview_id:
+            return
+        files = set(files)
+        for r in last_preview.get("rows", []):
+            if r["file"] in files:
+                r["kind"], r["video"] = "missing", ""
+                r["reason"] = "file no longer exists"
+        try:
+            _save_preview()
+        except (OSError, KeyError):
+            pass
 
 
 def preview_fingerprint(cfg: dict) -> dict:
@@ -716,9 +769,22 @@ def preview_status() -> dict:
         return {"id": None, "stale": True, "count": 0, "rows": [], "created": None}
     stale = last_preview["fingerprint"] != preview_fingerprint(load_config())
     done = last_preview.get("done", set())
-    rows = [{**r, "done": r["file"] in done} for r in last_preview.get("rows", [])]
-    return {"id": last_preview["id"], "stale": stale, "count": len(last_preview["names"] - done),
-            "rows": rows, "created": last_preview.get("created")}
+    with _preview_lock:
+        rows = [{**r, "kind": classify_row(r), "done": r["file"] in done} for r in last_preview.get("rows", [])]
+    for r in rows:
+        r["state"] = "converted" if r["done"] else r["kind"]
+    counts: dict = {}
+    for r in rows:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+    cfg = load_config()
+    root = cfg.get("input_directory") or None
+    return {"id": last_preview["id"], "stale": stale,
+            "count": counts.get("ready", 0) if rows else len(last_preview["names"] - done),
+            "rows": rows, "created": last_preview.get("created"),
+            "counts": {"all": len(rows), **counts},
+            "cleanup": {"mode": video_removal.normalize_mode(cfg.get("video_removal_mode")),
+                        "destination": video_removal.describe_destination(
+                            cfg.get("video_removal_mode"), root, cfg.get("video_removal_folder"))}}
 
 
 def validate_selected(preview_id, files, cfg: dict, preview: dict, skipped: Optional[list] = None) -> list:
@@ -743,9 +809,14 @@ def validate_selected(preview_id, files, cfg: dict, preview: dict, skipped: Opti
         full = (root / f).resolve()
         if not video_removal.is_inside(full, root) or not is_browsable(full, browse_roots()):
             raise ValueError(f"Path is outside the input directory: {f}")
+        kind = next((classify_row(r) for r in preview.get("rows", []) if r["file"] == f), "ready")
         if f in done:
             if skipped is not None:
                 skipped.append({"file": f, "reason": "already converted"})
+        elif kind != "ready":
+            if skipped is not None:
+                skipped.append({"file": f, "reason": "file no longer exists" if kind == "missing"
+                                else f"not ready to convert ({kind})"})
         elif not full.is_file():
             if skipped is not None:
                 skipped.append({"file": f, "reason": "file no longer exists"})
@@ -801,7 +872,7 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         proc.wait()
         run_state.emit(f"{'✓' if proc.returncode == 0 else '✗'} Exited with code {proc.returncode}")
         if proc.returncode == 0 and run_state.dry_run and extract is None and not only_files:
-            rows = [r for _, r in run_state.read_results(0)[0] if r["status"] == "planned"]
+            rows = [r for _, r in run_state.read_results(0)[0]]
             set_preview(preview_fingerprint(cfg), rows)
         elif proc.returncode == 0 and only_files and preview_id:
             mark_preview_done(preview_id, [r["file"] for _, r in run_state.read_results(0)[0]
@@ -1072,10 +1143,96 @@ async def api_run_selected(request: Request):
         msg = str(e)
         return JSONResponse({"error": msg, "stale": "Preview" in msg or "changed" in msg},
                             status_code=409 if "Preview" in msg or "changed" in msg else 400)
+    mark_preview_missing(body["preview_id"], [s["file"] for s in skipped if s["reason"] == "file no longer exists"])
     if files:
         threading.Thread(target=do_run, args=("manual", False, None, files, body["preview_id"], skipped),
                          daemon=True).start()
     return {"ok": True, "count": len(files), "skipped": skipped}
+
+
+@app.post("/api/cleanup-movs")
+async def api_cleanup_movs(request: Request):
+    """Dispose of the leftover MOVs of Preview rows classed 'already a Motion Photo'.
+    Body: {"preview_id": "...", "files": [photo rel paths]}. Each MOV is removed only
+    after the photo is re-verified to contain an identical embedded video; the
+    configured removal mode applies (bin by default, move to folder, or delete)."""
+    if run_state.running:
+        return JSONResponse({"error": "Already running"}, status_code=409)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Body must be a JSON object")
+        cfg = load_config()
+        if not last_preview:
+            load_preview()
+        files = body.get("files")
+        pv = last_preview
+        if not pv or pv.get("id") != body.get("preview_id"):
+            raise ValueError("Preview not found: run Preview again")
+        if pv["fingerprint"] != preview_fingerprint(cfg):
+            raise ValueError("Preview is out of date: settings changed since the preview")
+        if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
+            raise ValueError("'files' must be a non-empty list of paths")
+        root = Path(cfg.get("input_directory") or "").expanduser().resolve()
+        if not root.is_dir() or not is_browsable(root, browse_roots()):
+            raise ValueError("Input directory is not available")
+        rowmap = {r["file"]: r for r in pv.get("rows", [])}
+        for f in files:
+            if f not in rowmap:
+                raise ValueError(f"Not part of the preview: {f}")
+    except ValueError as e:
+        msg = str(e)
+        stale = "Preview" in msg or "changed" in msg
+        return JSONResponse({"error": msg, "stale": stale}, status_code=409 if stale else 400)
+    return cleanup_movs(files, rowmap, cfg, root)
+
+
+def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
+    cleaned, refused, errors, skipped = [], [], [], []
+    mode = cfg.get("video_removal_mode")
+    gone = []
+    for f in dict.fromkeys(files):
+        row = rowmap[f]
+        if classify_row(row) != "motion_leftover" or not row.get("video"):
+            skipped.append({"file": f, "reason": "no leftover MOV for this row"})
+            continue
+        photo, video = (root / f).resolve(), (root / row["video"]).resolve()
+        if not (video_removal.is_inside(photo, root) and video_removal.is_inside(video, root)
+                and is_browsable(photo, browse_roots()) and is_browsable(video, browse_roots())):
+            errors.append({"file": f, "error": "path is outside the input directory"})
+            continue
+        if not photo.is_file():
+            gone.append(f)
+            skipped.append({"file": f, "reason": "photo no longer exists"})
+            continue
+        if not video.is_file():
+            with _preview_lock:
+                row["kind"], row["video"], row["reason"] = "motion_only", "", "already a motion photo"
+            skipped.append({"file": f, "reason": "MOV already gone"})
+            continue
+        problem = video_removal.verify_embedded_video(str(photo), str(video))
+        if problem:
+            refused.append({"file": f, "reason": problem})
+            continue
+        try:
+            action = video_removal.remove_video(str(video), mode, str(root), cfg.get("video_removal_folder"))
+        except Exception as e:
+            errors.append({"file": f, "error": str(e)})
+            continue
+        cleaned.append({"file": f, "video": row["video"], "action": action})
+        with _preview_lock:
+            row["kind"], row["video"], row["reason"] = "motion_only", "", "already a motion photo"
+    if gone:
+        with _preview_lock:
+            for f in gone:
+                rowmap[f].update(kind="missing", video="", reason="file no longer exists")
+    with _preview_lock:
+        try:
+            _save_preview()
+        except (OSError, KeyError):
+            pass
+    return {"ok": True, "cleaned": len(cleaned), "details": cleaned, "refused": refused,
+            "errors": errors, "skipped": skipped}
 
 
 @app.post("/api/run")
