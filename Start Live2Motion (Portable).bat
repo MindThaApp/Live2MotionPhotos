@@ -6,6 +6,13 @@ REM Closing this window stops the server.
 cd /d "%~dp0"
 
 if not exist "python\python.exe" (
+  if exist "Start Live2Motion.bat" (
+    echo No bundled Python found - this looks like a source checkout, not the portable ZIP.
+    echo Starting the regular launcher instead...
+    echo.
+    call "Start Live2Motion.bat"
+    exit /b
+  )
   echo This launcher must stay inside the extracted Live2Motion portable folder
   echo ^(python\python.exe was not found next to it^).
   echo Re-extract the full ZIP and run it from there.
