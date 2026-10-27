@@ -46,10 +46,11 @@ except ImportError:
             group.add_argument = lambda *a, **kw: orig_add_argument(*a, **_strip_gooey_kwargs(kw))
             return group
 
-from Muxer import Muxer, MuxerInputError
+from Muxer import Muxer, MuxerInputError, OutputConflictError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
 from video_removal import normalize_mode, skip_folders, describe_destination
-from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
+from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
+    output_with_extension, output_conflict, claim_output
 
 logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
@@ -100,9 +101,20 @@ def planned_output(args, image: str, output_directory, output_file=None) -> str:
     return output_file or enrich_fname(str(image), "LIVE")
 
 
-def report_dry_run(args, name, image: str, video: str, output_directory, removal_kwargs, output_file=None):
-    """--dry-run: say what a real run would do for this pair, touch nothing."""
-    out = planned_output(args, image, output_directory, output_file)
+def report_dry_run(args, name, image: str, video: str, output_directory, removal_kwargs, output_file=None,
+                   ext=None, claimed=None):
+    """--dry-run: say what a real run would do for this pair, touch nothing.
+    ext is the image's real extension (File:FileTypeExtension): the real run writes
+    IMG.jpeg as IMG.jpg, so the preview must check that name. A path another file
+    already owns (or another photo of this run writes) is reported as a conflict."""
+    base = planned_output(args, image, output_directory, output_file)
+    out = output_with_extension(base, ext)
+    why = output_conflict(out, image, video, claimed, rerun_ok=not args.overwrite and out == base)
+    if why:
+        print(f"[DRY-RUN] Would skip {name}: {why}")
+        emit_result(name, "skipped", why[0].upper() + why[1:], out, kind="conflict")
+        return
+    claim_output(claimed, out)
     print(f"[DRY-RUN] Would convert {name} + {video} -> {out}")
     dest = describe_destination(removal_kwargs['video_removal_mode'], removal_kwargs.get('video_removal_root'),
                                 removal_kwargs.get('video_removal_folder'))
@@ -528,13 +540,32 @@ def main():
             failed_pairs = []
             all_videos = list(videos)
             claimed_videos = set()     # videos that belong to some photo (so are not "MOV without a photo")
+            claimed_outputs = set()    # output paths already taken in this run (two photos must not write one file)
 
             if not args.exif_match: # match by file name
+                # Several photos can share one video by name (IMG.HEIC + IMG.jpeg + IMG.jpg
+                # next to IMG.MOV). Count them first so --delete-video only removes the video
+                # after the last of them, and never pop it from the list on first use.
+                video_names = set(videos)
+                def name_match(image):
+                    base = str(Path(image).with_suffix(''))
+                    return next((base + e for e in (".mp4", ".mov", ".MP4", ".MOV") if base + e in video_names), None)
+                photos_left = {}
+                for image in images:
+                    v = name_match(image)
+                    if v:
+                        photos_left[v] = photos_left.get(v, 0) + 1
+
                 i = 0
                 for image in images:
                     i += 1
                     image_path = Path(image)
                     fname = str(image_path.with_suffix(''))
+                    last_photo_for_video = True
+                    v0 = name_match(image)
+                    if v0:
+                        photos_left[v0] -= 1
+                        last_photo_for_video = photos_left[v0] <= 0
 
                     # Check if source image is already a motion photo
                     is_mp, err = check_motion_photo(input_directory / image, et)
@@ -557,9 +588,11 @@ def main():
                     
                     for ext in [".mp4", ".mov", ".MP4", ".MOV"]:
                         video_fname = fname + ext
-                        if video_fname in videos:
+                        if video_fname in video_names:
                             print(f"=========================[{i}/{len(images)}]")
-                            video = videos.pop(videos.index(video_fname))
+                            video = video_fname
+                            if video in videos:
+                                videos.remove(video)     # matched: not an "unmuxed" video to copy
                             claimed_videos.add(video)
 
                             # Construct full paths for input files
@@ -584,22 +617,31 @@ def main():
                             
                             try:
                                 if args.dry_run:
-                                    report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
+                                    try:
+                                        real_ext = et.get_metadata(str(input_image))[0].get('File:FileTypeExtension')
+                                    except Exception:
+                                        real_ext = None
+                                    report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory,
+                                                   removal_kwargs, ext=real_ext, claimed=claimed_outputs)
                                 else:
                                     muxer = Muxer(
                                         image_fpath=str(input_image),
                                         video_fpath=str(input_video),
                                         exiftool=et,
                                         output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                        delete_video=args.delete_video,
+                                        delete_video=args.delete_video and last_photo_for_video,
                                         **removal_kwargs,
                                         delete_temp=not args.keep_temp,
                                         overwrite=args.overwrite,
                                         no_xmp=args.no_xmp,
                                         verbose=args.verbose,
+                                        claimed_outputs=claimed_outputs,
                                     )
                                     muxer.mux()
                                     emit_result(image, "converted", output=muxer.output_fpath)
+                            except OutputConflictError as e:
+                                print(f"[WARNING] Skipping {image}: {e}")
+                                emit_result(image, "skipped", str(e), kind="conflict")
                             except MuxerInputError as e:
                                 print(f"[WARNING] Skipping {image}: {e}")
                                 emit_result(image, "error", str(e), kind="error")
@@ -723,7 +765,8 @@ def main():
                         
                         try:
                             if args.dry_run:
-                                report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs)
+                                report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs,
+                                               ext=img_meta.get('File:FileTypeExtension'), claimed=claimed_outputs)
                             else:
                                 muxer = Muxer(
                                     image_fpath=str(input_image),
@@ -736,9 +779,13 @@ def main():
                                     overwrite=args.overwrite,
                                     no_xmp=args.no_xmp,
                                     verbose=args.verbose,
+                                    claimed_outputs=claimed_outputs,
                                 )
                                 muxer.mux()
                                 emit_result(img, "converted", output=muxer.output_fpath)
+                        except OutputConflictError as e:
+                            print(f"[WARNING] Skipping {img}: {e}")
+                            emit_result(img, "skipped", str(e), kind="conflict")
                         except MuxerInputError as e:
                             print(f"[WARNING] Skipping {img}: {e}")
                             emit_result(img, "error", str(e), kind="error")

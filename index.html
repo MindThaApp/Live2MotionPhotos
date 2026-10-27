@@ -997,9 +997,9 @@ function clearResults() {
 let previewInfo = null;
 let selected = new Set(), activeFilter = 'all', selPreviewId = null;
 const KIND_LABEL = {ready:'Ready to convert', motion_leftover:'Motion Photo + leftover MOV', motion_only:'Already Motion Photo',
-  no_mov:'No matching MOV', no_photo:'MOV, no photo', skipped:'Skipped', error:'Error', converted:'Converted', missing:'Missing'};
+  no_mov:'No matching MOV', no_photo:'MOV, no photo', skipped:'Skipped', conflict:'Output conflict', error:'Error', converted:'Converted', missing:'Missing'};
 const KIND_COLOR = {ready:'var(--blue)', motion_leftover:'var(--purple)', motion_only:'var(--green)', no_mov:'var(--yellow)',
-  no_photo:'var(--yellow)', skipped:'var(--yellow)', error:'var(--red)', converted:'var(--green)', missing:'var(--red)'};
+  no_photo:'var(--yellow)', skipped:'var(--yellow)', conflict:'var(--red)', error:'var(--red)', converted:'var(--green)', missing:'var(--red)'};
 const CHIPS = [
   ['all', 'All', null],
   ['ready', 'Ready', ['ready']],
@@ -1008,6 +1008,7 @@ const CHIPS = [
   ['no_mov', 'No MOV', ['no_mov']],
   ['no_photo', 'MOV, no photo', ['no_photo']],
   ['skipped', 'Skipped', ['skipped']],
+  ['conflict', 'Output conflict', ['conflict']],
   ['error', 'Error', ['error']],
   ['converted', 'Converted', ['converted']],
   ['missing', 'Missing', ['missing']],
