@@ -93,7 +93,7 @@ input:disabled{opacity:.5;cursor:not-allowed}
 .sel-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 #res-table{table-layout:fixed;min-width:480px}
 #res-table td,#res-table th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:5px 10px}
-#res-table .c-sel{width:34px}#res-table .c-st{width:170px}
+#res-table .c-sel{width:34px}#res-table .c-st{width:215px}
 #res-table .c-file{width:42%}#res-table .c-why{width:26%}
 #res-body tr.info td{opacity:.8}
 #confirm-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:900;display:none;align-items:center;justify-content:center;padding:16px}
@@ -108,7 +108,8 @@ input:disabled{opacity:.5;cursor:not-allowed}
   .hdr{flex-wrap:wrap;padding:8px 10px}
   #res-wrap{height:60vh}
   #res-table .c-why,#res-table .c-out,#res-table th:nth-child(4),#res-table th:nth-child(5),#res-table td:nth-child(4),#res-table td:nth-child(5){display:none}
-  #res-table .c-st{width:120px}#res-table .c-file{width:auto}
+  #res-table{min-width:0}
+  #res-table .c-st{width:112px}#res-table .c-file{width:auto}
 }
 #video_removal_opts select,#video_removal_opts input[type=text]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)}
 
