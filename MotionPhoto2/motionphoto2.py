@@ -629,10 +629,26 @@ def main():
                         if args.verbose:
                             print(f"[DEBUG] Mapped video {vid} to ContentIdentifier: {content_id}")
                 
+                # Several photos can share one video (e.g. HEIC + JPEG exports of the same
+                # Live Photo). Count the photos per video so --delete-video only removes it
+                # after the last of them, otherwise the rest fail with "Video file doesn't exist".
+                photos_left = {}
+                for img_meta in image_metadatas:
+                    cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
+                    if cid in content_id_to_video:
+                        v = content_id_to_video[cid][0]
+                        photos_left[v] = photos_left.get(v, 0) + 1
+
                 # Match images to videos
                 i = 0
                 for img, img_meta in zip(images, image_metadatas):
                     i += 1
+                    cid0 = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
+                    last_photo_for_video = True
+                    if cid0 in content_id_to_video:
+                        v0 = content_id_to_video[cid0][0]
+                        photos_left[v0] -= 1
+                        last_photo_for_video = photos_left[v0] <= 0
 
                     # Check if source image is already a motion photo
                     is_mp, err = check_motion_photo(input_directory / img, et)
@@ -714,7 +730,7 @@ def main():
                                     video_fpath=str(input_video),
                                     exiftool=et,
                                     output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                    delete_video=args.delete_video,
+                                    delete_video=args.delete_video and last_photo_for_video,
                                     **removal_kwargs,
                                     delete_temp=not args.keep_temp,
                                     overwrite=args.overwrite,
