@@ -45,7 +45,7 @@ def test_report_dry_run_output(capsys, tmp_path):
     kw = {"video_removal_mode": "trash"}
     mp.report_dry_run(args, "a.heic", "/in/a.heic", "/in/a.mov", None, kw)
     mp.report_dry_run(args, "a.heic", "/in/a.heic", "/in/a.mov", "/out", kw)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out.replace("\\", "/")   # Windows path separators
     assert "[DRY-RUN] Would convert a.heic + /in/a.mov -> /in/a.LIVE.heic" in out
     assert "-> /out/a.heic" in out
     assert "[DRY-RUN] Would remove video /in/a.mov; it goes to recycle bin" in out

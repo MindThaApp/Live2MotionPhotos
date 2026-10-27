@@ -196,7 +196,7 @@ def test_cli_extract_emits_results(tmp_path, video):
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     results = [json.loads(l[len("@@RESULT "):]) for l in proc.stdout.splitlines() if l.startswith("@@RESULT ")]
-    assert results[0]["status"] == "planned" and results[0]["output"].endswith("_extracted/good.mp4")
+    assert results[0]["status"] == "planned" and results[0]["output"].replace("\\", "/").endswith("_extracted/good.mp4")
     assert not (tmp_path / "good.mp4").exists()
     real = subprocess.run([sys.executable, str(ROOT / "MotionPhoto2" / "motionphoto2.py"), "--extract",
                            "--input-image", str(tmp_path / "good.jpg"), "--extract-mov"],

@@ -178,9 +178,10 @@ def test_selected_paths_validated(preview_env):
             appmod.validate_selected("p1", bad, cfg, prev)
     with pytest.raises(ValueError, match="Preview"):
         appmod.validate_selected("other", ["a.jpg"], cfg, prev)
-    (root / "a.jpg").unlink()
-    with pytest.raises(ValueError, match="no longer exists"):
-        appmod.validate_selected("p1", ["a.jpg"], cfg, prev)
+    (root / "a.jpg").unlink()           # gone files are skipped and reported, not an error
+    skipped = []
+    assert appmod.validate_selected("p1", ["a.jpg", str(Path("sub/b.jpg"))], cfg, prev, skipped) == [str(Path("sub/b.jpg"))]
+    assert skipped == [{"file": "a.jpg", "reason": "file no longer exists"}]
 
 
 def test_stale_preview_detected(preview_env):
@@ -231,3 +232,81 @@ def test_cli_only_file_filters_images(tmp_path):
                         str(root), "--dry-run", "--only-file", str(only)],
                        capture_output=True, text=True, cwd=tmp_path)
     assert '"file": "a.jpg"' in r.stdout and '"file": "b.jpg"' not in r.stdout, r.stdout + r.stderr
+
+
+def _rows(*names):
+    return [{"file": n, "status": "planned", "reason": "", "output": ""} for n in names]
+
+
+def test_preview_persists_and_reloads(preview_env, monkeypatch):
+    _, cfg, _ = preview_env
+    appmod.set_preview(appmod.preview_fingerprint(cfg), _rows("a.jpg"))
+    saved = json.loads(appmod.preview_file().read_text())
+    assert saved["rows"][0]["file"] == "a.jpg" and not appmod.preview_file().with_name("preview.json.tmp").exists()
+    pid = appmod.last_preview["id"]
+    appmod.last_preview.clear()                      # simulate an app restart
+    st = appmod.preview_status()
+    assert st["id"] == pid and st["count"] == 1 and st["stale"] is False and st["created"]
+    assert st["rows"][0]["file"] == "a.jpg"
+
+
+def test_corrupt_preview_file_ignored(preview_env):
+    appmod.last_preview.clear()
+    appmod.preview_file().write_text("{nope")
+    assert appmod.preview_status()["id"] is None
+
+
+def test_selected_skips_gone_and_done(preview_env):
+    root, cfg, _ = preview_env
+    appmod.set_preview(appmod.preview_fingerprint(cfg), _rows("a.jpg", str(Path("sub/b.jpg"))))
+    prev = appmod.last_preview
+    prev["done"].add("a.jpg")
+    (root / "sub" / "b.jpg").unlink()
+    skipped = []
+    assert appmod.validate_selected(prev["id"], ["a.jpg", str(Path("sub/b.jpg"))], cfg, prev, skipped) == []
+    assert {s["reason"] for s in skipped} == {"already converted", "file no longer exists"}
+
+
+def test_run_selected_all_skipped_does_not_run(preview_env, monkeypatch):
+    from fastapi.testclient import TestClient
+    root, cfg, _ = preview_env
+    appmod.set_preview(appmod.preview_fingerprint(cfg), _rows("a.jpg"))
+    (root / "a.jpg").unlink()
+    seen = []
+    monkeypatch.setattr(appmod, "do_run", lambda *a: seen.append(a))
+    monkeypatch.setattr(appmod.run_state, "running", False)
+    c = TestClient(appmod.app, base_url="http://localhost:7000")
+    r = c.post("/api/run-selected", json={"preview_id": appmod.last_preview["id"], "files": ["a.jpg"]})
+    assert r.status_code == 200 and r.json()["count"] == 0 and r.json()["skipped"][0]["file"] == "a.jpg"
+    import time; time.sleep(0.2)
+    assert seen == []
+
+
+def test_stale_preview_returns_409_out_of_date(preview_env):
+    from fastapi.testclient import TestClient
+    _, cfg, _ = preview_env
+    appmod.set_preview(appmod.preview_fingerprint(cfg), _rows("a.jpg"))
+    pid = appmod.last_preview["id"]
+    appmod.CONFIG_FILE.write_text(json.dumps({**cfg, "overwrite": True}))
+    c = TestClient(appmod.app, base_url="http://localhost:7000")
+    r = c.post("/api/run-selected", json={"preview_id": pid, "files": ["a.jpg"]})
+    assert r.status_code == 409 and "Preview is out of date" in r.json()["error"]
+
+
+def test_mark_done_then_clear(preview_env):
+    _, cfg, _ = preview_env
+    appmod.set_preview(appmod.preview_fingerprint(cfg), _rows("a.jpg", "b.jpg"))
+    pid = appmod.last_preview["id"]
+    appmod.mark_preview_done(pid, ["a.jpg"])
+    st = appmod.preview_status()
+    assert st["count"] == 1 and [r["done"] for r in st["rows"]] == [True, False]
+    appmod.last_preview.clear()                      # done flags survive a restart too
+    assert appmod.preview_status()["count"] == 1
+    appmod.mark_preview_done(pid, ["b.jpg"])
+    assert appmod.preview_status()["id"] is None and not appmod.preview_file().exists()
+
+
+def test_ui_has_no_dry_run_tickbox_and_run_sends_false():
+    html = (Path(appmod.__file__).parent / "index.html").read_text(encoding="utf-8")
+    assert 'id="dry_run"' not in html and "gc('dry_run')" not in html
+    assert "'/api/run?dry_run=' + (dryRun === true)" in html

@@ -635,7 +635,73 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
 PREVIEW_KEYS = ("input_directory", "output_directory", "recursive", "exif_match", "incremental_mode",
                 "copy_unmuxed", "overwrite", "delete_video", "video_removal_mode",
                 "video_removal_folder", "no_xmp")
-last_preview: dict = {}      # {"id", "fingerprint", "names"} of the latest finished mux dry run
+last_preview: dict = {}      # {"id", "fingerprint", "names", "rows", "created", "done"} of the latest finished mux dry run
+_preview_lock = threading.Lock()
+
+
+def preview_file() -> Path:
+    return CONFIG_FILE.with_name("preview.json")
+
+
+def _save_preview():
+    """Atomic write next to the config, so a restart keeps the Preview."""
+    p = preview_file()
+    data = {"id": last_preview["id"], "fingerprint": last_preview["fingerprint"],
+            "created": last_preview["created"], "rows": last_preview["rows"],
+            "done": sorted(last_preview["done"])}
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def set_preview(fingerprint: dict, rows: list):
+    with _preview_lock:
+        last_preview.clear()
+        last_preview.update({"id": uuid.uuid4().hex, "fingerprint": fingerprint, "created": time.time(),
+                             "rows": rows, "names": {r["file"] for r in rows}, "done": set()})
+        try:
+            _save_preview()
+        except OSError:
+            pass
+
+
+def clear_preview():
+    with _preview_lock:
+        last_preview.clear()
+        try:
+            preview_file().unlink()
+        except OSError:
+            pass
+
+
+def load_preview():
+    """Restore the saved Preview after a restart (no-op if none or unreadable)."""
+    try:
+        d = json.loads(preview_file().read_text(encoding="utf-8"))
+        rows = [{k: str(r.get(k, "")) for k in ("file", "status", "reason", "output")} for r in d["rows"]]
+        with _preview_lock:
+            last_preview.clear()
+            last_preview.update({"id": str(d["id"]), "fingerprint": dict(d["fingerprint"]),
+                                 "created": float(d["created"]), "rows": rows,
+                                 "names": {r["file"] for r in rows}, "done": set(map(str, d.get("done", [])))})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+
+
+def mark_preview_done(preview_id: str, converted):
+    """Mark converted rows done; drop the Preview once nothing is left to convert."""
+    with _preview_lock:
+        if not last_preview or last_preview.get("id") != preview_id:
+            return
+        last_preview["done"] |= (set(converted) & last_preview["names"])
+        left = last_preview["names"] - last_preview["done"]
+        if left:
+            try:
+                _save_preview()
+            except OSError:
+                pass
+            return
+    clear_preview()
 
 
 def preview_fingerprint(cfg: dict) -> dict:
@@ -643,41 +709,54 @@ def preview_fingerprint(cfg: dict) -> dict:
 
 
 def preview_status() -> dict:
-    """Latest preview and whether settings that affect output changed since."""
+    """Latest preview, its rows, and whether settings that affect output changed since."""
     if not last_preview:
-        return {"id": None, "stale": True, "count": 0}
+        load_preview()
+    if not last_preview:
+        return {"id": None, "stale": True, "count": 0, "rows": [], "created": None}
     stale = last_preview["fingerprint"] != preview_fingerprint(load_config())
-    return {"id": last_preview["id"], "stale": stale, "count": len(last_preview["names"])}
+    done = last_preview.get("done", set())
+    rows = [{**r, "done": r["file"] in done} for r in last_preview.get("rows", [])]
+    return {"id": last_preview["id"], "stale": stale, "count": len(last_preview["names"] - done),
+            "rows": rows, "created": last_preview.get("created")}
 
 
-def validate_selected(preview_id, files, cfg: dict, preview: dict) -> list:
+def validate_selected(preview_id, files, cfg: dict, preview: dict, skipped: Optional[list] = None) -> list:
     """Return the cleaned list of relative image paths to convert, or raise ValueError.
-    Every file must have been in the preview, sit inside the input directory (and
-    the browse roots) and still exist."""
+    Every file must have been in the preview and sit inside the input directory (and
+    the browse roots). Files that are gone or already converted are not an error:
+    they are left out and, if `skipped` is given, appended to it as {"file", "reason"}."""
     if not preview or preview.get("id") != preview_id:
         raise ValueError("Preview not found: run Preview again")
     if preview["fingerprint"] != preview_fingerprint(cfg):
-        raise ValueError("Settings changed since the preview: run Preview again")
+        raise ValueError("Preview is out of date: settings changed since the preview")
     if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
         raise ValueError("'files' must be a non-empty list of paths")
     root = Path(cfg.get("input_directory") or "").expanduser().resolve()
     if not root.is_dir() or not is_browsable(root, browse_roots()):
         raise ValueError("Input directory is not available")
     out = []
+    done = preview.get("done", set())
     for f in dict.fromkeys(files):
         if f not in preview["names"]:
             raise ValueError(f"Not part of the preview: {f}")
         full = (root / f).resolve()
         if not video_removal.is_inside(full, root) or not is_browsable(full, browse_roots()):
             raise ValueError(f"Path is outside the input directory: {f}")
-        if not full.is_file():
-            raise ValueError(f"File no longer exists: {f}")
-        out.append(f)
+        if f in done:
+            if skipped is not None:
+                skipped.append({"file": f, "reason": "already converted"})
+        elif not full.is_file():
+            if skipped is not None:
+                skipped.append({"file": f, "reason": "file no longer exists"})
+        else:
+            out.append(f)
     return out
 
 
 def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Optional[dict] = None,
-           only_files: Optional[list] = None):
+           only_files: Optional[list] = None, preview_id: Optional[str] = None,
+           skipped_files: Optional[list] = None):
     """extract: None for the normal mux run, else the per-request overrides for an Extract run."""
     if not run_state.start(trigger):
         return
@@ -698,6 +777,8 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
     cmd = build_extract_cmd(cfg) if extract is not None else build_cmd(cfg)
     run_state.emit(f"▶ Triggered by: {trigger}" + (" (DRY RUN - nothing will be changed)" if run_state.dry_run else ""))
     run_state.emit("$ " + " ".join(cmd))
+    for sk in skipped_files or []:
+        run_state.emit(f"Skipped {sk['file']}: {sk['reason']}")
     if not Path(BIN[-1]).exists():
         run_state.emit(f"✗ MotionPhoto2 entry point not found: {BIN[-1]}")
         run_state.finish(127)
@@ -720,9 +801,11 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         proc.wait()
         run_state.emit(f"{'✓' if proc.returncode == 0 else '✗'} Exited with code {proc.returncode}")
         if proc.returncode == 0 and run_state.dry_run and extract is None and not only_files:
-            names = {r["file"] for _, r in run_state.read_results(0)[0] if r["status"] == "planned"}
-            last_preview.clear()
-            last_preview.update({"id": uuid.uuid4().hex, "fingerprint": preview_fingerprint(cfg), "names": names})
+            rows = [r for _, r in run_state.read_results(0)[0] if r["status"] == "planned"]
+            set_preview(preview_fingerprint(cfg), rows)
+        elif proc.returncode == 0 and only_files and preview_id:
+            mark_preview_done(preview_id, [r["file"] for _, r in run_state.read_results(0)[0]
+                                           if r["status"] == "converted"])
         run_state.finish(proc.returncode)
     except Exception as exc:
         run_state.emit(f"✗ Exception: {exc}")
@@ -981,13 +1064,18 @@ async def api_run_selected(request: Request):
         if not isinstance(body, dict):
             raise ValueError("Body must be a JSON object")
         cfg = load_config()
-        files = validate_selected(body.get("preview_id"), body.get("files"), cfg, last_preview)
+        if not last_preview:
+            load_preview()
+        skipped: list = []
+        files = validate_selected(body.get("preview_id"), body.get("files"), cfg, last_preview, skipped)
     except ValueError as e:
         msg = str(e)
         return JSONResponse({"error": msg, "stale": "Preview" in msg or "changed" in msg},
                             status_code=409 if "Preview" in msg or "changed" in msg else 400)
-    threading.Thread(target=do_run, args=("manual", False, None, files), daemon=True).start()
-    return {"ok": True, "count": len(files)}
+    if files:
+        threading.Thread(target=do_run, args=("manual", False, None, files, body["preview_id"], skipped),
+                         daemon=True).start()
+    return {"ok": True, "count": len(files), "skipped": skipped}
 
 
 @app.post("/api/run")

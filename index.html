@@ -378,13 +378,6 @@ tr:hover td{background:var(--surface2)}
         </div>
 
         <label class="flag">
-          <input type="checkbox" id="dry_run">
-          <span class="fn">Dry Run (preview only)</span>
-          <span class="ft">--dry-run</span>
-          <span class="tip-icon" data-tip="List which photos would be converted and which videos would be removed, without writing, moving or deleting anything. Applies to Run Now, the schedule and the folder watcher.">ⓘ</span>
-        </label>
-
-        <label class="flag">
           <input type="checkbox" id="keep_temp">
           <span class="fn">Keep Temp Files</span>
           <span class="ft">-kt</span>
@@ -715,7 +708,7 @@ async function init() {
   await loadConfig();
   const s = await fetchStatus().catch(() => null);
   if (s?.running) { setRunning(true); connectSSE(0); }
-  else loadResults();
+  else { await loadResults(); await showSelBar(true); }
   setInterval(pollStatus, 5000);
 }
 
@@ -723,7 +716,7 @@ async function init() {
 async function loadConfig() {
   const c = await fetch('/api/config').then(r => r.json());
   for (const id of ['input_directory','output_directory','recursive','exif_match','incremental_mode',
-      'copy_unmuxed','overwrite','dry_run','extract_mov','extract_still','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
+      'copy_unmuxed','overwrite','extract_mov','extract_still','delete_video','video_removal_mode','video_removal_folder','keep_temp','no_xmp','verbose',
       'schedule_enabled','schedule_cron','watch_enabled','watch_debounce','watch_stable_seconds']) {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
@@ -771,7 +764,6 @@ function formConfig() {
     incremental_mode: gc('incremental_mode'),
     copy_unmuxed:     gc('copy_unmuxed'),
     overwrite:        gc('overwrite'),
-    dry_run:          gc('dry_run'),
     delete_video:     gc('delete_video'),
     extract_mov:      gc('extract_mov'),
     extract_still:    gc('extract_still'),
@@ -793,7 +785,7 @@ const gc = id => document.getElementById(id)?.checked ?? false;
 // ── Run control ───────────────────────────────────────────────────────────────
 async function startExtract(dryRun) {
   await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
-  const r = await fetch('/api/extract' + (dryRun === true ? '?dry_run=true' : ''), {method:'POST'});
+  const r = await fetch('/api/extract?dry_run=' + (dryRun === true), {method:'POST'});
   if (r.status === 409) { flash('Already running', true); return; }
   if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Extract failed', true); return; }
   lastRunExtract = true;
@@ -808,7 +800,7 @@ async function startRun(dryRun) {
   // stale settings still on disk.
   const cfgR = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
   if (!cfgR.ok) { flash((await cfgR.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
-  const r = await fetch('/api/run' + (dryRun === true ? '?dry_run=true' : ''), {method:'POST'});
+  const r = await fetch('/api/run?dry_run=' + (dryRun === true), {method:'POST'});
   if (r.status === 409) { flash('Already running', true); return; }
   clearTerm();
   setRunning(true);
@@ -832,6 +824,7 @@ function connectSSE(fromLine) {
       document.getElementById('sp-file').style.display = 'none';
       if (d.stats?.skipped > 0 && !lastRunExtract) checkCleanup();
       if (!lastRunExtract && d.history?.[0]?.dry_run) showSelBar();
+      else if (!lastRunExtract) showSelBar(true);
       return;
     }
     if (d.result) { addResult(d.result); return; }
@@ -964,14 +957,27 @@ function updateSel() {
   btn.textContent = `Convert selected (${n})`;
   btn.disabled = n === 0 || !previewInfo || previewInfo.stale;
 }
-async function showSelBar() {
-  if (lastRunExtract || !selBoxes().length) return;
-  previewInfo = await fetch('/api/preview').then(r => r.json()).catch(() => null);
-  if (!previewInfo?.id) return;
+function fmtAge(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000), t = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString() + ' ' + t;
+}
+// fromServer: redraw the table from the saved Preview (page load, after Convert selected)
+async function showSelBar(fromServer) {
+  if (lastRunExtract) return;
+  if (!fromServer && !selBoxes().length) return;
+  const info = await fetch('/api/preview').then(r => r.json()).catch(() => null);
+  if (!info?.id) { if (fromServer) hideSelBar(); return; }
+  if (fromServer) {
+    clearResults();
+    info.rows.forEach(r => addResult(r.done ? {...r, status: 'converted', reason: 'done'} : r));
+  }
+  previewInfo = info;
   document.getElementById('res-wrap').classList.add('sel-on');
   document.getElementById('sel-bar').style.display = 'flex';
   document.getElementById('sel-all').checked = true;
-  document.getElementById('sel-note').textContent = 'Runs exactly the ticked files, no rescan. Changing settings requires a new Preview.';
+  document.getElementById('sel-note').textContent = 'Preview from ' + fmtAge(info.created) + '. ' +
+    (info.stale ? 'Preview is out of date: run Preview again.' : 'Runs exactly the ticked files, no rescan. Changing settings requires a new Preview.');
   updateSel();
 }
 async function convertSelected() {
@@ -988,6 +994,9 @@ async function convertSelected() {
   }
   if (r.status === 409) { flash('Already running', true); return; }
   if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Failed', true); return; }
+  const res = await r.json().catch(() => ({}));
+  if (res.skipped?.length) flash(`Skipped ${res.skipped.length} file(s): already converted or no longer on disk.`, true);
+  if (!res.count) { showSelBar(true); return; }
   lastRunExtract = false;
   clearTerm(); setRunning(true); connectSSE(0);
 }
