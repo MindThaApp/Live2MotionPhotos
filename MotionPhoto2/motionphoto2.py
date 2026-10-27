@@ -70,10 +70,25 @@ class Unbuffered(object):
    def __getattr__(self, attr):
        return getattr(self.stream, attr)
 
-def emit_result(name, status: str, reason: str = "", output: str = ""):
-    """One machine-readable line per file for the web UI's results table."""
-    print("@@RESULT " + json.dumps({"file": str(name), "status": status,
-                                    "reason": reason, "output": str(output)}), flush=True)
+def emit_result(name, status: str, reason: str = "", output: str = "", kind: str = "", video: str = ""):
+    """One machine-readable line per file for the web UI's results table.
+    kind (optional) is the finer classification the Preview filters on: ready,
+    motion_leftover, motion_only, no_mov, no_photo, skipped, error. video is the
+    relative path of the paired MOV (for motion_leftover)."""
+    d = {"file": str(name), "status": status, "reason": reason, "output": str(output)}
+    if kind:
+        d["kind"] = kind
+    if video:
+        d["video"] = str(video)
+    print("@@RESULT " + json.dumps(d), flush=True)
+
+
+def check_motion_photo(path, et):
+    """(is_motion_photo, error). An unreadable file is reported, not fatal."""
+    try:
+        return is_motion_photo(str(path), et), ""
+    except Exception as e:
+        return False, str(e) or e.__class__.__name__
 
 
 def planned_output(args, image: str, output_directory, output_file=None) -> str:
@@ -96,7 +111,7 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
         notes.append(f"original photo replaced, old copy -> {dest}")
     if args.delete_video:
         notes.append(f"video removed -> {dest}")
-    emit_result(name, "planned", "dry run" + ("; " + "; ".join(notes) if notes else ""), out)
+    emit_result(name, "planned", "dry run" + ("; " + "; ".join(notes) if notes else ""), out, kind="ready")
     if args.overwrite:
         print(f"[DRY-RUN] Would replace original photo {image}; old copy goes to {dest}")
     if args.delete_video:
@@ -511,6 +526,8 @@ def main():
 
             unmatched_images = []
             failed_pairs = []
+            all_videos = list(videos)
+            claimed_videos = set()     # videos that belong to some photo (so are not "MOV without a photo")
 
             if not args.exif_match: # match by file name
                 i = 0
@@ -520,9 +537,20 @@ def main():
                     fname = str(image_path.with_suffix(''))
 
                     # Check if source image is already a motion photo
-                    if is_motion_photo(input_directory / image, et):
+                    is_mp, err = check_motion_photo(input_directory / image, et)
+                    if err:
+                        print(f"[WARNING] Cannot read {image}: {err}")
+                        emit_result(image, "error", "unreadable: " + err[:200], kind="error")
+                        continue
+                    if is_mp:
                         print(f"Input {image} is already a motion photo, skipping muxing...")
-                        emit_result(image, "skipped", "already a motion photo")
+                        left = next((fname + e for e in (".mp4", ".mov", ".MP4", ".MOV") if fname + e in videos), "")
+                        if left:
+                            claimed_videos.add(left)
+                            emit_result(image, "skipped", "already a motion photo; its MOV is still there",
+                                        kind="motion_leftover", video=left)
+                        else:
+                            emit_result(image, "skipped", "already a motion photo", kind="motion_only")
                         if args.copy_unmuxed:
                             unmatched_images.append(image)
                         continue
@@ -532,6 +560,7 @@ def main():
                         if video_fname in videos:
                             print(f"=========================[{i}/{len(images)}]")
                             video = videos.pop(videos.index(video_fname))
+                            claimed_videos.add(video)
 
                             # Construct full paths for input files
                             input_image = input_directory / image
@@ -550,7 +579,7 @@ def main():
                                 output_image_path = output_subdirectory / image_path.name
                                 if os.path.exists(output_image_path) and input_output_binary_compare(input_video,output_image_path):
                                     print(f"Destination {image} is already a motion photo, skipping...")
-                                    emit_result(image, "skipped", "already converted in the output folder")
+                                    emit_result(image, "skipped", "already converted in the output folder", kind="skipped")
                                     break
                             
                             try:
@@ -573,12 +602,12 @@ def main():
                                     emit_result(image, "converted", output=muxer.output_fpath)
                             except MuxerInputError as e:
                                 print(f"[WARNING] Skipping {image}: {e}")
-                                emit_result(image, "error", str(e))
+                                emit_result(image, "error", str(e), kind="error")
                                 failed_pairs.append((image, str(e)))
                             break
                     else:
                         print(f"No matching video found for {image}")
-                        emit_result(image, "skipped", "no matching video")
+                        emit_result(image, "skipped", "no matching video", kind="no_mov")
                         if args.copy_unmuxed:
                             unmatched_images.append(image)
 
@@ -606,9 +635,21 @@ def main():
                     i += 1
 
                     # Check if source image is already a motion photo
-                    if is_motion_photo(input_directory / img, et):
+                    is_mp, err = check_motion_photo(input_directory / img, et)
+                    if err:
+                        print(f"[WARNING] Cannot read {img}: {err}")
+                        emit_result(img, "error", "unreadable: " + err[:200], kind="error")
+                        continue
+                    if is_mp:
                         print(f"Input {img} is already a motion photo, skipping muxing...")
-                        emit_result(img, "skipped", "already a motion photo")
+                        cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
+                        left = (content_id_to_video.get(cid) or [""])[0] if cid else ""
+                        if left:
+                            claimed_videos.update(content_id_to_video[cid])
+                            emit_result(img, "skipped", "already a motion photo; its MOV is still there",
+                                        kind="motion_leftover", video=left)
+                        else:
+                            emit_result(img, "skipped", "already a motion photo", kind="motion_only")
                         if args.copy_unmuxed:
                             unmatched_images.append(img)
                         continue
@@ -619,6 +660,7 @@ def main():
                     if content_id and content_id.strip() in content_id_to_video:
                         print(f"=========================[{i}/{len(images)}]")
                         video = content_id_to_video[content_id.strip()][0]
+                        claimed_videos.update(content_id_to_video[content_id.strip()])
 
                         if args.copy_unmuxed:
                             for vid in content_id_to_video[content_id.strip()]:
@@ -654,13 +696,13 @@ def main():
                                         if args.verbose:
                                             print(f"[DEBUG] ContentIdentifier '{content_id.strip()}' of the source {input_image} and {output_image_path} destination matches")
                                         print(f"Destination {img} as it is already a motion photo, skipping...")
-                                        emit_result(img, "skipped", "already converted in the output folder")
+                                        emit_result(img, "skipped", "already converted in the output folder", kind="skipped")
                                         continue
                                 else:
                                     # Do binary comparison to check input and output
                                     if input_output_binary_compare(input_video,output_image_path):
                                         print(f"Destination {img} is already a motion photo, skipping...")
-                                        emit_result(img, "skipped", "already converted in the output folder")
+                                        emit_result(img, "skipped", "already converted in the output folder", kind="skipped")
                                         continue
                         
                         try:
@@ -683,13 +725,18 @@ def main():
                                 emit_result(img, "converted", output=muxer.output_fpath)
                         except MuxerInputError as e:
                             print(f"[WARNING] Skipping {img}: {e}")
-                            emit_result(img, "error", str(e))
+                            emit_result(img, "error", str(e), kind="error")
                             failed_pairs.append((img, str(e)))
                     else:
                         print(f"No matching video found for {img}")
-                        emit_result(img, "skipped", "no matching video")
+                        emit_result(img, "skipped", "no matching video", kind="no_mov")
                         if args.copy_unmuxed:
                             unmatched_images.append(img)
+
+            if args.dry_run and only_images is None:      # MOVs no photo claims (informational)
+                for vid in all_videos:
+                    if vid not in claimed_videos:
+                        emit_result(vid, "skipped", "no matching photo", kind="no_photo")
 
             # Copy unmuxed images and videos while preserving the directory structure
             if args.copy_unmuxed:

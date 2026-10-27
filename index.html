@@ -75,7 +75,42 @@ input:disabled{opacity:.5;cursor:not-allowed}
 #res-body .sel{width:28px;text-align:center}
 .sel-col{display:none}
 .sel-on .sel-col{display:table-cell}
-#sel-bar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px}
+#sel-bar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 12px 8px;font-size:12px}
+/* Results panel: full width of the main column, resizable, scrolls inside, sticky head */
+#res-wrap{max-height:none;height:175px;min-height:120px;resize:vertical;overflow:auto;position:relative}
+#res-wrap.sel-on{height:340px}
+#res-wrap.res-full{position:fixed;inset:0;z-index:600;height:auto !important;max-height:none;resize:none;border-top:none}
+#res-head{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border)}
+.res-top{display:flex;align-items:center;gap:8px;padding:6px 12px 2px;flex-wrap:wrap}
+.res-top .hist-hdr{padding:0;position:static}
+#res-close{display:none}
+.res-full #res-close{display:inline-flex}.res-full #res-expand{display:none}
+.chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 100%}
+.chip{padding:2px 10px;border-radius:20px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;cursor:pointer;white-space:nowrap}
+.chip:hover{border-color:#6e7681}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.chip small{opacity:.75;font-size:11px}
+.sel-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+#res-table{table-layout:fixed;min-width:480px}
+#res-table td,#res-table th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:5px 10px}
+#res-table .c-sel{width:34px}#res-table .c-st{width:215px}
+#res-table .c-file{width:42%}#res-table .c-why{width:26%}
+#res-body tr.info td{opacity:.8}
+#confirm-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:900;display:none;align-items:center;justify-content:center;padding:16px}
+#confirm-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;max-width:460px;width:100%;font-size:13px}
+#confirm-box p{margin:8px 0}#confirm-box .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+@media (max-width:760px){
+  .body{flex-direction:column;overflow-y:auto}
+  .sidebar{width:100%;border-right:none;border-bottom:1px solid var(--border);overflow:visible;flex-shrink:0}
+  .main{flex:none;overflow:visible}
+  .content-row{flex-direction:column;overflow:visible}
+  .right-col,.term-section{width:100%;border:none;max-height:260px}
+  .hdr{flex-wrap:wrap;padding:8px 10px}
+  #res-wrap{height:60vh}
+  #res-table .c-why,#res-table .c-out,#res-table th:nth-child(4),#res-table th:nth-child(5),#res-table td:nth-child(4),#res-table td:nth-child(5){display:none}
+  #res-table{min-width:0}
+  #res-table .c-st{width:112px}#res-table .c-file{width:auto}
+}
 #video_removal_opts select,#video_removal_opts input[type=text]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)}
 
 /* ── Tooltip system ── */
@@ -286,6 +321,11 @@ tr:hover td{background:var(--surface2)}
   <button class="btn btn-sm btn-primary" onclick="openCu()">Review & Delete</button>
   <button class="btn-ghost btn-sm" onclick="document.getElementById('cleanup-bar').style.display='none'" style="font-size:16px;padding:0 6px">×</button>
 </div>
+
+<div id="confirm-bg"><div id="confirm-box" role="dialog" aria-modal="true">
+  <b id="confirm-title"></b><p id="confirm-text"></p><p id="confirm-dest" style="color:var(--muted)"></p>
+  <div class="row"><button class="btn" id="confirm-no">Cancel</button><button class="btn btn-primary" id="confirm-yes">Confirm</button></div>
+</div></div>
 
 <div class="body">
 
@@ -559,13 +599,25 @@ tr:hover td{background:var(--surface2)}
 
     <!-- Per-file results (filled from the progress stream; all text set via textContent) -->
     <div class="hist-wrap" id="res-wrap">
-      <div class="hist-hdr">Results <span id="res-count" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
-      <div id="sel-bar">
-        <button class="btn btn-primary" id="conv-sel-btn" onclick="convertSelected()">Convert selected (0)</button>
-        <span id="sel-note" style="color:var(--muted)"></span>
+      <div id="res-head">
+        <div class="res-top">
+          <div class="hist-hdr">Results <span id="res-count" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+          <span id="sel-note" style="color:var(--muted);font-size:11px;flex:1"></span>
+          <button class="btn btn-sm" id="res-expand" onclick="toggleExpand(true)" title="Open the results full-screen">&#x2922; Expand</button>
+          <button class="btn btn-sm" id="res-close" onclick="toggleExpand(false)" title="Close (Esc)">&#x2715; Close</button>
+        </div>
+        <div id="sel-bar">
+          <div class="chips" id="chips"></div>
+          <div class="sel-actions">
+            <button class="btn btn-sm" id="sel-shown-btn" onclick="selShown()">Select all shown</button>
+            <button class="btn btn-sm" id="sel-none-btn" onclick="selNone()">Select none</button>
+            <button class="btn btn-primary btn-sm" id="conv-sel-btn" onclick="convertSelected()">Convert (0)</button>
+            <button class="btn btn-sm" id="clean-sel-btn" onclick="askCleanup()">Clean up MOVs (0)</button>
+          </div>
+        </div>
       </div>
       <table id="res-table">
-        <thead><tr><th class="sel-col sel"><input type="checkbox" id="sel-all" checked onchange="selAll(this.checked)" title="Select all / none"></th><th>File</th><th>Status</th><th>Reason</th><th>Output</th></tr></thead>
+        <thead><tr><th class="sel-col sel c-sel"></th><th class="c-file">File</th><th class="c-st">Status</th><th class="c-why">Reason</th><th class="c-out">Output</th></tr></thead>
         <tbody id="res-body"><tr id="res-empty"><td colspan="5" style="color:var(--muted);text-align:center;padding:10px 16px">No results yet</td></tr></tbody>
       </table>
     </div>
@@ -708,7 +760,7 @@ async function init() {
   await loadConfig();
   const s = await fetchStatus().catch(() => null);
   if (s?.running) { setRunning(true); connectSSE(0); }
-  else { await loadResults(); await showSelBar(true); }
+  else { await loadResults(); await showSelBar(); }
   setInterval(pollStatus, 5000);
 }
 
@@ -823,8 +875,7 @@ function connectSSE(fromLine) {
       setStatus(d.stats?.errors > 0 ? 'error' : 'done');
       document.getElementById('sp-file').style.display = 'none';
       if (d.stats?.skipped > 0 && !lastRunExtract) checkCleanup();
-      if (!lastRunExtract && d.history?.[0]?.dry_run) showSelBar();
-      else if (!lastRunExtract) showSelBar(true);
+      if (!lastRunExtract) showSelBar();
       return;
     }
     if (d.result) { addResult(d.result); return; }
@@ -944,61 +995,190 @@ function clearResults() {
   hideSelBar();
 }
 let previewInfo = null;
+let selected = new Set(), activeFilter = 'all', selPreviewId = null;
+const KIND_LABEL = {ready:'Ready to convert', motion_leftover:'Motion Photo + leftover MOV', motion_only:'Already Motion Photo',
+  no_mov:'No matching MOV', no_photo:'MOV, no photo', skipped:'Skipped', error:'Error', converted:'Converted', missing:'Missing'};
+const KIND_COLOR = {ready:'var(--blue)', motion_leftover:'var(--purple)', motion_only:'var(--green)', no_mov:'var(--yellow)',
+  no_photo:'var(--yellow)', skipped:'var(--yellow)', error:'var(--red)', converted:'var(--green)', missing:'var(--red)'};
+const CHIPS = [
+  ['all', 'All', null],
+  ['ready', 'Ready', ['ready']],
+  ['motion', 'Already Motion Photo', ['motion_leftover', 'motion_only']],
+  ['motion_leftover', 'Leftover MOV', ['motion_leftover']],
+  ['no_mov', 'No MOV', ['no_mov']],
+  ['no_photo', 'MOV, no photo', ['no_photo']],
+  ['skipped', 'Skipped', ['skipped']],
+  ['error', 'Error', ['error']],
+  ['converted', 'Converted', ['converted']],
+  ['missing', 'Missing', ['missing']],
+];
 function hideSelBar() {
-  previewInfo = null;
+  previewInfo = null; selected = new Set(); selPreviewId = null;
   document.getElementById('sel-bar').style.display = 'none';
   document.getElementById('res-wrap').classList.remove('sel-on');
 }
-function selBoxes() { return [...document.querySelectorAll('#res-body input[data-file]')]; }
-function selAll(on) { selBoxes().forEach(c => c.checked = on); updateSel(); }
-function updateSel() {
-  const n = selBoxes().filter(c => c.checked).length;
-  const btn = document.getElementById('conv-sel-btn');
-  btn.textContent = `Convert selected (${n})`;
-  btn.disabled = n === 0 || !previewInfo || previewInfo.stale;
+const rowState = r => r.state || (r.done ? 'converted' : r.kind);
+const rowActionable = r => (rowState(r) === 'ready') || rowState(r) === 'motion_leftover';
+function shownRows() {
+  if (!previewInfo) return [];
+  const states = CHIPS.find(c => c[0] === activeFilter)?.[2];
+  return previewInfo.rows.filter(r => !states || states.includes(rowState(r)));
 }
+function selCounts() {
+  let conv = 0, clean = 0;
+  for (const r of previewInfo?.rows || []) {
+    if (!selected.has(r.file)) continue;
+    if (rowState(r) === 'ready') conv++; else if (rowState(r) === 'motion_leftover') clean++;
+  }
+  return {conv, clean};
+}
+function updateSel() {
+  const {conv, clean} = selCounts();
+  const stale = !previewInfo || previewInfo.stale;
+  const b1 = document.getElementById('conv-sel-btn'), b2 = document.getElementById('clean-sel-btn');
+  b1.textContent = `Convert (${conv})`; b1.disabled = conv === 0 || stale || isRunning;
+  b2.textContent = `Clean up MOVs (${clean})`; b2.disabled = clean === 0 || stale || isRunning;
+  document.querySelectorAll('#res-body input[data-file]').forEach(c => c.checked = selected.has(c.dataset.file));
+}
+function selShown() { shownRows().forEach(r => { if (rowActionable(r)) selected.add(r.file); }); updateSel(); }
+function selNone() { selected.clear(); updateSel(); }
+function setFilter(f) { activeFilter = f; renderPreview(); }
+function renderChips() {
+  const c = previewInfo.counts || {}, box = document.getElementById('chips');
+  box.textContent = '';
+  const n = k => c[k] || 0;
+  for (const [key, label, states] of CHIPS) {
+    const cnt = states ? states.reduce((a, k) => a + n(k), 0) : n('all');
+    if (states && cnt === 0 && key !== activeFilter) continue;
+    const b = document.createElement('button');
+    b.className = 'chip' + (key === activeFilter ? ' on' : ''); b.dataset.chip = key;
+    b.appendChild(document.createTextNode(`${label} ${cnt}`));
+    if (key === 'motion' && n('motion_leftover')) {
+      const sm = document.createElement('small'); sm.textContent = ` (${n('motion_leftover')} with leftover MOV)`; b.appendChild(sm);
+    }
+    b.onclick = () => setFilter(key);
+    box.appendChild(b);
+  }
+}
+function renderPreview() {
+  renderChips();
+  const body = document.getElementById('res-body');
+  body.textContent = ''; resRows = 0;
+  const rows = shownRows();
+  rows.forEach((r, i) => { if (i < RES_MAX_ROWS) addPreviewRow(r); });
+  if (!rows.length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 5; td.textContent = 'Nothing in this filter'; td.style.cssText = 'color:var(--muted);text-align:center;padding:10px 16px';
+    tr.appendChild(td); body.appendChild(tr);
+  }
+  document.getElementById('res-count').textContent = rows.length > RES_MAX_ROWS
+    ? `(showing ${RES_MAX_ROWS} of ${rows.length})` : `(${rows.length})`;
+  updateSel();
+}
+function addPreviewRow(r) {
+  const st = rowState(r), tr = document.createElement('tr');
+  tr.dataset.state = st;
+  if (!rowActionable(r)) tr.className = 'info';
+  const sc = document.createElement('td'); sc.className = 'sel-col sel';
+  const cb = document.createElement('input'); cb.type = 'checkbox'; cb.dataset.file = r.file;
+  if (rowActionable(r)) {
+    cb.checked = selected.has(r.file);
+    cb.onchange = () => { cb.checked ? selected.add(r.file) : selected.delete(r.file); updateSel(); };
+  } else { cb.disabled = true; cb.title = 'Information only'; }
+  sc.appendChild(cb); tr.appendChild(sc);
+  const cell = (text, style) => {
+    const td = document.createElement('td'); td.textContent = text ?? ''; td.title = text ?? '';
+    if (style) td.style.cssText = style; tr.appendChild(td); return td;
+  };
+  cell(r.file);
+  cell(KIND_LABEL[st] || st, 'color:' + (KIND_COLOR[st] || 'var(--muted)'));
+  cell(st === 'motion_leftover' && r.video ? `leftover: ${r.video}` : r.reason, 'color:var(--muted)');
+  cell(r.output, 'color:var(--muted)');
+  document.getElementById('res-body').appendChild(tr);
+}
+function toggleExpand(on) {
+  document.getElementById('res-wrap').classList.toggle('res-full', on);
+}
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('confirm-bg').style.display === 'flex') { closeConfirm(); return; }
+  toggleExpand(false);
+});
 function fmtAge(ts) {
   if (!ts) return '';
   const d = new Date(ts * 1000), t = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString() + ' ' + t;
 }
-// fromServer: redraw the table from the saved Preview (page load, after Convert selected)
-async function showSelBar(fromServer) {
+// Redraw the table and chips from the saved Preview (page load, end of a run, after an action)
+async function showSelBar() {
   if (lastRunExtract) return;
-  if (!fromServer && !selBoxes().length) return;
   const info = await fetch('/api/preview').then(r => r.json()).catch(() => null);
-  if (!info?.id) { if (fromServer) hideSelBar(); return; }
-  if (fromServer) {
-    clearResults();
-    info.rows.forEach(r => addResult(r.done ? {...r, status: 'converted', reason: 'done'} : r));
-  }
+  if (!info?.id) { hideSelBar(); return; }
   previewInfo = info;
+  if (selPreviewId !== info.id) {            // a new Preview: ready rows start ticked, leftover MOVs do not
+    selPreviewId = info.id; activeFilter = 'all';
+    selected = new Set(info.rows.filter(r => rowState(r) === 'ready').map(r => r.file));
+  } else {
+    const ok = new Set(info.rows.filter(rowActionable).map(r => r.file));
+    selected = new Set([...selected].filter(f => ok.has(f)));
+  }
+  if (!CHIPS.some(c => c[0] === activeFilter)) activeFilter = 'all';
   document.getElementById('res-wrap').classList.add('sel-on');
   document.getElementById('sel-bar').style.display = 'flex';
-  document.getElementById('sel-all').checked = true;
   document.getElementById('sel-note').textContent = 'Preview from ' + fmtAge(info.created) + '. ' +
-    (info.stale ? 'Preview is out of date: run Preview again.' : 'Runs exactly the ticked files, no rescan. Changing settings requires a new Preview.');
+    (info.stale ? 'Preview is out of date: run Preview again.' : 'Actions run on exactly the ticked rows, no rescan. Changing settings requires a new Preview.');
+  renderPreview();
+}
+async function markStale() {
+  flash('Settings changed since the Preview. Run Preview again.', true);
+  document.getElementById('sel-note').textContent = 'Preview is out of date: run Preview again.';
+  if (previewInfo) previewInfo.stale = true;
   updateSel();
 }
 async function convertSelected() {
   if (!previewInfo) return;
-  const files = selBoxes().filter(c => c.checked).map(c => c.dataset.file);
+  const files = previewInfo.rows.filter(r => selected.has(r.file) && rowState(r) === 'ready').map(r => r.file);
+  if (!files.length) return;
   const cfgR = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
   if (!cfgR.ok) { flash((await cfgR.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
   const r = await fetch('/api/run-selected', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({preview_id: previewInfo.id, files})});
-  if (r.status === 409 && (await r.clone().json().catch(() => ({}))).stale) {
-    flash('Settings changed since the Preview. Run Preview again.', true);
-    document.getElementById('sel-note').textContent = 'Preview is out of date: run Preview again.';
-    document.getElementById('conv-sel-btn').disabled = true; return;
-  }
+  if (r.status === 409 && (await r.clone().json().catch(() => ({}))).stale) { markStale(); return; }
   if (r.status === 409) { flash('Already running', true); return; }
   if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Failed', true); return; }
   const res = await r.json().catch(() => ({}));
-  if (res.skipped?.length) flash(`Skipped ${res.skipped.length} file(s): already converted or no longer on disk.`, true);
-  if (!res.count) { showSelBar(true); return; }
+  if (res.skipped?.length) flash(`Skipped ${res.skipped.length} file(s): already converted, missing or not ready.`, true);
+  if (!res.count) { showSelBar(); return; }
   lastRunExtract = false;
   clearTerm(); setRunning(true); connectSSE(0);
+}
+function closeConfirm() { document.getElementById('confirm-bg').style.display = 'none'; }
+function askCleanup() {
+  if (!previewInfo) return;
+  const files = previewInfo.rows.filter(r => selected.has(r.file) && rowState(r) === 'motion_leftover').map(r => r.file);
+  if (!files.length) return;
+  const cu = previewInfo.cleanup || {};
+  document.getElementById('confirm-title').textContent = 'Clean up leftover MOVs';
+  document.getElementById('confirm-text').textContent =
+    `${files.length} leftover MOV file${files.length !== 1 ? 's' : ''} will be removed. Each one is first checked to be identical to the video inside its photo; any that is not is left alone.`;
+  document.getElementById('confirm-dest').textContent = `Destination: ${cu.destination || cu.mode || ''}` +
+    (cu.mode === 'delete' ? ' (cannot be undone)' : '');
+  document.getElementById('confirm-yes').textContent = `Clean up ${files.length}`;
+  document.getElementById('confirm-yes').onclick = () => { closeConfirm(); doCleanup(files); };
+  document.getElementById('confirm-no').onclick = closeConfirm;
+  document.getElementById('confirm-bg').style.display = 'flex';
+}
+async function doCleanup(files) {
+  const r = await fetch('/api/cleanup-movs', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({preview_id: previewInfo.id, files})});
+  const res = await r.json().catch(() => ({}));
+  if (r.status === 409 && res.stale) { markStale(); return; }
+  if (!r.ok) { flash(res.error || 'Clean up failed', true); return; }
+  let msg = `Cleaned up ${res.cleaned} MOV${res.cleaned !== 1 ? 's' : ''}`;
+  if (res.refused?.length) msg += `; ${res.refused.length} refused (${res.refused[0].reason})`;
+  if (res.errors?.length) msg += `; ${res.errors.length} failed`;
+  flash(msg, !!(res.refused?.length || res.errors?.length));
+  await showSelBar();
 }
 function addResult(r) {
   document.getElementById('res-empty')?.remove();
@@ -1008,21 +1188,18 @@ function addResult(r) {
   const tr = document.createElement('tr');
   const cell = (text, style) => {
     const td = document.createElement('td');
-    td.textContent = text ?? '';
+    td.textContent = text ?? ''; td.title = text ?? '';
     if (style) td.style.cssText = style;
     tr.appendChild(td); return td;
   };
   const sc = document.createElement('td'); sc.className = 'sel-col sel';
-  if (r.status === 'planned' && !lastRunExtract) {
-    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
-    cb.dataset.file = r.file; cb.onchange = updateSel; sc.appendChild(cb);
-  }
   tr.appendChild(sc);
-  cell(r.file, 'word-break:break-all;white-space:normal');
+  cell(r.file);
   const colors = {converted:'var(--green)', planned:'var(--blue)', skipped:'var(--yellow)', error:'var(--red)'};
-  cell(r.status, 'color:' + (colors[r.status] || 'var(--muted)'));
+  const label = r.kind && r.status !== 'converted' && !lastRunExtract ? KIND_LABEL[r.kind] : r.status;
+  cell(label, 'color:' + ((r.kind && KIND_COLOR[r.kind]) || colors[r.status] || 'var(--muted)'));
   cell(r.reason, 'color:var(--muted)');
-  cell(r.output, 'color:var(--muted);word-break:break-all;white-space:normal');
+  cell(r.output, 'color:var(--muted)');
   document.getElementById('res-body').appendChild(tr);
 }
 async function loadResults() {
