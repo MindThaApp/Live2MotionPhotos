@@ -17,10 +17,10 @@ def test_move_keeps_relative_path_and_handles_collisions(tmp_path):
     a = make(tmp_path / "sub" / "a.MOV", b"1")
     assert vr.remove_video(a, "move", tmp_path) == "move"
     assert not a.exists()
-    assert (tmp_path / "_deleted_videos" / "sub" / "a.MOV").read_bytes() == b"1"
+    assert (tmp_path / "_originals" / "sub" / "a.MOV").read_bytes() == b"1"
     b = make(tmp_path / "sub" / "a.MOV", b"2")
     vr.remove_video(b, "move", tmp_path)
-    assert (tmp_path / "_deleted_videos" / "sub" / "a_1.MOV").read_bytes() == b"2"
+    assert (tmp_path / "_originals" / "sub" / "a_1.MOV").read_bytes() == b"2"
 
 
 def test_custom_relative_folder(tmp_path):
@@ -37,7 +37,7 @@ def test_trash_failure_falls_back_to_move_not_delete(tmp_path, monkeypatch):
     monkeypatch.setattr(send2trash, "send2trash", boom)
     a = make(tmp_path / "a.mov")
     assert vr.remove_video(a, "trash", tmp_path) == "move"
-    assert (tmp_path / "_deleted_videos" / "a.mov").exists()
+    assert (tmp_path / "_originals" / "a.mov").exists()
 
 
 def test_delete_mode(tmp_path):

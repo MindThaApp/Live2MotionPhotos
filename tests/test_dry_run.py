@@ -48,6 +48,6 @@ def test_report_dry_run_output(capsys, tmp_path):
     out = capsys.readouterr().out
     assert "[DRY-RUN] Would convert a.heic + /in/a.mov -> /in/a.LIVE.heic" in out
     assert "-> /out/a.heic" in out
-    assert "[DRY-RUN] Would remove video /in/a.mov (trash)" in out
+    assert "[DRY-RUN] Would remove video /in/a.mov; it goes to recycle bin" in out
     args.overwrite = True
     assert mp.planned_output(args, "/in/a.heic", None) == "/in/a.heic"

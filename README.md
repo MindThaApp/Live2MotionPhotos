@@ -188,20 +188,26 @@ sudo systemctl enable --now live2motion
 | EXIF Match | `-em` | Match pairs by EXIF metadata instead of filename. Recommended for iPhone exports where filenames may not align |
 | Incremental Mode | `-im` | Skip files already converted. Requires an Output Directory |
 | Copy Unmuxed | `-cu` | Copy non-live photos unchanged to the Output Directory |
-| Overwrite Originals | `-o` | Replace source images in place. No Output Directory needed |
+| Replace original photo | `-o` | Replace source images in place. The old photo is first set aside using the removal mode below. Cannot be combined with an Output Directory |
 | Delete Video After Mux | `-dv` | Remove the `.MOV` file after embedding it (only after the output is verified; see below) |
 | Keep Temp Files | `-kt` | Retain temporary files for debugging |
 | Skip XMP Metadata | `-nx` | Do not copy XMP tags to the output |
 | Verbose | `-v` | Detailed per-file log output |
 
-### Video removal
+### Originals: replaced photos and removed videos
 
-When **Delete Video After Mux** is on, the output is checked first (it exists, is at least image + video in size, and contains the exact video bytes). If the check fails the `.MOV` is kept and a warning is logged. Otherwise the video is removed according to `video_removal_mode`:
+The same `video_removal_mode` / `video_removal_folder` apply to photos replaced by **Replace original photo** (`--overwrite`): the merged file is written beside the original and verified, the original is sent to the bin / folder, and only then is the new file moved into place, so one of the two always exists. `delete` keeps the old atomic replace (no backup). Files whose extension had to change (e.g. a `.jpg` that is really HEIC) go through the same path.
+
+In UI: **Preview** lists what would happen; tick rows and press **Convert selected** to run exactly those files without rescanning (API: `GET /api/preview`, `POST /api/run-selected`; CLI: `--only-file list.json`). Changing settings that affect output marks the preview stale.
+
+#### Video removal
+
+When **Remove original video** is on, the output is checked first (it exists, is at least image + video in size, and contains the exact video bytes). If the check fails the `.MOV` is kept and a warning is logged. Otherwise the video is removed according to `video_removal_mode`:
 
 | Mode | Behaviour |
 |---|---|
 | `trash` | Send to the OS recycle bin (default outside Docker). If no bin is available it falls back to `move`, never to `delete` |
-| `move` | Move into `video_removal_folder` (default `_deleted_videos` inside the input directory, default in Docker), keeping the relative path. Name clashes get a numeric suffix. The folder is ignored by scans and the file watcher |
+| `move` | Move into `video_removal_folder` (default `_originals` inside the input directory, default in Docker; the old `_deleted_videos` folder is still ignored by scans). Photos and videos share this folder, keeping the relative path. Name clashes get a numeric suffix. The folder is ignored by scans and the file watcher |
 | `delete` | Permanently delete |
 
 The Cleanup tool uses the same mode and only accepts video files inside the input directory. Configs that only have `delete_video` keep working and get the default mode.

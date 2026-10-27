@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -92,8 +93,8 @@ DEFAULT_CONFIG = {
     "overwrite": False,
     "dry_run": False,             # list what would be converted/removed; write nothing
     "delete_video": False,
-    "video_removal_mode": video_removal.default_mode(),
-    "video_removal_folder": "",   # "move" mode only; empty = <input_directory>/_deleted_videos
+    "video_removal_mode": video_removal.default_mode(),   # shared: removed videos AND photos replaced by overwrite
+    "video_removal_folder": "",   # "move" mode only (videos and replaced photos); empty = <input_directory>/_originals
     "extract_mov": False,         # Extract mode: save the video as .mov when that is safe
     "extract_still": False,       # Extract mode: also write a still image without the video
     "keep_temp": False,
@@ -362,6 +363,8 @@ def validate_config(data) -> dict:
         clean[key] = value
     if "video_removal_mode" in clean and clean["video_removal_mode"] not in video_removal.MODES:
         raise ValueError(f"'video_removal_mode' must be one of: {', '.join(video_removal.MODES)}")
+    if clean.get("overwrite") and clean.get("output_directory", "").strip():
+        raise ValueError("Overwrite and Output Directory cannot be used together: clear the output folder or untick overwrite")
     if clean.get("schedule_cron"):
         try:
             CronTrigger.from_crontab(clean["schedule_cron"])
@@ -553,10 +556,12 @@ def build_cmd(cfg: dict) -> list:
         cmd += ["--input-directory", d]
     if d := cfg.get("output_directory"):
         cmd += ["--output-directory", d]
-    if cfg.get("delete_video"):
+    if cfg.get("delete_video") or cfg.get("overwrite"):
         cmd += ["--video-removal-mode", video_removal.normalize_mode(cfg.get("video_removal_mode"))]
         if cfg.get("video_removal_folder"):
             cmd += ["--video-removal-folder", cfg["video_removal_folder"]]
+    if cfg.get("only_file"):
+        cmd += ["--only-file", cfg["only_file"]]
     for key, flag in [
         ("recursive",       "--recursive"),
         ("exif_match",      "--exif-match"),
@@ -625,7 +630,54 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
         pass
 
 
-def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Optional[dict] = None):
+# ─── Preview (dry run) that can be acted on ──────────────────────────────────
+
+PREVIEW_KEYS = ("input_directory", "output_directory", "recursive", "exif_match", "incremental_mode",
+                "copy_unmuxed", "overwrite", "delete_video", "video_removal_mode",
+                "video_removal_folder", "no_xmp")
+last_preview: dict = {}      # {"id", "fingerprint", "names"} of the latest finished mux dry run
+
+
+def preview_fingerprint(cfg: dict) -> dict:
+    return {k: cfg.get(k) for k in PREVIEW_KEYS}
+
+
+def preview_status() -> dict:
+    """Latest preview and whether settings that affect output changed since."""
+    if not last_preview:
+        return {"id": None, "stale": True, "count": 0}
+    stale = last_preview["fingerprint"] != preview_fingerprint(load_config())
+    return {"id": last_preview["id"], "stale": stale, "count": len(last_preview["names"])}
+
+
+def validate_selected(preview_id, files, cfg: dict, preview: dict) -> list:
+    """Return the cleaned list of relative image paths to convert, or raise ValueError.
+    Every file must have been in the preview, sit inside the input directory (and
+    the browse roots) and still exist."""
+    if not preview or preview.get("id") != preview_id:
+        raise ValueError("Preview not found: run Preview again")
+    if preview["fingerprint"] != preview_fingerprint(cfg):
+        raise ValueError("Settings changed since the preview: run Preview again")
+    if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
+        raise ValueError("'files' must be a non-empty list of paths")
+    root = Path(cfg.get("input_directory") or "").expanduser().resolve()
+    if not root.is_dir() or not is_browsable(root, browse_roots()):
+        raise ValueError("Input directory is not available")
+    out = []
+    for f in dict.fromkeys(files):
+        if f not in preview["names"]:
+            raise ValueError(f"Not part of the preview: {f}")
+        full = (root / f).resolve()
+        if not video_removal.is_inside(full, root) or not is_browsable(full, browse_roots()):
+            raise ValueError(f"Path is outside the input directory: {f}")
+        if not full.is_file():
+            raise ValueError(f"File no longer exists: {f}")
+        out.append(f)
+    return out
+
+
+def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Optional[dict] = None,
+           only_files: Optional[list] = None):
     """extract: None for the normal mux run, else the per-request overrides for an Extract run."""
     if not run_state.start(trigger):
         return
@@ -634,6 +686,13 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         cfg.update(extract)
     if dry_run is not None:
         cfg["dry_run"] = dry_run      # per-request override of the config toggle
+    only_path = None
+    if only_files and extract is None:
+        import tempfile
+        fd, only_path = tempfile.mkstemp(prefix="l2m_only_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(only_files, fh)
+        cfg["only_file"] = only_path
     run_state.dry_run = bool(cfg.get("dry_run"))
     run_state.input_dir = "" if extract is not None else cfg.get("input_directory", "")
     cmd = build_extract_cmd(cfg) if extract is not None else build_cmd(cfg)
@@ -660,10 +719,20 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
             run_state.emit(raw.rstrip())
         proc.wait()
         run_state.emit(f"{'✓' if proc.returncode == 0 else '✗'} Exited with code {proc.returncode}")
+        if proc.returncode == 0 and run_state.dry_run and extract is None and not only_files:
+            names = {r["file"] for _, r in run_state.read_results(0)[0] if r["status"] == "planned"}
+            last_preview.clear()
+            last_preview.update({"id": uuid.uuid4().hex, "fingerprint": preview_fingerprint(cfg), "names": names})
         run_state.finish(proc.returncode)
     except Exception as exc:
         run_state.emit(f"✗ Exception: {exc}")
         run_state.finish(-1)
+    finally:
+        if only_path:
+            try:
+                os.remove(only_path)
+            except OSError:
+                pass
 
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
@@ -706,7 +775,7 @@ class MediaHandler(FileSystemEventHandler):
     debounced, then every touched file must keep the same size and mtime for
     `stable_seconds` (so half-copied or still-syncing files are not processed)."""
 
-    def __init__(self, debounce: int, skip_folder: Optional[Path] = None,
+    def __init__(self, debounce: int, skip_folder=None,
                  stable_seconds: int = 10, poll: float = 1.0, on_ready=None):
         self._skip_folder = skip_folder
         self._debounce = max(debounce, 10)
@@ -719,7 +788,8 @@ class MediaHandler(FileSystemEventHandler):
         self._waiting = False
 
     def _relevant(self, path: str) -> bool:
-        if self._skip_folder and video_removal.is_inside(path, self._skip_folder):
+        skips = self._skip_folder if isinstance(self._skip_folder, (list, tuple)) else [self._skip_folder]
+        if any(f and video_removal.is_inside(path, f) for f in skips):
             return False   # videos moved aside by "move" mode must not retrigger a run
         p = Path(path)
         if "_extracted" in p.parts:
@@ -805,7 +875,7 @@ def start_watcher(cfg: dict):
     path = cfg.get("input_directory", "")
     if path and os.path.isdir(path):
         watch_observer = Observer()
-        skip = video_removal.removal_folder(path, cfg.get("video_removal_folder"))
+        skip = video_removal.skip_folders(path, cfg.get("video_removal_folder"))
         watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300), skip, cfg.get("watch_stable_seconds", 10)), path, recursive=True)
         watch_observer.start()
 
@@ -854,6 +924,7 @@ def root():
 def api_get_config():
     cfg = load_config()
     out = {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
+    out["docker"] = IN_DOCKER                 # the UI explains that Recycle Bin falls back to a folder there
     # folders that no longer exist (drive unplugged, renamed...): the UI shows a warning
     out["missing_paths"] = [k for k in ("input_directory", "output_directory")
                             if cfg.get(k) and _existing(cfg[k]) is None]
@@ -881,6 +952,9 @@ async def api_save_config(request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
     # Keep server-side settings (host, access_token, browse_roots) the UI can't see
     cfg = {**load_config(), **cfg}
+    if cfg.get("overwrite") and str(cfg.get("output_directory") or "").strip():
+        return JSONResponse({"error": "Overwrite and Output Directory cannot be used together: "
+                                      "clear the output folder or untick overwrite"}, status_code=400)
     save_config(cfg)
     apply_schedule(cfg)
     if cfg.get("watch_enabled"):
@@ -888,6 +962,32 @@ async def api_save_config(request: Request):
     else:
         stop_watcher()
     return {"ok": True}
+
+
+@app.get("/api/preview")
+def api_preview():
+    """Latest finished Preview: id, item count, and whether settings changed since."""
+    return preview_status()
+
+
+@app.post("/api/run-selected")
+async def api_run_selected(request: Request):
+    """Convert exactly the ticked files of the latest Preview, without rescanning.
+    Body: {"preview_id": "...", "files": ["rel/path.jpg", ...]}."""
+    if run_state.running:
+        return JSONResponse({"error": "Already running"}, status_code=409)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Body must be a JSON object")
+        cfg = load_config()
+        files = validate_selected(body.get("preview_id"), body.get("files"), cfg, last_preview)
+    except ValueError as e:
+        msg = str(e)
+        return JSONResponse({"error": msg, "stale": "Preview" in msg or "changed" in msg},
+                            status_code=409 if "Preview" in msg or "changed" in msg else 400)
+    threading.Thread(target=do_run, args=("manual", False, None, files), daemon=True).start()
+    return {"ok": True, "count": len(files)}
 
 
 @app.post("/api/run")
@@ -1164,9 +1264,9 @@ def _batch_durations(video_paths: list[str]) -> dict[str, float]:
 def _walk_media(input_dir: str) -> tuple[list[str], list[str]]:
     """Recursively collect (photo_paths, video_paths) under input_dir, any subfolder."""
     photo_paths, video_paths = [], []
-    skip = video_removal.removal_folder(input_dir, load_config().get("video_removal_folder"))
+    skip = {str(f) for f in video_removal.skip_folders(input_dir, load_config().get("video_removal_folder"))}
     for root, _dirs, files in os.walk(input_dir, followlinks=True):
-        _dirs[:] = [d for d in _dirs if Path(root, d).resolve() != skip]   # don't rescan removed videos
+        _dirs[:] = [d for d in _dirs if str(Path(root, d).resolve()) not in skip]   # don't rescan removed videos
         try:
             for f in files:
                 fp = Path(root) / f

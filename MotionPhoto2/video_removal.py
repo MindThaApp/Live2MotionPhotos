@@ -1,4 +1,10 @@
-"""Safe removal of source videos after muxing (shared by Muxer.py and app.py)."""
+"""Safe disposal of originals after muxing (shared by Muxer.py and app.py).
+
+One removal mode (trash | move | delete) and one folder apply to both kinds of
+originals: source videos removed after muxing, and photos replaced by --overwrite.
+In "move" mode both go to the same folder (default <input dir>/_originals,
+keeping relative paths). The old default folder name `_deleted_videos` is still
+skipped by scans so existing folders are never re-processed."""
 
 import hashlib
 import logging
@@ -12,7 +18,8 @@ logger = logging.getLogger("video_removal")
 
 MODES = ("trash", "move", "delete")
 VIDEO_EXTS = {".mov", ".mp4"}
-DEFAULT_FOLDER_NAME = "_deleted_videos"
+DEFAULT_FOLDER_NAME = "_originals"
+LEGACY_FOLDER_NAMES = ("_deleted_videos",)   # previous default, still ignored by scans
 
 
 def in_docker() -> bool:
@@ -31,12 +38,20 @@ def normalize_mode(mode) -> str:
 
 def removal_folder(root, folder=None) -> Path:
     """Folder used by "move" mode: `folder` if given (relative paths are taken
-    relative to root), otherwise <root>/_deleted_videos."""
+    relative to root), otherwise <root>/_originals."""
     root = Path(root).resolve()
     if not folder:
         return root / DEFAULT_FOLDER_NAME
     folder = Path(folder)
     return (folder if folder.is_absolute() else root / folder).resolve()
+
+
+def skip_folders(root, folder=None) -> list:
+    """Folders scans/watchers must ignore: the removal folder plus legacy default."""
+    root = Path(root).resolve()
+    out = [removal_folder(root, folder)]
+    out += [root / n for n in LEGACY_FOLDER_NAMES]
+    return out
 
 
 def is_inside(path, parent) -> bool:
@@ -215,17 +230,18 @@ def _move(path: Path, root: Path, folder) -> Path:
     return dest
 
 
-def remove_video(path, mode=None, root=None, folder=None) -> str:
-    """The only place video files get removed. Returns the action taken
-    ("trash", "move" or "delete"). Raises ValueError for non-video files or
-    paths outside root. If root is None, the video's own folder is the root."""
+def dispose_file(path, mode=None, root=None, folder=None, exts=None) -> str:
+    """The only place originals get removed. Returns the action taken
+    ("trash", "move" or "delete"). Trash failure falls back to move, never delete.
+    Raises ValueError for disallowed extensions (if `exts` given) or paths outside
+    root, FileNotFoundError if missing. If root is None the file's folder is the root."""
     p = Path(path).resolve()
-    if p.suffix.lower() not in VIDEO_EXTS:
-        raise ValueError(f"not a video file: {path}")
+    if exts is not None and p.suffix.lower() not in exts:
+        raise ValueError(f"not a supported file: {path}")
     if root is not None and not is_inside(p, root):
         raise ValueError(f"path is outside the configured root: {path}")
     if not p.is_file():
-        raise FileNotFoundError(f"video file doesn't exist: {path}")
+        raise FileNotFoundError(f"file doesn't exist: {path}")
     r = Path(root).resolve() if root is not None else p.parent
 
     mode = normalize_mode(mode)
@@ -245,3 +261,20 @@ def remove_video(path, mode=None, root=None, folder=None) -> str:
     p.unlink()
     logger.info("Permanently deleted: %s", p)
     return "delete"
+
+
+def remove_video(path, mode=None, root=None, folder=None) -> str:
+    """Video-only wrapper around dispose_file (keeps the old name and checks)."""
+    if Path(path).suffix.lower() not in VIDEO_EXTS:
+        raise ValueError(f"not a video file: {path}")
+    return dispose_file(path, mode, root, folder, VIDEO_EXTS)
+
+
+def describe_destination(mode, root=None, folder=None) -> str:
+    """Human text for dry-run reports."""
+    mode = normalize_mode(mode)
+    if mode == "trash":
+        return "recycle bin (falls back to a folder if unavailable)"
+    if mode == "move":
+        return f"folder {removal_folder(root, folder) if root else (folder or DEFAULT_FOLDER_NAME)}"
+    return "permanently deleted"
