@@ -15,7 +15,7 @@ from utils import (
     enrich_fname,
     atomic_write,
 )
-from video_removal import verify_muxed_output, remove_video
+from video_removal import verify_muxed_output, remove_video, dispose_file, normalize_mode
 
 import constants as const
 from SamsungTags import SamsungTags
@@ -330,8 +330,29 @@ class Muxer:
         video_footer = samsung_tail.video_footer()
         merged_bytes += video_footer
 
+        # Overwrite keeps the original photo (trash / move) unless mode is "delete":
+        # write the merged file next to it first, then set the original aside, then
+        # move the new file into place. One of the two always exists.
+        protect = self.overwrite is True and normalize_mode(self.video_removal_mode) != "delete"
         self.logger.info("Writing output file: %s", self.output_fpath)
-        atomic_write(self.output_fpath, merged_bytes, stat_from=self.image_fpath)
+        new_fpath = None
+        if protect:
+            new_fpath = os.path.join(os.path.dirname(self.output_fpath), ".mp2new." + os.path.basename(self.output_fpath))
+            atomic_write(new_fpath, merged_bytes, stat_from=self.image_fpath)
+            problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size)
+            if problem:
+                os.remove(new_fpath)
+                raise MuxerInputError(f"Original kept, merged output failed verification: {problem}")
+            try:
+                action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
+                                      root=self.video_removal_root, folder=self.video_removal_folder)
+            except BaseException:
+                os.remove(new_fpath)    # original untouched
+                raise
+            self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
+            os.replace(new_fpath, self.output_fpath)
+        else:
+            atomic_write(self.output_fpath, merged_bytes, stat_from=self.image_fpath)
 
         if self.delete_temp is True and xmp_updated is not None:
             os.remove(xmp_updated)
@@ -352,6 +373,6 @@ class Muxer:
                 )
                 self.logger.debug("Video removal (%s): %s", action, self.video_fpath)
             
-        if self.overwrite is True and self.output_fpath != self.org_outfpath:
+        if self.overwrite is True and not protect and self.output_fpath != self.org_outfpath:
             os.remove(self.org_outfpath)
             self.logger.debug("Delete: %s", self.org_outfpath)

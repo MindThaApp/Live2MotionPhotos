@@ -66,7 +66,16 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .flag input[type=checkbox]{width:13px;height:13px;accent-color:var(--accent);cursor:pointer;flex-shrink:0}
 .flag .fn{font-size:13px;flex:1}
 .flag .ft{font-size:10px;color:var(--muted);font-family:var(--mono)}
-#video_removal_opts{cursor:default}
+#video_removal_opts{cursor:default;padding:0 0 4px 21px}
+.orig-box{border:1px solid var(--border);border-radius:var(--r);padding:6px 8px;margin:6px 0}
+.orig-title{font-size:12px;font-weight:600;margin-bottom:2px}
+.orig-sub{font-size:11px;color:var(--muted);margin:4px 0 2px}
+#removal_folder_row{display:none}
+input:disabled{opacity:.5;cursor:not-allowed}
+#res-body .sel{width:28px;text-align:center}
+.sel-col{display:none}
+.sel-on .sel-col{display:table-cell}
+#sel-bar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px}
 #video_removal_opts select,#video_removal_opts input[type=text]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)}
 
 /* ── Tooltip system ── */
@@ -296,11 +305,12 @@ tr:hover td{background:var(--surface2)}
       </div>
 
       <div class="field">
-        <label>Output Directory <span style="font-size:10px;color:var(--muted)">(empty = use Overwrite)</span></label>
+        <label>Output Directory <span style="font-size:10px;color:var(--muted)">(empty = save next to the original, or replace it)</span></label>
         <div class="dir-row">
-          <input type="text" id="output_directory" placeholder="(in-place)">
-          <button class="btn btn-sm" onclick="openBrowser('output_directory')" data-tip="Browse to choose where muxed files are saved. Leave the field empty to overwrite originals in place.">📁</button>
+          <input type="text" id="output_directory" placeholder="(in-place)" oninput="syncOverwrite()">
+          <button class="btn btn-sm" id="output_browse" onclick="openBrowser('output_directory')" data-tip="Browse to choose where muxed files are saved. Leave the field empty to save next to the original (or replace it, see Originals below).">📁</button>
         </div>
+        <div id="output_hint" style="display:none;color:var(--muted);font-size:11px;margin-top:4px">Disabled while "Replace original photo" is on.</div>
       </div>
 
       <div class="flags">
@@ -333,29 +343,38 @@ tr:hover td{background:var(--surface2)}
           <span class="tip-icon" data-tip="Copy regular photos (JPEGs, PNGs) and standalone videos that have no matching Live Photo pair to the Output Directory unchanged. Use this when you want the output folder to be a complete copy of your library.">ⓘ</span>
         </label>
 
-        <label class="flag">
-          <input type="checkbox" id="overwrite" onchange="checkOverwrite()">
-          <span class="fn">Overwrite Originals</span>
-          <span class="ft">-o</span>
-          <span class="tip-icon" data-tip="Replace the original image file in-place with the muxed Motion Photo. No Output Directory needed. The .MOV video file remains. Use with caution — originals cannot be recovered without a backup.">ⓘ</span>
-        </label>
-
-        <label class="flag">
-          <input type="checkbox" id="delete_video">
-          <span class="fn">Delete Video After Mux</span>
-          <span class="ft">-dv</span>
-          <span class="tip-icon" data-tip="Remove the original .MOV video file after it has been embedded into the Motion Photo. The output is verified first; if verification fails the video is kept. What happens to the file depends on the removal mode below.">ⓘ</span>
-        </label>
-
-        <div class="flag" id="video_removal_opts" style="flex-wrap:wrap;gap:6px">
-          <span class="fn">Video Removal Mode</span>
-          <select id="video_removal_mode" onchange="onRemovalModeChange()">
-            <option value="trash">Move to recycle bin</option>
-            <option value="move">Move to a folder</option>
-            <option value="delete">Delete permanently</option>
-          </select>
-          <input type="text" id="video_removal_folder" placeholder="_deleted_videos (inside the input directory)" style="display:none;flex:1;min-width:200px">
-          <div id="video_removal_warn" style="display:none;width:100%;color:#f85149;font-size:12px"></div>
+        <div class="orig-box">
+          <div class="orig-title">Originals / cleanup <span style="font-weight:400;color:var(--muted)">- after converting</span></div>
+          <label class="flag">
+            <input type="checkbox" id="overwrite" onchange="syncOverwrite()">
+            <span class="fn">Replace original photo (overwrite)</span>
+            <span class="ft">-o</span>
+            <span class="tip-icon" data-tip="Write the Motion Photo over the original photo file instead of creating a new file. The old photo is first set aside (recycle bin or folder, see below), so it can be restored. Cannot be combined with an Output Directory.">ⓘ</span>
+          </label>
+          <label class="flag">
+            <input type="checkbox" id="delete_video" onchange="onRemovalModeChange()">
+            <span class="fn">Remove original video (MOV)</span>
+            <span class="ft">-dv</span>
+            <span class="tip-icon" data-tip="Remove the original .MOV video after it has been embedded into the Motion Photo. The output is verified first; if verification fails the video is kept.">ⓘ</span>
+          </label>
+          <div id="video_removal_opts" style="display:none">
+            <div class="orig-sub">Replaced / removed originals go to:</div>
+            <div class="flag" style="flex-wrap:wrap;gap:6px">
+              <select id="video_removal_mode" onchange="onRemovalModeChange()">
+                <option value="trash">Recycle Bin (recommended)</option>
+                <option value="move">Move to a folder</option>
+                <optgroup label="Advanced">
+                  <option value="delete">Delete permanently (no undo)</option>
+                </optgroup>
+              </select>
+              <span id="removal_folder_row" style="display:none;flex:1;min-width:200px;gap:4px">
+                <input type="text" id="video_removal_folder" placeholder="_originals (inside the input directory)" style="flex:1;min-width:0">
+                <button class="btn btn-sm" onclick="openBrowser('video_removal_folder')" data-tip="Pick a custom folder. Photos and videos both go here.">📁</button>
+              </span>
+            </div>
+            <div id="video_removal_note" style="color:var(--muted);font-size:11px;margin-top:2px"></div>
+            <div id="video_removal_warn" style="display:none;color:#f85149;font-size:12px;margin-top:2px"></div>
+          </div>
         </div>
 
         <label class="flag">
@@ -388,7 +407,7 @@ tr:hover td{background:var(--surface2)}
 
       </div>
 
-      <div class="warn" id="warn-overwrite" style="display:none">⚠ Overwrite replaces originals in place. Ensure you have a backup first.</div>
+      <div class="warn" id="warn-overwrite" style="display:none"></div>
       <div class="warn" id="warn-incremental" style="display:none">⚠ Incremental mode requires an Output Directory to be set.</div>
 
       <button class="btn btn-primary" onclick="saveSettings()" style="width:100%">💾 Save Settings</button>
@@ -548,9 +567,13 @@ tr:hover td{background:var(--surface2)}
     <!-- Per-file results (filled from the progress stream; all text set via textContent) -->
     <div class="hist-wrap" id="res-wrap">
       <div class="hist-hdr">Results <span id="res-count" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
-      <table>
-        <thead><tr><th>File</th><th>Status</th><th>Reason</th><th>Output</th></tr></thead>
-        <tbody id="res-body"><tr id="res-empty"><td colspan="4" style="color:var(--muted);text-align:center;padding:10px 16px">No results yet</td></tr></tbody>
+      <div id="sel-bar">
+        <button class="btn btn-primary" id="conv-sel-btn" onclick="convertSelected()">Convert selected (0)</button>
+        <span id="sel-note" style="color:var(--muted)"></span>
+      </div>
+      <table id="res-table">
+        <thead><tr><th class="sel-col sel"><input type="checkbox" id="sel-all" checked onchange="selAll(this.checked)" title="Select all / none"></th><th>File</th><th>Status</th><th>Reason</th><th>Output</th></tr></thead>
+        <tbody id="res-body"><tr id="res-empty"><td colspan="5" style="color:var(--muted);text-align:center;padding:10px 16px">No results yet</td></tr></tbody>
       </table>
     </div>
 
@@ -628,7 +651,7 @@ function selectFolder() {
   if (browserPath && browserPath !== 'This PC')
     fetch('/api/last-folder', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({key: browserTarget, path: browserPath})}).catch(() => {});
-  checkIncremental();
+  syncOverwrite();
 }
 function joinPath(base, name, sep) {
   return base.endsWith(sep) ? base + name : base + sep + name;
@@ -709,21 +732,31 @@ async function loadConfig() {
   mw.textContent = miss.length ? 'Warning: saved folder not found: ' + miss.map(k => c[k]).join(', ') + '. Pick another folder.' : '';
   mw.style.display = miss.length ? '' : 'none';
   syncPreset(c.schedule_cron || '0 2 * * *');
-  checkOverwrite(); checkIncremental(); onRemovalModeChange(); onScheduleToggle(); onWatchToggle();
+  dockerMode = !!c.docker; syncOverwrite(); checkIncremental(); onRemovalModeChange(); onScheduleToggle(); onWatchToggle();
 }
 
+let dockerMode = false;
 function onRemovalModeChange() {
+  const any = gc('overwrite') || gc('delete_video');
+  document.getElementById('video_removal_opts').style.display = any ? '' : 'none';
   const mode = gv('video_removal_mode');
-  document.getElementById('video_removal_folder').style.display = mode === 'move' ? '' : 'none';
+  document.getElementById('removal_folder_row').style.display = mode === 'move' ? 'flex' : 'none';
+  const note = document.getElementById('video_removal_note');
+  note.textContent = mode === 'trash'
+    ? (dockerMode ? 'No Recycle Bin inside Docker: files are moved to the _originals folder instead.'
+                  : 'Files can be restored from the Recycle Bin. If it is unavailable they are moved to the _originals folder.')
+    : mode === 'move' ? 'Replaced photos and removed videos both go to this folder, keeping their sub-folders. Default: _originals inside the input directory.' : '';
   const warn = document.getElementById('video_removal_warn');
   warn.textContent = mode === 'delete'
-    ? 'Warning: videos will be deleted permanently and cannot be recovered. Make sure you have a backup.' : '';
+    ? 'Warning: replaced photos and removed videos are deleted permanently and cannot be recovered. Make sure you have a backup.' : '';
   warn.style.display = mode === 'delete' ? '' : 'none';
+  checkOverwrite();
 }
 
 async function saveSettings() {
   const cfg = formConfig();
-  await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)});
+  const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)});
+  if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
   flash('✓ Saved');
   await pollStatus();
 }
@@ -773,7 +806,8 @@ async function startRun(dryRun) {
   // Save the currently displayed settings first, so a folder just picked in
   // the browser (but not yet saved) doesn't get silently ignored in favor of
   // stale settings still on disk.
-  await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
+  const cfgR = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
+  if (!cfgR.ok) { flash((await cfgR.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
   const r = await fetch('/api/run' + (dryRun === true ? '?dry_run=true' : ''), {method:'POST'});
   if (r.status === 409) { flash('Already running', true); return; }
   clearTerm();
@@ -797,6 +831,7 @@ function connectSSE(fromLine) {
       setStatus(d.stats?.errors > 0 ? 'error' : 'done');
       document.getElementById('sp-file').style.display = 'none';
       if (d.stats?.skipped > 0 && !lastRunExtract) checkCleanup();
+      if (!lastRunExtract && d.history?.[0]?.dry_run) showSelBar();
       return;
     }
     if (d.result) { addResult(d.result); return; }
@@ -909,10 +944,52 @@ function clearResults() {
   body.textContent = '';
   const tr = document.createElement('tr'); tr.id = 'res-empty';
   const td = document.createElement('td');
-  td.colSpan = 4; td.textContent = 'No results yet';
+  td.colSpan = 5; td.textContent = 'No results yet';
   td.style.cssText = 'color:var(--muted);text-align:center;padding:10px 16px';
   tr.appendChild(td); body.appendChild(tr);
   document.getElementById('res-count').textContent = '';
+  hideSelBar();
+}
+let previewInfo = null;
+function hideSelBar() {
+  previewInfo = null;
+  document.getElementById('sel-bar').style.display = 'none';
+  document.getElementById('res-wrap').classList.remove('sel-on');
+}
+function selBoxes() { return [...document.querySelectorAll('#res-body input[data-file]')]; }
+function selAll(on) { selBoxes().forEach(c => c.checked = on); updateSel(); }
+function updateSel() {
+  const n = selBoxes().filter(c => c.checked).length;
+  const btn = document.getElementById('conv-sel-btn');
+  btn.textContent = `Convert selected (${n})`;
+  btn.disabled = n === 0 || !previewInfo || previewInfo.stale;
+}
+async function showSelBar() {
+  if (lastRunExtract || !selBoxes().length) return;
+  previewInfo = await fetch('/api/preview').then(r => r.json()).catch(() => null);
+  if (!previewInfo?.id) return;
+  document.getElementById('res-wrap').classList.add('sel-on');
+  document.getElementById('sel-bar').style.display = 'flex';
+  document.getElementById('sel-all').checked = true;
+  document.getElementById('sel-note').textContent = 'Runs exactly the ticked files, no rescan. Changing settings requires a new Preview.';
+  updateSel();
+}
+async function convertSelected() {
+  if (!previewInfo) return;
+  const files = selBoxes().filter(c => c.checked).map(c => c.dataset.file);
+  const cfgR = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
+  if (!cfgR.ok) { flash((await cfgR.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
+  const r = await fetch('/api/run-selected', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({preview_id: previewInfo.id, files})});
+  if (r.status === 409 && (await r.clone().json().catch(() => ({}))).stale) {
+    flash('Settings changed since the Preview. Run Preview again.', true);
+    document.getElementById('sel-note').textContent = 'Preview is out of date: run Preview again.';
+    document.getElementById('conv-sel-btn').disabled = true; return;
+  }
+  if (r.status === 409) { flash('Already running', true); return; }
+  if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Failed', true); return; }
+  lastRunExtract = false;
+  clearTerm(); setRunning(true); connectSSE(0);
 }
 function addResult(r) {
   document.getElementById('res-empty')?.remove();
@@ -926,6 +1003,12 @@ function addResult(r) {
     if (style) td.style.cssText = style;
     tr.appendChild(td); return td;
   };
+  const sc = document.createElement('td'); sc.className = 'sel-col sel';
+  if (r.status === 'planned' && !lastRunExtract) {
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
+    cb.dataset.file = r.file; cb.onchange = updateSel; sc.appendChild(cb);
+  }
+  tr.appendChild(sc);
   cell(r.file, 'word-break:break-all;white-space:normal');
   const colors = {converted:'var(--green)', planned:'var(--blue)', skipped:'var(--yellow)', error:'var(--red)'};
   cell(r.status, 'color:' + (colors[r.status] || 'var(--muted)'));
@@ -982,8 +1065,26 @@ function setStatus(st) {
   if (st !== 'running') setTimeout(() => { if (!isRunning) { pill.className='pill pill-idle'; pill.textContent='Idle'; }}, 8000);
 }
 
+function syncOverwrite() {
+  // Overwrite and an Output Directory are mutually exclusive
+  const ow = gc('overwrite'), hasOut = gv('output_directory').trim() !== '';
+  document.getElementById('overwrite').disabled = hasOut && !ow;
+  document.getElementById('output_directory').disabled = ow;
+  document.getElementById('output_browse').disabled = ow;
+  const hint = document.getElementById('output_hint');
+  hint.style.display = (ow || hasOut) ? '' : 'none';
+  hint.textContent = ow ? 'Disabled while "Replace original photo" is on (the result replaces the original).'
+                        : 'Replace original photo is unavailable while an Output Directory is set. Clear this field to use it.';
+  onRemovalModeChange();
+  checkIncremental();
+}
 function checkOverwrite() {
-  document.getElementById('warn-overwrite').style.display = gc('overwrite') ? '' : 'none';
+  const w = document.getElementById('warn-overwrite'), mode = gv('video_removal_mode');
+  const on = gc('overwrite');
+  w.style.display = on ? '' : 'none';
+  w.textContent = mode === 'delete'
+    ? 'Overwrite with permanent delete: the original photo is replaced and cannot be recovered.'
+    : 'The original photo is set aside first (' + (mode === 'move' ? 'moved to the folder above' : 'Recycle Bin') + '), then replaced.';
 }
 function checkIncremental() {
   document.getElementById('warn-incremental').style.display =

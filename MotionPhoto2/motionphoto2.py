@@ -48,7 +48,7 @@ except ImportError:
 
 from Muxer import Muxer, MuxerInputError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import normalize_mode, removal_folder
+from video_removal import normalize_mode, skip_folders, describe_destination
 from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults
 
 logging.basicConfig(
@@ -89,9 +89,18 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
     """--dry-run: say what a real run would do for this pair, touch nothing."""
     out = planned_output(args, image, output_directory, output_file)
     print(f"[DRY-RUN] Would convert {name} + {video} -> {out}")
-    emit_result(name, "planned", "dry run" + (", video would be removed" if args.delete_video else ""), out)
+    dest = describe_destination(removal_kwargs['video_removal_mode'], removal_kwargs.get('video_removal_root'),
+                                removal_kwargs.get('video_removal_folder'))
+    notes = []
+    if args.overwrite:
+        notes.append(f"original photo replaced, old copy -> {dest}")
     if args.delete_video:
-        print(f"[DRY-RUN] Would remove video {video} ({removal_kwargs['video_removal_mode']})")
+        notes.append(f"video removed -> {dest}")
+    emit_result(name, "planned", "dry run" + ("; " + "; ".join(notes) if notes else ""), out)
+    if args.overwrite:
+        print(f"[DRY-RUN] Would replace original photo {image}; old copy goes to {dest}")
+    if args.delete_video:
+        print(f"[DRY-RUN] Would remove video {video}; it goes to {dest}")
 
 
 def run_extract_mode(args) -> int:
@@ -213,14 +222,21 @@ def main():
         "--video-removal-mode",
         choices=["trash", "move", "delete"],
         default=None,
-        help="How --delete-video removes the video (default: move in Docker, otherwise trash)",
+        help="How --delete-video / --overwrite dispose of originals: trash, move (to a folder) or delete (default: move in Docker, otherwise trash)",
         gooey_options={'visible':False}
     )
 
     settings_group.add_argument(
         "--video-removal-folder",
         default=None,
-        help="Folder for --video-removal-mode move (default: <input directory>/_deleted_videos)",
+        help="Folder for --video-removal-mode move, used for removed videos and replaced photos (default: <input directory>/_originals)",
+        gooey_options={'visible':False}
+    )
+
+    settings_group.add_argument(
+        "--only-file",
+        default=None,
+        help="JSON file with a list of image paths (relative to the input directory) to convert; all other photos are ignored",
         gooey_options={'visible':False}
     )
 
@@ -435,7 +451,14 @@ def main():
         'video_removal_folder': args.video_removal_folder,
         'video_removal_root': removal_root,
     }
-    skip_folder = removal_folder(removal_root, args.video_removal_folder) if removal_root else None
+    skip_folders_ = [str(f) for f in skip_folders(removal_root, args.video_removal_folder)] if removal_root else []
+    only_images = None
+    if args.only_file:
+        if args.copy_unmuxed:
+            print("[ERROR] --only-file cannot be combined with copy-unmuxed")
+            sys.exit(1)
+        with open(args.only_file, encoding="utf-8") as fh:
+            only_images = {str(Path(x)) for x in json.load(fh)}
 
     logger = logging.getLogger("ExifTool")
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
@@ -456,7 +479,7 @@ def main():
                 for root, dirnames, filenames in os.walk(input_directory):
                     # never rescan videos that were moved aside by --delete-video
                     dirnames[:] = [d for d in dirnames if d != EXTRACT_DIRNAME
-                                   and not (skip_folder and (Path(root) / d).resolve() == skip_folder)]
+                                   and str((Path(root) / d).resolve()) not in skip_folders_]
                     for filename in filenames:
                         full_path = Path(root) / filename
                         rel_path = full_path.relative_to(input_directory)
@@ -478,6 +501,9 @@ def main():
                 if Path(f).suffix.lower() in [".heic", ".heif", ".avif", ".jpg", ".jpeg"]
             ]
             
+            if only_images is not None:
+                images = [f for f in images if str(Path(f)) in only_images]
+
             unsupported = [
                 f for f in files
                 if Path(f).suffix.lower() not in [".mp4", ".mov", ".heic", ".heif", ".avif", ".jpg", ".jpeg"]
