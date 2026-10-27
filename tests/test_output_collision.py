@@ -184,3 +184,10 @@ def test_name_match_copy_unmuxed_does_not_copy_matched_video(tmp_path, monkeypat
     run_main(monkeypatch, capsys, root, "--copy-unmuxed", "--output-directory", str(tmp_path / "out"))
     assert not (tmp_path / "out" / "a.mov").exists()
     assert len(RecMuxer.calls) == 2
+
+
+def test_video_of_a_skipped_conflict_photo_is_kept(tmp_path, monkeypatch, capsys):
+    root = make_dir(tmp_path)
+    rows = run_main(monkeypatch, capsys, root, "--overwrite", "--delete-video", "--no-xmp", "--video-removal-mode", "move")
+    assert rows["IMG_1.jpeg"]["kind"] == "conflict"
+    assert (root / "IMG_1.MOV").exists()

@@ -540,6 +540,7 @@ def main():
             failed_pairs = []
             all_videos = list(videos)
             claimed_videos = set()     # videos that belong to some photo (so are not "MOV without a photo")
+            blocked_videos = set()     # videos a photo was skipped for (output conflict): keep them
             claimed_outputs = set()    # output paths already taken in this run (two photos must not write one file)
 
             if not args.exif_match: # match by file name
@@ -629,7 +630,7 @@ def main():
                                         video_fpath=str(input_video),
                                         exiftool=et,
                                         output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                        delete_video=args.delete_video and last_photo_for_video,
+                                        delete_video=args.delete_video and last_photo_for_video and video not in blocked_videos,
                                         **removal_kwargs,
                                         delete_temp=not args.keep_temp,
                                         overwrite=args.overwrite,
@@ -640,6 +641,7 @@ def main():
                                     muxer.mux()
                                     emit_result(image, "converted", output=muxer.output_fpath)
                             except OutputConflictError as e:
+                                blocked_videos.add(video)
                                 print(f"[WARNING] Skipping {image}: {e}")
                                 emit_result(image, "skipped", str(e), kind="conflict")
                             except MuxerInputError as e:
@@ -773,7 +775,7 @@ def main():
                                     video_fpath=str(input_video),
                                     exiftool=et,
                                     output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                    delete_video=args.delete_video and last_photo_for_video,
+                                    delete_video=args.delete_video and last_photo_for_video and video not in blocked_videos,
                                     **removal_kwargs,
                                     delete_temp=not args.keep_temp,
                                     overwrite=args.overwrite,
@@ -784,6 +786,7 @@ def main():
                                 muxer.mux()
                                 emit_result(img, "converted", output=muxer.output_fpath)
                         except OutputConflictError as e:
+                            blocked_videos.add(video)
                             print(f"[WARNING] Skipping {img}: {e}")
                             emit_result(img, "skipped", str(e), kind="conflict")
                         except MuxerInputError as e:
