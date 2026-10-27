@@ -118,7 +118,7 @@ MAX_RESULTS = 100000         # per-file result rows kept for the results table
 RESULT_PREFIX = "@@RESULT "    # machine-readable lines printed by motionphoto2.py
 RESULT_STATUSES = {"converted", "skipped", "error", "planned"}
 # Finer per-row classification the Preview filters on (see classify_row).
-ROW_KINDS = ("ready", "motion_leftover", "motion_only", "no_mov", "no_photo", "skipped", "error", "missing")
+ROW_KINDS = ("ready", "motion_leftover", "motion_only", "no_mov", "no_photo", "skipped", "conflict", "error", "missing")
 
 
 # ─── Shared run state ─────────────────────────────────────────────────────────
@@ -656,6 +656,8 @@ def classify_row(r: dict) -> str:
         return "motion_only"
     if "no matching video" in why:
         return "no_mov"
+    if "would overwrite" in why:
+        return "conflict"
     if "no matching photo" in why:
         return "no_photo"
     return "skipped"

@@ -14,6 +14,9 @@ from utils import (
     read_file,
     enrich_fname,
     atomic_write,
+    output_with_extension,
+    output_conflict,
+    claim_output,
 )
 from video_removal import verify_muxed_output, remove_video, dispose_file, normalize_mode
 
@@ -34,6 +37,12 @@ class MuxerInputError(Exception):
     pass
 
 
+class OutputConflictError(MuxerInputError):
+    """The output path is an existing file that is not the photo being replaced
+    (or another photo of the same run already writes it). Nothing was touched."""
+    pass
+
+
 class Muxer:
     def __init__(
         self,
@@ -50,6 +59,7 @@ class Muxer:
         overwrite: bool = False,
         no_xmp: bool = False,
         verbose: bool = False,
+        claimed_outputs: set = None,
     ):
         self.logger = logging.getLogger(Path(image_fpath).stem)
         self.verbose = verbose
@@ -67,6 +77,7 @@ class Muxer:
         self.video_removal_folder = video_removal_folder
         self.video_removal_root = video_removal_root
         self.no_xmp = no_xmp
+        self.claimed_outputs = claimed_outputs
         self.exiftool = exiftool
 
         if os.path.isfile(self.image_fpath) is False:
@@ -192,20 +203,25 @@ class Muxer:
         return video_type
 
     def fix_output_fpath(self, metadata: dict = None):
-        output_path = Path(self.output_fpath)
         image_metadata_extension = (metadata or {}).get("File:FileTypeExtension", None)
-        if image_metadata_extension is not None:
-            if output_path.suffix[1:].lower() != image_metadata_extension.lower():
-                self.logger.warning(
-                    "Output extension %s doesn't match with input image metadata %s",
-                    output_path.suffix,
-                    image_metadata_extension,
-                )
+        fixed = output_with_extension(self.output_fpath, image_metadata_extension)
+        if fixed != self.output_fpath:
+            self.logger.warning(
+                "Output extension %s doesn't match with input image metadata %s",
+                Path(self.output_fpath).suffix,
+                image_metadata_extension,
+            )
+            self.output_fpath = fixed
 
-                self.output_fpath = os.path.join(
-                    output_path.parent,
-                    output_path.stem + f".{image_metadata_extension.lower()}",
-                )
+    def check_output_collision(self):
+        """Never write over a file that is not the photo being replaced."""
+        rerun_ok = not self.overwrite and self.output_fpath == self.org_outfpath
+        why = output_conflict(self.output_fpath, self.image_fpath, self.video_fpath,
+                              self.claimed_outputs, rerun_ok=rerun_ok)
+        if why:
+            self.logger.error(why)
+            raise OutputConflictError(why)
+        claim_output(self.claimed_outputs, self.output_fpath)
 
     def merge_xmp(self, xmp: str):
         try:
@@ -253,6 +269,7 @@ class Muxer:
 
         image_type = self.validate_image(self.image_fpath, metadata=image_metadata)
         self.fix_output_fpath(image_metadata)
+        self.check_output_collision()
         self.validate_video(self.video_fpath, metadata=video_metadata)
 
         if self.no_xmp is False:

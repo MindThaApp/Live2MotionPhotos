@@ -64,6 +64,47 @@ def atomic_write(target: str, data: bytes, stat_from: str = None) -> None:
         raise
 
 
+def output_with_extension(path: str, ext) -> str:
+    """The output path Muxer really writes: the extension follows the image's real type
+    (File:FileTypeExtension), so IMG.JPEG becomes IMG.jpg."""
+    p = Path(path)
+    if ext and p.suffix[1:].lower() != str(ext).lower():
+        return os.path.join(p.parent, p.stem + f".{str(ext).lower()}")
+    return path
+
+
+def _norm_path(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def output_conflict(output: str, source: str, video: str = None, claimed=None, rerun_ok: bool = False):
+    """Why writing `output` for `source` would destroy another file, or None if it is safe.
+
+    Safe: the output is the source itself (overwrite), or does not exist yet. With
+    rerun_ok (the name comes straight from the source, not overwrite mode) an existing
+    file that already contains this video is an earlier result of the same conversion.
+    `claimed` is a set shared by the whole run: two sources must not map to one output."""
+    key = _norm_path(output)
+    if claimed is not None and key in claimed:
+        return f"output would overwrite {output}, which another photo in this run also writes"
+    try:
+        same = os.path.samefile(output, source)
+    except OSError:
+        same = _norm_path(output) == _norm_path(source)
+    if same:
+        return None
+    if os.path.lexists(output):
+        if rerun_ok and video and input_output_binary_compare(video, output):
+            return None
+        return f"output would overwrite {output}, an existing file that is not this photo"
+    return None
+
+
+def claim_output(claimed, output: str) -> None:
+    if claimed is not None:
+        claimed.add(_norm_path(output))
+
+
 def enrich_fname(fpath: str, enrich: str) -> str:
     p = Path(fpath)
     fname = f"{p.stem}.{enrich}{p.suffix}"
