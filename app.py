@@ -184,6 +184,10 @@ class RunState:
         if not isinstance(r, dict):
             return
         status = r.get("status")
+        # Count from the per-file outcome, not the "Writing output file" log line: that
+        # line comes before verification, so a photo that then failed was counted too.
+        if status in ("converted", "planned"):
+            self.stats["converted"] += 1
         self.results.append({
             "file": str(r.get("file", ""))[:1024],
             "status": status if status in RESULT_STATUSES else "error",
@@ -232,9 +236,6 @@ class RunState:
             if m:
                 self.stats["current"] = int(m.group(1))
                 self.stats["total"] = int(m.group(2))
-        elif "Writing output file" in raw or "[DRY-RUN] Would convert" in raw \
-                or "[DRY-RUN] Would extract" in raw or raw.startswith("Extracted "):
-            self.stats["converted"] += 1
         elif "is not a motion photo, skipping" in rawl:
             self.stats["skipped"] += 1
         elif "[ERROR]" in raw:
