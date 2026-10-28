@@ -22,6 +22,8 @@ from test_safe_overwrite import MP4, StubExif  # noqa: E402
 class JpgET(FakeET):
     """Every image is a real JPEG, so IMG.jpeg is written as IMG.jpg."""
     def get_metadata(self, files):
+        if isinstance(files, (str, os.PathLike)):     # real ExifToolHelper accepts a single path too
+            files = [files]
         out = super().get_metadata(files)
         for m, f in zip(out, files):
             m["File:FileTypeExtension"] = "jpg" if Path(f).suffix.lower() in (".jpg", ".jpeg") else "heic"
@@ -202,3 +204,30 @@ def test_video_of_a_skipped_conflict_photo_is_kept(tmp_path, monkeypatch, capsys
     rows = run_main(monkeypatch, capsys, root, "--overwrite", "--delete-video", "--no-xmp", "--video-removal-mode", "move")
     assert rows["IMG_1.jpeg"]["kind"] == "conflict"
     assert (root / "IMG_1.MOV").exists()
+
+
+@pytest.mark.parametrize("order", ["jpeg_first", "jpg_first"])
+def test_real_run_skips_the_conflict_and_touches_nothing(tmp_path, monkeypatch, capsys, order):
+    """Not a preview: a real --overwrite run where IMG_1.jpeg would be written as IMG_1.jpg."""
+    if _fs_case_insensitive(tmp_path):
+        pytest.skip("needs a case-sensitive filesystem")
+    root = make_dir(tmp_path)
+    for name in ("IMG_1.HEIC", "IMG_1.jpg", "IMG_1.jpeg"):     # distinct content, to tell them apart
+        (root / name).write_bytes(JPEG + name.encode())
+    real_walk = os.walk
+    first = {"jpeg_first": "IMG_1.jpeg", "jpg_first": "IMG_1.jpg"}[order]
+
+    def walk(top, *a, **k):
+        for d, dirs, files in real_walk(top, *a, **k):
+            yield d, dirs, sorted(files, key=lambda f: f != first)
+    monkeypatch.setattr(os, "walk", walk)
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+    rows = run_main(monkeypatch, capsys, root, "--overwrite", "--delete-video")
+    assert rows["IMG_1.jpeg"]["status"] == "skipped" and rows["IMG_1.jpeg"]["kind"] == "conflict"
+    assert (root / "IMG_1.jpeg").read_bytes() == before["IMG_1.jpeg"]          # the skipped source is untouched
+    assert (root / "IMG_1.MOV").exists()                                        # its video was kept
+    assert not [p for p in root.iterdir() if p.name.startswith(".mp2")]
+    # the file the conflict would have clobbered holds its own photo, never the skipped one's bytes
+    assert b"IMG_1.jpeg" not in (root / "IMG_1.jpg").read_bytes()
+    assert (root / "IMG_1.jpg").read_bytes().startswith(JPEG + b"IMG_1.jpg")
+    assert rows["IMG_1.jpg"]["status"] == "converted"
