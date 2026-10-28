@@ -18,7 +18,7 @@ from utils import (
     output_conflict,
     claim_output,
 )
-from video_removal import verify_muxed_output, remove_video, dispose_file, normalize_mode
+from video_removal import jpeg_scan_tail, verify_muxed_output, remove_video, dispose_file, normalize_mode
 
 import constants as const
 from SamsungTags import SamsungTags
@@ -343,6 +343,10 @@ class Muxer:
             merged_bytes = read_file(self.image_fpath)
         samsung_tail.set_image_size(len(merged_bytes))
         image_size = os.path.getsize(self.image_fpath)  # before an overwrite replaces it
+        # Rewriting the XMP can shrink a JPEG, so its verification compares the picture
+        # data (which never changes) instead of the file size. None = legacy size check.
+        image_scan = jpeg_scan_tail(self.image_fpath) if image_type == "jpg" else None
+        image_end = len(merged_bytes)
         video_offset = len(merged_bytes) + samsung_tail.get_image_padding()
         video_footer = samsung_tail.video_footer()
         merged_bytes += video_footer
@@ -356,7 +360,7 @@ class Muxer:
         if protect:
             new_fpath = os.path.join(os.path.dirname(self.output_fpath), ".mp2new." + os.path.basename(self.output_fpath))
             atomic_write(new_fpath, merged_bytes, stat_from=self.image_fpath)
-            problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size)
+            problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end)
             if problem:
                 os.remove(new_fpath)
                 raise MuxerInputError(f"Original kept, merged output failed verification: {problem}")
@@ -378,7 +382,7 @@ class Muxer:
             self.logger.debug("Delete: %s", xmp_image)
 
         if self.delete_video is True:
-            problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size)
+            problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end)
             if problem:
                 self.logger.warning("Keeping video %s, output verification failed: %s", self.video_fpath, problem)
             else:

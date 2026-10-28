@@ -22,6 +22,7 @@ def test_dry_run_lines_counted_as_planned_conversions():
     st = appmod.RunState()
     st.start("manual")
     st.emit("[DRY-RUN] Would convert a.heic + a.mov -> a.LIVE.heic")
+    st.emit('@@RESULT {"file": "a.heic", "status": "planned", "reason": "dry run", "kind": "ready"}')
     st.emit("[DRY-RUN] Would remove video a.mov (trash)")
     assert st.stats["converted"] == 1 and st.stats["errors"] == 0
 

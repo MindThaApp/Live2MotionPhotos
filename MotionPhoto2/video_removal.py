@@ -13,6 +13,7 @@ import shutil
 import struct
 
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("video_removal")
 
@@ -62,15 +63,67 @@ def is_inside(path, parent) -> bool:
         return False
 
 
-def verify_muxed_output(output_path, video_path, video_offset: int, image_size: int) -> str:
+def jpeg_scan_tail(data) -> Optional[bytes]:
+    """The bytes of a JPEG from its first SOS marker to the end (the compressed
+    picture data plus anything after it), or None if the header cannot be parsed.
+    Rewriting the metadata segments (XMP, EXIF) never changes these bytes."""
+    if isinstance(data, (str, os.PathLike)):
+        with open(data, "rb") as f:
+            data = f.read()
+    start = _jpeg_sos_offset(data)
+    return None if start is None else bytes(data[start:])
+
+
+def _jpeg_sos_offset(data) -> Optional[int]:
+    """Offset of the first SOS marker, walking the segment chain from the start of
+    the file; None if the chain is not a well formed JPEG header."""
+    if data[:2] != b"\xff\xd8":
+        return None
+    i, n = 2, len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:               # fill byte
+            i += 1
+            continue
+        if marker == 0xDA:
+            return i
+        if marker in (0x00, 0x01, 0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            return None                  # not valid before the scan
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return None
+
+
+def verify_muxed_output(output_path, video_path, video_offset: int, image_size: int,
+                        image_scan: Optional[bytes] = None, image_end: Optional[int] = None) -> str:
     """Return "" if the muxed file looks complete, else the reason it does not.
-    video_offset is where the source video bytes start inside the output."""
+    video_offset is where the source video bytes start inside the output.
+
+    Without image_scan the output must be at least as large as the original photo
+    plus the video. That is wrong for JPEGs: rewriting the XMP can legitimately make
+    the photo smaller. For a JPEG, pass image_scan (jpeg_scan_tail of the original)
+    and image_end (where the merged photo ends in the output): the output must then
+    start with a well formed JPEG header whose scan data is byte for byte the
+    original's and ends at image_end, followed by the unchanged video."""
     if not os.path.isfile(output_path):
         return f"output file does not exist: {output_path}"
     video_size = os.path.getsize(video_path)
     out_size = os.path.getsize(output_path)
-    if out_size < image_size + video_size:
-        return f"output is {out_size} bytes, expected at least {image_size + video_size}"
+    if image_scan is None or image_end is None:
+        if out_size < image_size + video_size:
+            return f"output is {out_size} bytes, expected at least {image_size + video_size}"
+    else:
+        if not image_scan or image_end > video_offset or image_end > out_size or image_end < len(image_scan):
+            return f"merged photo end {image_end} is inconsistent with the video offset {video_offset}"
+        with open(output_path, "rb") as out:
+            head = out.read(image_end - len(image_scan) + 4)
+            out.seek(image_end - len(image_scan))
+            scan = out.read(len(image_scan))
+        if _jpeg_sos_offset(head) != image_end - len(image_scan):
+            return "merged photo header is not a well formed JPEG that ends where the picture data starts"
+        if scan != image_scan:
+            return "picture data of the merged photo differs from the original"
     if video_offset < 0 or video_offset + video_size > out_size:
         return f"video offset {video_offset} + {video_size} bytes is outside the output ({out_size} bytes)"
     with open(output_path, "rb") as out, open(video_path, "rb") as vid:

@@ -80,7 +80,18 @@ def test_result_lines_feed_results_table_not_log():
     items, total = st.read_results(0)
     assert total == 2 and items[0][1]["file"] == "a<b>.heic"
     assert items[1][1]["status"] == "error"          # unknown statuses are coerced
-    assert len(st.lines) == 1 and st.stats["converted"] == 0
+    assert len(st.lines) == 1 and st.stats["converted"] == 1    # only the real "converted" result counts
+
+
+def test_converted_count_ignores_photos_that_failed_verification():
+    st = appmod.RunState()
+    st.start("manual")
+    for n in range(3):
+        st.emit(f"[INFO] Writing output file: /in/{n}.jpg")      # logged before verification
+    st.emit('@@RESULT {"file": "0.jpg", "status": "converted", "output": "/in/0.jpg"}')
+    st.emit('@@RESULT {"file": "1.jpg", "status": "error", "reason": "Original kept, merged output failed verification"}')
+    st.emit('@@RESULT {"file": "2.jpg", "status": "skipped", "kind": "conflict"}')
+    assert st.stats["converted"] == 1
 
 
 def test_results_endpoint_and_stream(monkeypatch):

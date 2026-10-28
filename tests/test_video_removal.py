@@ -73,3 +73,57 @@ def test_verify_muxed_output(tmp_path):
     assert "expected at least" in vr.verify_muxed_output(make(tmp_path / "s.jpg", b"IMG"), video, 0, 5)
     assert "outside" in vr.verify_muxed_output(out, video, 100, 1)
     assert "does not exist" in vr.verify_muxed_output(tmp_path / "none", video, 0, 5)
+
+
+def _jpeg(xmp: bytes, scan: bytes = b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00" + b"PIXELS" * 20 + b"\xff\xd9") -> bytes:
+    app1 = b"\xff\xe1" + (len(xmp) + 2).to_bytes(2, "big") + xmp
+    dqt = b"\xff\xdb\x00\x04\x00\x00"
+    return b"\xff\xd8" + app1 + dqt + scan
+
+
+def test_jpeg_scan_tail():
+    data = _jpeg(b"x" * 30)
+    assert vr.jpeg_scan_tail(data).startswith(b"\xff\xda") and vr.jpeg_scan_tail(data).endswith(b"\xff\xd9")
+    assert vr.jpeg_scan_tail(b"not a jpeg") is None
+    assert vr.jpeg_scan_tail(b"\xff\xd8\xff\xe1\x00\xf0abc") is None      # segment runs past the end
+    assert vr.jpeg_scan_tail(b"\xff\xd8\x00\x00\x00\x00\x00\x00") is None
+
+
+def _muxed(tmp_path, original: bytes, merged: bytes, video: bytes, name="o.jpg"):
+    """merged photo + 3 bytes of Samsung tag padding + video + footer."""
+    out = make(tmp_path / name, merged + b"PAD" + video + b"FOOTER")
+    return out, len(merged) + 3
+
+
+def test_verify_jpeg_accepts_smaller_xmp(tmp_path):
+    video = make(tmp_path / "v.mov", b"VIDEODATA")
+    original = _jpeg(b"x" * 400)
+    merged = _jpeg(b"y" * 100)                  # the XMP shrank by 300 bytes
+    out, offset = _muxed(tmp_path, original, merged, b"VIDEODATA")
+    assert len(merged) + 3 + 9 < len(original) + 9 + 3 + 6      # legacy size check would fail ...
+    assert "expected at least" in vr.verify_muxed_output(out, video, offset, len(original))
+    scan, end = vr.jpeg_scan_tail(original), len(merged)        # ... the parse based one passes
+    assert vr.verify_muxed_output(out, video, offset, len(original), scan, end) == ""
+
+
+def test_verify_jpeg_rejects_damaged_output(tmp_path):
+    video = make(tmp_path / "v.mov", b"VIDEODATA")
+    original, merged = _jpeg(b"x" * 400), _jpeg(b"y" * 100)
+    scan, end = vr.jpeg_scan_tail(original), len(merged)
+    # picture data altered
+    bad = merged[:-10] + b"X" * 10
+    out, offset = _muxed(tmp_path, original, bad, b"VIDEODATA", "a.jpg")
+    assert "picture data" in vr.verify_muxed_output(out, video, offset, len(original), scan, end)
+    # truncated header (picture data intact but header chain broken)
+    broken = b"\xff\xd8\xff\xe1\x00\x10" + b"z" * 5 + vr.jpeg_scan_tail(merged)
+    out, offset = _muxed(tmp_path, original, broken, b"VIDEODATA", "b.jpg")
+    assert "well formed" in vr.verify_muxed_output(out, video, offset, len(original), scan, len(broken))
+    # wrong video bytes
+    out, offset = _muxed(tmp_path, original, merged, b"OTHERDATA", "c.jpg")
+    assert "differ" in vr.verify_muxed_output(out, video, offset, len(original), scan, end)
+    # video cut short
+    out = make(tmp_path / "d.jpg", merged + b"PAD" + b"VIDEO")
+    assert "outside" in vr.verify_muxed_output(out, video, len(merged) + 3, len(original), scan, end)
+    # image end past the video offset
+    out, offset = _muxed(tmp_path, original, merged, b"VIDEODATA", "e.jpg")
+    assert "inconsistent" in vr.verify_muxed_output(out, video, offset, len(original), scan, offset + 5)
