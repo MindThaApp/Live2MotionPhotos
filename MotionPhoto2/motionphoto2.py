@@ -84,6 +84,32 @@ def emit_result(name, status: str, reason: str = "", output: str = "", kind: str
     print("@@RESULT " + json.dumps(d), flush=True)
 
 
+def get_metadata_safe(et, paths):
+    """(metadata list, errors) for paths. One batch call first; if exiftool fails on it
+    (an empty or corrupt file makes it exit 1), retry file by file so only the bad
+    files are lost. errors maps the index of an unreadable file to exiftool's message;
+    its metadata entry is {}. Unreadable files are never matched or touched."""
+    paths = list(paths)
+    if not paths:
+        return [], {}
+    try:
+        metas = et.get_metadata(paths)
+        if len(metas) == len(paths):
+            return list(metas), {}
+    except Exception:
+        pass
+    metas, errors = [], {}
+    for i, p in enumerate(paths):
+        try:
+            m = et.get_metadata(p)
+            metas.append(m[0] if m else {})
+        except Exception as e:
+            msg = (getattr(e, "stderr", "") or "").strip() or str(e) or e.__class__.__name__
+            errors[i] = msg.replace("\n", " ")[:200]
+            metas.append({})
+    return metas, errors
+
+
 def check_motion_photo(path, et):
     """(is_motion_photo, error). An unreadable file is reported, not fatal."""
     try:
@@ -660,9 +686,13 @@ def main():
                 video_paths = [input_directory / vid for vid in videos]
                 print("Running in EXIF matching mode.")
                 print("Getting metadata for images, please wait...")
-                image_metadatas = et.get_metadata([str(p) for p in image_paths])
+                image_metadatas, image_errors = get_metadata_safe(et, [str(p) for p in image_paths])
                 print("Getting metadata for videos, please wait...")
-                video_metadatas = et.get_metadata([str(p) for p in video_paths])
+                video_metadatas, video_errors = get_metadata_safe(et, [str(p) for p in video_paths])
+                for vi, msg in video_errors.items():
+                    print(f"[WARNING] Cannot read {videos[vi]}: {msg}")
+                    emit_result(videos[vi], "skipped", "unreadable: " + msg, kind="skipped")
+                    claimed_videos.add(videos[vi])
                 
                 # Map content identifiers to video relative paths
                 content_id_to_video = {}
@@ -685,8 +715,12 @@ def main():
 
                 # Match images to videos
                 i = 0
-                for img, img_meta in zip(images, image_metadatas):
+                for img_idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
                     i += 1
+                    if img_idx in image_errors:
+                        print(f"[WARNING] Cannot read {img}: {image_errors[img_idx]}")
+                        emit_result(img, "skipped", "unreadable: " + image_errors[img_idx], kind="skipped")
+                        continue
                     cid0 = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
                     last_photo_for_video = True
                     if cid0 in content_id_to_video:
@@ -744,7 +778,7 @@ def main():
                             # Try matching using Content id
                             output_image_path = output_subdirectory / image_path.name
                             if os.path.exists(output_image_path):
-                                output_metadata = et.get_metadata(output_image_path)[0]
+                                output_metadata = get_metadata_safe(et, [str(output_image_path)])[0][0]
                                 output_image_content_id = output_metadata.get('MakerNotes:ContentIdentifier')
                                 output_video_data_from_image = extract_video_from_image(output_image_path, et)
 

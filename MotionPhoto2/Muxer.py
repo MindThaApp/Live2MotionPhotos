@@ -260,9 +260,15 @@ class Muxer:
         xmp_updated = None
         xmp_image = None
 
-        image_metadata, video_metadata = self.exiftool.get_metadata(
-            [self.image_fpath, self.video_fpath]
-        )
+        try:
+            image_metadata, video_metadata = self.exiftool.get_metadata(
+                [self.image_fpath, self.video_fpath]
+            )
+        except MuxerInputError:
+            raise
+        except Exception as e:
+            reason = (getattr(e, "stderr", "") or "").strip() or str(e) or e.__class__.__name__
+            raise MuxerInputError(f"exiftool cannot read the photo or video: {reason[:200]}")
         
         for ns in const.NAMESPACES:
             etree.register_namespace(ns, const.NAMESPACES[ns])
