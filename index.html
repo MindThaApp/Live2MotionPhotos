@@ -615,6 +615,10 @@ tr:hover td{background:var(--surface2)}
             <button class="btn btn-sm" id="clean-sel-btn" onclick="askCleanup()">Clean up MOVs (0)</button>
           </div>
         </div>
+        <div id="bin-bar" style="display:none;font-size:12px;padding:4px 16px;gap:10px;align-items:center">
+          <span id="bin-msg" style="flex:1"></span>
+          <button class="btn btn-sm btn-primary" id="bin-switch" style="display:none" onclick="switchToMove()">Switch to Move to folder</button>
+        </div>
       </div>
       <table id="res-table">
         <thead><tr><th class="sel-col sel c-sel"></th><th class="c-file">File</th><th class="c-st">Status</th><th class="c-why">Reason</th><th class="c-out">Output</th></tr></thead>
@@ -1042,6 +1046,55 @@ function updateSel() {
   b1.textContent = `Convert (${conv})`; b1.disabled = conv === 0 || stale || isRunning;
   b2.textContent = `Clean up MOVs (${clean})`; b2.disabled = clean === 0 || stale || isRunning;
   document.querySelectorAll('#res-body input[data-file]').forEach(c => c.checked = selected.has(c.dataset.file));
+  scheduleBinCheck();
+}
+const fmtBytes = n => n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
+let binTimer = null, binSeq = 0;
+function showBin(rep) {
+  const bar = document.getElementById('bin-bar'), msg = document.getElementById('bin-msg'), sw = document.getElementById('bin-switch');
+  if (!rep || !rep.applies || !rep.files) { bar.style.display = 'none'; return; }
+  const est = `Bin: ~${fmtBytes(rep.estimate)} of ~${fmtBytes(rep.cap)} cap` +
+    (rep.usage ? ` (${fmtBytes(rep.usage)} already in the bin)` : '') + `, ${rep.files} item${rep.files !== 1 ? 's' : ''}`;
+  bar.style.display = 'flex';
+  msg.textContent = rep.ok ? est : `${rep.reason}  [${est}]`;
+  msg.style.color = rep.ok ? 'var(--muted)' : 'var(--red)';
+  sw.style.display = rep.ok ? 'none' : '';
+}
+function scheduleBinCheck() {
+  clearTimeout(binTimer);
+  binTimer = setTimeout(async () => {
+    const seq = ++binSeq;
+    const conv = [], clean = [];
+    for (const r of previewInfo?.rows || []) {
+      if (!selected.has(r.file)) continue;
+      if (rowState(r) === 'ready') conv.push(r.file); else if (isCleanable(r)) clean.push(r.file);
+    }
+    if (!previewInfo || previewInfo.stale || (!conv.length && !clean.length)) { showBin(null); return; }
+    try {
+      const reps = await Promise.all([[conv, 'convert'], [clean, 'cleanup']].filter(x => x[0].length).map(async ([files, action]) => {
+        const r = await fetch('/api/bin-check', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({files, action})});
+        return r.ok ? r.json() : null;
+      }));
+      if (seq !== binSeq) return;
+      const live = reps.filter(x => x && x.applies && x.files);
+      showBin(live.find(x => !x.ok) || live[0] || null);
+    } catch (e) { showBin(null); }
+  }, 250);
+}
+async function switchToMove() {
+  const sel = document.getElementById('video_removal_mode');
+  sel.value = 'move'; onRemovalModeChange();
+  const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(formConfig())});
+  if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
+  flash('Switched to Move to folder. Preview again to continue.');
+  document.getElementById('bin-bar').style.display = 'none';
+  markStale();
+}
+function binRefused(res) {
+  if (!res.bin_guard) return false;
+  showBin({...res.bin, applies: true, files: res.bin.files || 1});
+  flash(res.error, true);
+  return true;
 }
 function selShown() { shownRows().forEach(r => { if (rowActionable(r)) selected.add(r.file); }); updateSel(); }
 function selNone() { selected.clear(); updateSel(); }
@@ -1146,7 +1199,9 @@ async function convertSelected() {
   if (!cfgR.ok) { flash((await cfgR.json().catch(() => ({}))).error || 'Invalid settings', true); return; }
   const r = await fetch('/api/run-selected', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({preview_id: previewInfo.id, files})});
-  if (r.status === 409 && (await r.clone().json().catch(() => ({}))).stale) { markStale(); return; }
+  const j409 = r.status === 409 ? await r.clone().json().catch(() => ({})) : {};
+  if (j409.bin_guard) { binRefused(j409); return; }
+  if (r.status === 409 && j409.stale) { markStale(); return; }
   if (r.status === 409) { flash('Already running', true); return; }
   if (!r.ok) { flash((await r.json().catch(() => ({}))).error || 'Failed', true); return; }
   const res = await r.json().catch(() => ({}));
@@ -1175,6 +1230,7 @@ async function doCleanup(files) {
   const r = await fetch('/api/cleanup-movs', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({preview_id: previewInfo.id, files})});
   const res = await r.json().catch(() => ({}));
+  if (binRefused(res)) return;
   if (r.status === 409 && res.stale) { markStale(); return; }
   if (!r.ok) { flash(res.error || 'Clean up failed', true); return; }
   let msg = `Cleaned up ${res.cleaned} MOV${res.cleaned !== 1 ? 's' : ''}`;
