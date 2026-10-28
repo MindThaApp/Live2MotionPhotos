@@ -1048,7 +1048,6 @@ function updateSel() {
   document.querySelectorAll('#res-body input[data-file]').forEach(c => c.checked = selected.has(c.dataset.file));
   scheduleBinCheck();
 }
-const fmtBytes = n => n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
 let binTimer = null, binSeq = 0;
 function showBin(rep) {
   const bar = document.getElementById('bin-bar'), msg = document.getElementById('bin-msg'), sw = document.getElementById('bin-switch');
