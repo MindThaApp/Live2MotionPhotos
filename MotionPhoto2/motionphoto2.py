@@ -49,7 +49,7 @@ except ImportError:
 from Muxer import Muxer, MuxerInputError, OutputConflictError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
 from video_removal import normalize_mode, skip_folders, describe_destination
-from utils import enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
+from utils import exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
 logging.basicConfig(
@@ -71,7 +71,7 @@ class Unbuffered(object):
    def __getattr__(self, attr):
        return getattr(self.stream, attr)
 
-def emit_result(name, status: str, reason: str = "", output: str = "", kind: str = "", video: str = ""):
+def emit_result(name, status: str, reason: str = "", output: str = "", kind: str = "", video: str = "", photo: str = ""):
     """One machine-readable line per file for the web UI's results table.
     kind (optional) is the finer classification the Preview filters on: ready,
     motion_leftover, motion_only, no_mov, no_photo, skipped, error. video is the
@@ -81,6 +81,8 @@ def emit_result(name, status: str, reason: str = "", output: str = "", kind: str
         d["kind"] = kind
     if video:
         d["video"] = str(video)
+    if photo:
+        d["photo"] = str(photo)
     print("@@RESULT " + json.dumps(d), flush=True)
 
 
@@ -104,10 +106,26 @@ def get_metadata_safe(et, paths):
             m = et.get_metadata(p)
             metas.append(m[0] if m else {})
         except Exception as e:
-            msg = (getattr(e, "stderr", "") or "").strip() or str(e) or e.__class__.__name__
-            errors[i] = msg.replace("\n", " ")[:200]
+            errors[i] = exiftool_message(e)[:200]
             metas.append({})
     return metas, errors
+
+
+def assign_videos(candidates) -> dict:
+    """candidates: [(photo, [videos with its Live Photo identity or name])]. Returns
+    {photo: video}. Each photo embeds its own video: a video no other photo has taken
+    yet, preferring the one with the photo's own file name. Only when every candidate
+    is already taken (HEIC + JPEG exports sharing one MOV) is a video shared."""
+    taken, out = set(), {}
+    for photo, cands in candidates:
+        if not cands:
+            continue
+        stem = str(Path(photo).with_suffix(""))
+        ordered = sorted(cands, key=lambda v: str(Path(v).with_suffix("")) != stem)   # stable
+        pick = next((v for v in ordered if v not in taken), ordered[0])
+        taken.add(pick)
+        out[photo] = pick
+    return out
 
 
 def check_motion_photo(path, et):
@@ -115,7 +133,7 @@ def check_motion_photo(path, et):
     try:
         return is_motion_photo(str(path), et), ""
     except Exception as e:
-        return False, str(e) or e.__class__.__name__
+        return False, exiftool_message(e)
 
 
 def planned_output(args, image: str, output_directory, output_file=None) -> str:
@@ -567,6 +585,25 @@ def main():
             all_videos = list(videos)
             claimed_videos = set()     # videos that belong to some photo (so are not "MOV without a photo")
             blocked_videos = set()     # videos a photo was skipped for (output conflict): keep them
+            stats = {"converted": 0, "videos_removed": 0, "duplicates_kept": 0}
+            reported_dupes = set()
+
+            def report_duplicates(photo, cands, assigned_videos):
+                """Videos of the same Live Photo that no photo embedded: kept, shown in Preview."""
+                for vid in cands:
+                    if vid not in assigned_videos and vid not in reported_dupes:
+                        reported_dupes.add(vid)
+                        stats["duplicates_kept"] += 1
+                        claimed_videos.add(vid)
+                        print(f"Duplicate video kept: {vid} (same Live Photo as {photo}, not embedded)")
+                        emit_result(vid, "skipped", f"duplicate video kept: same Live Photo as {photo}, not embedded in any photo",
+                                    kind="duplicate_video", video=vid, photo=photo)
+
+            def after_mux(image, muxer):
+                stats["converted"] += 1
+                if getattr(muxer, "video_removed", False) is True:
+                    stats["videos_removed"] += 1
+                emit_result(image, "converted", output=muxer.output_fpath)
             claimed_outputs = set()    # output paths already taken in this run (two photos must not write one file)
 
             if not args.exif_match: # match by file name
@@ -574,14 +611,18 @@ def main():
                 # next to IMG.MOV). Count them first so --delete-video only removes the video
                 # after the last of them, and never pop it from the list on first use.
                 video_names = set(videos)
-                def name_match(image):
+                def name_candidates(image):
                     base = str(Path(image).with_suffix(''))
-                    return next((base + e for e in (".mp4", ".mov", ".MP4", ".MOV") if base + e in video_names), None)
+                    return [base + e for e in (".mp4", ".mov", ".MP4", ".MOV") if base + e in video_names]
+                # Photos that are already Motion Photos take no video: check them first
+                mp_state = {image: check_motion_photo(input_directory / image, et) for image in images}
+                name_cands = {image: name_candidates(image) for image in images
+                              if not mp_state[image][1] and not mp_state[image][0]}
+                assigned = assign_videos(list(name_cands.items()))
                 photos_left = {}
-                for image in images:
-                    v = name_match(image)
-                    if v:
-                        photos_left[v] = photos_left.get(v, 0) + 1
+                for v in assigned.values():
+                    photos_left[v] = photos_left.get(v, 0) + 1
+                assigned_videos = set(assigned.values())
 
                 i = 0
                 for image in images:
@@ -589,13 +630,13 @@ def main():
                     image_path = Path(image)
                     fname = str(image_path.with_suffix(''))
                     last_photo_for_video = True
-                    v0 = name_match(image)
+                    v0 = assigned.get(image)
                     if v0:
                         photos_left[v0] -= 1
                         last_photo_for_video = photos_left[v0] <= 0
 
                     # Check if source image is already a motion photo
-                    is_mp, err = check_motion_photo(input_directory / image, et)
+                    is_mp, err = mp_state[image]
                     if err:
                         print(f"[WARNING] Cannot read {image}: {err}")
                         emit_result(image, "error", "unreadable: " + err[:200], kind="error")
@@ -613,9 +654,9 @@ def main():
                             unmatched_images.append(image)
                         continue
                     
-                    for ext in [".mp4", ".mov", ".MP4", ".MOV"]:
-                        video_fname = fname + ext
-                        if video_fname in video_names:
+                    for video_fname in ([assigned[image]] if image in assigned else []):
+                        if True:
+                            report_duplicates(image, name_cands[image], assigned_videos)
                             print(f"=========================[{i}/{len(images)}]")
                             video = video_fname
                             if video in videos:
@@ -665,7 +706,7 @@ def main():
                                         claimed_outputs=claimed_outputs,
                                     )
                                     muxer.mux()
-                                    emit_result(image, "converted", output=muxer.output_fpath)
+                                    after_mux(image, muxer)
                             except OutputConflictError as e:
                                 blocked_videos.add(video)
                                 print(f"[WARNING] Skipping {image}: {e}")
@@ -706,12 +747,20 @@ def main():
                 # Several photos can share one video (e.g. HEIC + JPEG exports of the same
                 # Live Photo). Count the photos per video so --delete-video only removes it
                 # after the last of them, otherwise the rest fail with "Video file doesn't exist".
-                photos_left = {}
-                for img_meta in image_metadatas:
+                # Photos that are already Motion Photos take no video: check them first.
+                mp_state = {img: (False, "") if idx in image_errors else check_motion_photo(input_directory / img, et)
+                            for idx, img in enumerate(images)}
+                exif_cands = []
+                for idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
                     cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
-                    if cid in content_id_to_video:
-                        v = content_id_to_video[cid][0]
-                        photos_left[v] = photos_left.get(v, 0) + 1
+                    if idx not in image_errors and not mp_state[img][1] and not mp_state[img][0] and cid in content_id_to_video:
+                        exif_cands.append((img, list(content_id_to_video[cid])))
+                exif_cands_by_img = dict(exif_cands)
+                assigned = assign_videos(exif_cands)
+                photos_left = {}
+                for v in assigned.values():
+                    photos_left[v] = photos_left.get(v, 0) + 1
+                assigned_videos = set(assigned.values())
 
                 # Match images to videos
                 i = 0
@@ -721,15 +770,14 @@ def main():
                         print(f"[WARNING] Cannot read {img}: {image_errors[img_idx]}")
                         emit_result(img, "skipped", "unreadable: " + image_errors[img_idx], kind="skipped")
                         continue
-                    cid0 = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
                     last_photo_for_video = True
-                    if cid0 in content_id_to_video:
-                        v0 = content_id_to_video[cid0][0]
+                    v0 = assigned.get(img)
+                    if v0:
                         photos_left[v0] -= 1
                         last_photo_for_video = photos_left[v0] <= 0
 
                     # Check if source image is already a motion photo
-                    is_mp, err = check_motion_photo(input_directory / img, et)
+                    is_mp, err = mp_state[img]
                     if err:
                         print(f"[WARNING] Cannot read {img}: {err}")
                         emit_result(img, "error", "unreadable: " + err[:200], kind="error")
@@ -753,13 +801,12 @@ def main():
                         print(f"[DEBUG] Image {img} has ContentIdentifier: {content_id}")
                     if content_id and content_id.strip() in content_id_to_video:
                         print(f"=========================[{i}/{len(images)}]")
-                        video = content_id_to_video[content_id.strip()][0]
-                        claimed_videos.update(content_id_to_video[content_id.strip()])
+                        video = assigned[img]
+                        claimed_videos.add(video)
+                        report_duplicates(img, exif_cands_by_img[img], assigned_videos)
 
-                        if args.copy_unmuxed:
-                            for vid in content_id_to_video[content_id.strip()]:
-                                if vid in videos:
-                                    videos.remove(vid)
+                        if args.copy_unmuxed and video in videos:
+                            videos.remove(video)
                         
                         # Construct full paths for input files
                         input_image = input_directory / img
@@ -818,7 +865,7 @@ def main():
                                     claimed_outputs=claimed_outputs,
                                 )
                                 muxer.mux()
-                                emit_result(img, "converted", output=muxer.output_fpath)
+                                after_mux(img, muxer)
                         except OutputConflictError as e:
                             blocked_videos.add(video)
                             print(f"[WARNING] Skipping {img}: {e}")
@@ -862,6 +909,9 @@ def main():
                     shutil.copy2(input_directory / file, output_subdirectory)
             print("=" * 25)
 
+            if not args.dry_run:
+                print(f"[SUMMARY] {stats['converted']} photo(s) converted, {stats['videos_removed']} video(s) removed, "
+                      f"{stats['duplicates_kept']} duplicate video(s) kept")
             if failed_pairs:
                 print(f"[SUMMARY] {len(failed_pairs)} file(s) skipped due to missing pair:")
                 for name, reason in failed_pairs:

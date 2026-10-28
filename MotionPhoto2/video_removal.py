@@ -95,8 +95,153 @@ def _jpeg_sos_offset(data) -> Optional[int]:
     return None
 
 
+# ─── HEIC structure ───────────────────────────────────────────────────────────
+# Rewriting the XMP of a HEIC (exiftool) moves boxes around and can make the file
+# smaller, so its size says nothing. What must never change is the picture data:
+# every image item (primary image, tiles, thumbnails, auxiliary images) keeps its
+# bytes. Metadata items (Exif, XMP) are allowed to change.
+
+_HEIC_META_TYPES = (b"Exif", b"mime")
+_HEIC_MAX_ITEM = 512 * 1024 * 1024
+
+
+def _iso_boxes(data, start: int, end: int):
+    """(type, payload_start, box_end) for the boxes in data[start:end]; raises
+    ValueError if they do not tile that range exactly."""
+    out, i = [], start
+    while i < end:
+        if i + 8 > end:
+            raise ValueError("truncated box header")
+        size = int.from_bytes(data[i:i + 4], "big")
+        kind = bytes(data[i + 4:i + 8])
+        hdr = 8
+        if size == 1:
+            size, hdr = int.from_bytes(data[i + 8:i + 16], "big"), 16
+        elif size == 0:
+            size = end - i
+        if size < hdr or i + size > end:
+            raise ValueError("box %r runs outside the file" % kind)
+        out.append((kind, i + hdr, i + size))
+        i += size
+    return out
+
+
+def heic_image_items(source, limit: Optional[int] = None) -> dict:
+    """Parse a HEIC/HEIF/AVIF file (a path or bytes, only the first `limit` bytes if
+    given, which must be exactly a sequence of whole boxes). Returns
+    {"primary": item_id, "items": {item_id: (type, sha256 of the item bytes)}} for all
+    non-metadata items. Raises ValueError if the file is not a well formed HEIF."""
+    if isinstance(source, (str, os.PathLike)):
+        with open(source, "rb") as f:
+            data = f.read() if limit is None else f.read(limit)
+        if limit is not None and len(data) != limit:
+            raise ValueError("file is shorter than the expected image size")
+    else:
+        data = bytes(source if limit is None else source[:limit])
+    try:
+        top = _iso_boxes(data, 0, len(data))
+        if not top or top[0][0] != b"ftyp":
+            raise ValueError("no ftyp box first")
+        metas = [b for b in top if b[0] == b"meta"]
+        if len(metas) != 1:
+            raise ValueError("expected exactly one meta box")
+        m_start, m_end = metas[0][1] + 4, metas[0][2]           # meta is a full box
+        kids = {k: (a, b) for k, a, b in _iso_boxes(data, m_start, m_end)}
+        for need in (b"pitm", b"iinf", b"iloc"):
+            if need not in kids:
+                raise ValueError("no %s box" % need.decode())
+        a, b = kids[b"pitm"]
+        primary = int.from_bytes(data[a + 4:a + 6], "big") if data[a] == 0 else int.from_bytes(data[a + 4:a + 8], "big")
+
+        a, b = kids[b"iinf"]
+        iv = data[a]
+        n = int.from_bytes(data[a + 4:a + 6], "big"); pos = a + 6
+        if iv != 0:
+            n = int.from_bytes(data[a + 4:a + 8], "big"); pos = a + 8
+        types = {}
+        for kind, ia, ib in _iso_boxes(data, pos, b):
+            if kind != b"infe":
+                continue
+            ver = data[ia]
+            if ver < 2:
+                raise ValueError("unsupported infe version")
+            if ver == 2:
+                iid, itype = int.from_bytes(data[ia + 4:ia + 6], "big"), bytes(data[ia + 8:ia + 12])
+            else:
+                iid, itype = int.from_bytes(data[ia + 4:ia + 8], "big"), bytes(data[ia + 10:ia + 14])
+            types[iid] = itype
+        if len(types) != n or primary not in types:
+            raise ValueError("item list is inconsistent")
+
+        a, b = kids[b"iloc"]
+        ver = data[a]
+        osz, lsz = data[a + 4] >> 4, data[a + 4] & 15
+        bsz, isz = data[a + 5] >> 4, data[a + 5] & 15
+        pos = a + 6
+        if ver < 2:
+            count, pos = int.from_bytes(data[pos:pos + 2], "big"), pos + 2
+        else:
+            count, pos = int.from_bytes(data[pos:pos + 4], "big"), pos + 4
+
+        def rd(k):
+            nonlocal pos
+            v = int.from_bytes(data[pos:pos + k], "big")
+            pos += k
+            return v
+        idat = kids.get(b"idat")
+        items = {}
+        for _ in range(count):
+            iid = rd(4 if ver == 2 else 2)
+            method = 0
+            if ver in (1, 2):
+                method = rd(2) & 15
+            rd(2)                                              # data reference index
+            base = rd(bsz)
+            ext = []
+            for _ in range(rd(2)):
+                if ver in (1, 2) and isz:
+                    rd(isz)
+                ext.append((rd(osz), rd(lsz)))
+            if pos > b:
+                raise ValueError("iloc is truncated")
+            if types.get(iid) in _HEIC_META_TYPES or iid not in types:
+                continue
+            h = hashlib.sha256()
+            for off, ln in ext:
+                if method == 0:
+                    lo = base + off
+                    if ln == 0 or lo + ln > len(data):
+                        raise ValueError("item %d is outside the file" % iid)
+                    h.update(data[lo:lo + ln])
+                elif method == 1 and idat:
+                    lo = idat[0] + base + off
+                    if lo + ln > idat[1]:
+                        raise ValueError("item %d is outside idat" % iid)
+                    h.update(data[lo:lo + ln])
+                else:
+                    raise ValueError("unsupported item location")
+            items[iid] = (types[iid], h.hexdigest())
+        if primary not in items:
+            raise ValueError("primary image has no data")
+        return {"primary": primary, "items": items}
+    except (IndexError, struct.error) as e:
+        raise ValueError("malformed HEIF structure: %s" % e)
+
+
+def _compare_heic(original: dict, merged: dict) -> str:
+    if original["primary"] != merged["primary"]:
+        return "primary image changed in the merged photo"
+    if set(original["items"]) != set(merged["items"]):
+        return "image items of the merged photo differ from the original"
+    for iid, want in original["items"].items():
+        if merged["items"][iid] != want:
+            return "picture data of the merged photo differs from the original (item %d)" % iid
+    return ""
+
+
 def verify_muxed_output(output_path, video_path, video_offset: int, image_size: int,
-                        image_scan: Optional[bytes] = None, image_end: Optional[int] = None) -> str:
+                        image_scan: Optional[bytes] = None, image_end: Optional[int] = None,
+                        heic_items: Optional[dict] = None) -> str:
     """Return "" if the muxed file looks complete, else the reason it does not.
     video_offset is where the source video bytes start inside the output.
 
@@ -105,12 +250,27 @@ def verify_muxed_output(output_path, video_path, video_offset: int, image_size: 
     the photo smaller. For a JPEG, pass image_scan (jpeg_scan_tail of the original)
     and image_end (where the merged photo ends in the output): the output must then
     start with a well formed JPEG header whose scan data is byte for byte the
-    original's and ends at image_end, followed by the unchanged video."""
+    original's and ends at image_end, followed by the unchanged video.
+
+    For a HEIC, pass heic_items (heic_image_items of the original) and image_end: the
+    first image_end bytes of the output must be well formed boxes whose image items
+    (primary, tiles, thumbnails) are byte for byte the original's. The size rule is
+    the fallback when the original could not be parsed (heic_items None)."""
     if not os.path.isfile(output_path):
         return f"output file does not exist: {output_path}"
     video_size = os.path.getsize(video_path)
     out_size = os.path.getsize(output_path)
-    if image_scan is None or image_end is None:
+    if heic_items is not None and image_end is not None:
+        if image_end > video_offset or image_end > out_size:
+            return f"merged photo end {image_end} is inconsistent with the video offset {video_offset}"
+        try:
+            merged = heic_image_items(output_path, limit=image_end)
+        except (ValueError, OSError) as e:
+            return f"merged photo is not a well formed HEIC: {e}"
+        problem = _compare_heic(heic_items, merged)
+        if problem:
+            return problem
+    elif image_scan is None or image_end is None:
         if out_size < image_size + video_size:
             return f"output is {out_size} bytes, expected at least {image_size + video_size}"
     else:
@@ -208,9 +368,18 @@ def _xmp_video_location(f, size: int):
     return None
 
 
-def find_embedded_video(path, use_xmp: bool = True):
+def looks_like_video(head: bytes) -> bool:
+    """True if the first bytes look like an MP4/MOV: an `ftyp` box, or a `wide`
+    (free space) box first. The bytes are read once by the caller, then every
+    signature is checked against the same bytes."""
+    return any(sig in head[:16] for sig in VIDEO_SIGNATURES)
+
+
+def find_embedded_video(path, use_xmp: bool = True, check_signature: bool = True):
     """(offset, length) of the video embedded in a Motion Photo, or None.
-    Checks the Samsung trailer first (tail bytes only), then, if use_xmp, the XMP."""
+    Checks the Samsung trailer first (tail bytes only), then, if use_xmp, the XMP.
+    check_signature=False accepts any trailer/XMP pointer without looking at the
+    video bytes (used by the "never mux twice" guard, where a false alarm is safer)."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -219,9 +388,10 @@ def find_embedded_video(path, use_xmp: bool = True):
                 loc = _xmp_video_location(f, size)
             if loc is None or loc[0] < 0 or loc[1] <= 8 or loc[0] + loc[1] > size:
                 return None
-            f.seek(loc[0])
-            if not any(sig in f.read(15) for sig in VIDEO_SIGNATURES):
-                return None
+            if check_signature:
+                f.seek(loc[0])
+                if not looks_like_video(f.read(16)):   # read once, check every signature
+                    return None
             return loc
     except (OSError, struct.error):
         return None
