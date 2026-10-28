@@ -228,3 +228,20 @@ def test_cleanup_small_goes_to_bin(env, monkeypatch):
     monkeypatch.setattr(vr, "dispose_file", lambda p, mode=None, root=None, folder=None, exts=None: sent.append(Path(p).name) or "trash")
     r = c.post("/api/cleanup-movs", json={"preview_id": appmod.last_preview["id"], "files": ["p0.jpg"]}).json()
     assert r["cleaned"] == 1 and r["details"][0]["action"] == "trash" and sent == ["p0.mov"]
+
+
+def test_index_html_script_parses():
+    """A duplicate declaration in index.html's script silently kills the whole page."""
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    js = re.findall(r"<script>(.*?)</script>", (ROOT / "index.html").read_text(encoding="utf-8"), re.S)[-1]
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "page.js"
+        f.write_text(js, encoding="utf-8")
+        r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
