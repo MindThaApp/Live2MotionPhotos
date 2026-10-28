@@ -8,6 +8,7 @@ from pathlib import Path
 from lxml import etree
 
 from utils import (
+    exiftool_message,
     extract_track_number,
     extract_track_duration,
     extract_still_image_time,
@@ -18,7 +19,7 @@ from utils import (
     output_conflict,
     claim_output,
 )
-from video_removal import jpeg_scan_tail, verify_muxed_output, remove_video, dispose_file, normalize_mode
+from video_removal import jpeg_scan_tail, heic_image_items, find_embedded_video, verify_muxed_output, remove_video, dispose_file, normalize_mode
 
 import constants as const
 from SamsungTags import SamsungTags
@@ -73,6 +74,7 @@ class Muxer:
         self.output_directory = output_directory
         self.overwrite = overwrite
         self.delete_video = delete_video
+        self.video_removed = False
         self.video_removal_mode = video_removal_mode
         self.video_removal_folder = video_removal_folder
         self.video_removal_root = video_removal_root
@@ -257,6 +259,9 @@ class Muxer:
 
     def _mux(self):
         self.logger.info("Processing %s", self.image_fpath)
+        self.video_removed = False
+        if find_embedded_video(self.image_fpath, check_signature=False):
+            raise MuxerInputError("photo already contains an embedded video (Samsung trailer or XMP), not adding a second one")
         xmp_updated = None
         xmp_image = None
 
@@ -267,7 +272,7 @@ class Muxer:
         except MuxerInputError:
             raise
         except Exception as e:
-            reason = (getattr(e, "stderr", "") or "").strip() or str(e) or e.__class__.__name__
+            reason = exiftool_message(e)
             raise MuxerInputError(f"exiftool cannot read the photo or video: {reason[:200]}")
         
         for ns in const.NAMESPACES:
@@ -353,6 +358,12 @@ class Muxer:
         # data (which never changes) instead of the file size. None = legacy size check.
         image_scan = jpeg_scan_tail(self.image_fpath) if image_type == "jpg" else None
         image_end = len(merged_bytes)
+        heic_items = None
+        if image_type == "heic":
+            try:
+                heic_items = heic_image_items(self.image_fpath)
+            except (ValueError, OSError) as e:
+                self.logger.warning("Cannot parse the HEIC structure (%s), falling back to the size check", e)
         video_offset = len(merged_bytes) + samsung_tail.get_image_padding()
         video_footer = samsung_tail.video_footer()
         merged_bytes += video_footer
@@ -366,7 +377,7 @@ class Muxer:
         if protect:
             new_fpath = os.path.join(os.path.dirname(self.output_fpath), ".mp2new." + os.path.basename(self.output_fpath))
             atomic_write(new_fpath, merged_bytes, stat_from=self.image_fpath)
-            problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end)
+            problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)
             if problem:
                 os.remove(new_fpath)
                 raise MuxerInputError(f"Original kept, merged output failed verification: {problem}")
@@ -388,7 +399,7 @@ class Muxer:
             self.logger.debug("Delete: %s", xmp_image)
 
         if self.delete_video is True:
-            problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end)
+            problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)
             if problem:
                 self.logger.warning("Keeping video %s, output verification failed: %s", self.video_fpath, problem)
             else:
@@ -398,6 +409,7 @@ class Muxer:
                     root=self.video_removal_root,
                     folder=self.video_removal_folder,
                 )
+                self.video_removed = True
                 self.logger.debug("Video removal (%s): %s", action, self.video_fpath)
             
         if self.overwrite is True and not protect and self.output_fpath != self.org_outfpath:

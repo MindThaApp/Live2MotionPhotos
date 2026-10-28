@@ -110,6 +110,26 @@ def enrich_fname(fpath: str, enrich: str) -> str:
     fname = f"{p.stem}.{enrich}{p.suffix}"
     return os.path.join(p.parent, fname)
 
+def exiftool_message(e) -> str:
+    """exiftool's own message for a failed call (e.g. "Error: File is empty - x.jpg"),
+    not pyexiftool's generic "execute returned a non-zero exit status: 1"."""
+    parts = []
+    for attr in ("stderr", "stdout"):
+        v = getattr(e, attr, "")
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", "replace")
+        v = str(v or "").strip()
+        if attr == "stdout" and v.startswith(("[", "{")):
+            try:                              # -json output: the message is in "Error"/"Warning"
+                v = " ".join(str(d.get(k)) for d in json.loads(v) if isinstance(d, dict) for k in ("Error", "Warning") if d.get(k))
+            except ValueError:
+                pass
+        if v:
+            parts.append(v)
+    msg = " ".join(" ".join(parts).split())
+    return msg or str(e) or e.__class__.__name__
+
+
 def is_motion_photo(fpath: str, et: exiftool.ExifToolHelper) -> bool:
     # 1. Samsung trailer (also what this tool writes): a few bytes from the end of
     #    the file, no exiftool and no video extraction.

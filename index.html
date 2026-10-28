@@ -997,9 +997,9 @@ function clearResults() {
 let previewInfo = null;
 let selected = new Set(), activeFilter = 'all', selPreviewId = null;
 const KIND_LABEL = {ready:'Ready to convert', motion_leftover:'Motion Photo + leftover MOV', motion_only:'Already Motion Photo',
-  no_mov:'No matching MOV', no_photo:'MOV, no photo', skipped:'Skipped', conflict:'Output conflict', error:'Error', converted:'Converted', missing:'Missing'};
+  no_mov:'No matching MOV', no_photo:'MOV, no photo', duplicate_video:'Duplicate video kept', skipped:'Skipped', conflict:'Output conflict', error:'Error', converted:'Converted', missing:'Missing'};
 const KIND_COLOR = {ready:'var(--blue)', motion_leftover:'var(--purple)', motion_only:'var(--green)', no_mov:'var(--yellow)',
-  no_photo:'var(--yellow)', skipped:'var(--yellow)', conflict:'var(--red)', error:'var(--red)', converted:'var(--green)', missing:'var(--red)'};
+  no_photo:'var(--yellow)', duplicate_video:'var(--purple)', skipped:'var(--yellow)', conflict:'var(--red)', error:'var(--red)', converted:'var(--green)', missing:'var(--red)'};
 const CHIPS = [
   ['all', 'All', null],
   ['ready', 'Ready', ['ready']],
@@ -1007,6 +1007,7 @@ const CHIPS = [
   ['motion_leftover', 'Leftover MOV', ['motion_leftover']],
   ['no_mov', 'No MOV', ['no_mov']],
   ['no_photo', 'MOV, no photo', ['no_photo']],
+  ['duplicate_video', 'Duplicate video kept', ['duplicate_video']],
   ['skipped', 'Skipped', ['skipped']],
   ['conflict', 'Output conflict', ['conflict']],
   ['error', 'Error', ['error']],
@@ -1019,7 +1020,8 @@ function hideSelBar() {
   document.getElementById('res-wrap').classList.remove('sel-on');
 }
 const rowState = r => r.state || (r.done ? 'converted' : r.kind);
-const rowActionable = r => (rowState(r) === 'ready') || rowState(r) === 'motion_leftover';
+const isCleanable = r => ['motion_leftover', 'duplicate_video'].includes(rowState(r));
+const rowActionable = r => (rowState(r) === 'ready') || isCleanable(r);
 function shownRows() {
   if (!previewInfo) return [];
   const states = CHIPS.find(c => c[0] === activeFilter)?.[2];
@@ -1029,7 +1031,7 @@ function selCounts() {
   let conv = 0, clean = 0;
   for (const r of previewInfo?.rows || []) {
     if (!selected.has(r.file)) continue;
-    if (rowState(r) === 'ready') conv++; else if (rowState(r) === 'motion_leftover') clean++;
+    if (rowState(r) === 'ready') conv++; else if (isCleanable(r)) clean++;
   }
   return {conv, clean};
 }
@@ -1156,7 +1158,7 @@ async function convertSelected() {
 function closeConfirm() { document.getElementById('confirm-bg').style.display = 'none'; }
 function askCleanup() {
   if (!previewInfo) return;
-  const files = previewInfo.rows.filter(r => selected.has(r.file) && rowState(r) === 'motion_leftover').map(r => r.file);
+  const files = previewInfo.rows.filter(r => selected.has(r.file) && isCleanable(r)).map(r => r.file);
   if (!files.length) return;
   const cu = previewInfo.cleanup || {};
   document.getElementById('confirm-title').textContent = 'Clean up leftover MOVs';

@@ -118,7 +118,7 @@ MAX_RESULTS = 100000         # per-file result rows kept for the results table
 RESULT_PREFIX = "@@RESULT "    # machine-readable lines printed by motionphoto2.py
 RESULT_STATUSES = {"converted", "skipped", "error", "planned"}
 # Finer per-row classification the Preview filters on (see classify_row).
-ROW_KINDS = ("ready", "motion_leftover", "motion_only", "no_mov", "no_photo", "skipped", "conflict", "error", "missing")
+ROW_KINDS = ("ready", "motion_leftover", "motion_only", "no_mov", "no_photo", "duplicate_video", "skipped", "conflict", "error", "missing")
 
 
 # ─── Shared run state ─────────────────────────────────────────────────────────
@@ -195,6 +195,7 @@ class RunState:
             "output": str(r.get("output", ""))[:1024],
             "kind": r.get("kind") if r.get("kind") in ROW_KINDS else "",
             "video": str(r.get("video", ""))[:1024],
+            "photo": str(r.get("photo", ""))[:1024],
         })
         self.result_total += 1
 
@@ -665,13 +666,13 @@ def classify_row(r: dict) -> str:
 
 
 def _norm_row(r: dict) -> dict:
-    out = {k: str(r.get(k, "")) for k in ("file", "status", "reason", "output", "video")}
+    out = {k: str(r.get(k, "")) for k in ("file", "status", "reason", "output", "video", "photo")}
     out["kind"] = classify_row(r)
     return out
 
 
 def _actionable(r: dict, done: set) -> bool:
-    return (r["kind"] == "ready" and r["file"] not in done) or r["kind"] == "motion_leftover"
+    return (r["kind"] == "ready" and r["file"] not in done) or r["kind"] in ("motion_leftover", "duplicate_video")
 
 
 def preview_file() -> Path:
@@ -1190,16 +1191,27 @@ async def api_cleanup_movs(request: Request):
     return cleanup_movs(files, rowmap, cfg, root)
 
 
+def _after_cleanup(row: dict, kind: str):
+    if kind == "duplicate_video":
+        row["kind"], row["reason"] = "skipped", "duplicate video removed (verified identical to the video inside the photo)"
+    else:
+        row["kind"], row["video"], row["reason"] = "motion_only", "", "already a motion photo"
+
+
 def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
     cleaned, refused, errors, skipped = [], [], [], []
     mode = cfg.get("video_removal_mode")
     gone = []
     for f in dict.fromkeys(files):
         row = rowmap[f]
-        if classify_row(row) != "motion_leftover" or not row.get("video"):
+        kind = classify_row(row)
+        if kind not in ("motion_leftover", "duplicate_video") or not row.get("video") \
+                or (kind == "duplicate_video" and not row.get("photo")):
             skipped.append({"file": f, "reason": "no leftover MOV for this row"})
             continue
-        photo, video = (root / f).resolve(), (root / row["video"]).resolve()
+        # A duplicate video's row is the video itself; the photo it must be verified against is stored beside it
+        photo = (root / (row["photo"] if kind == "duplicate_video" else f)).resolve()
+        video = (root / row["video"]).resolve()
         if not (video_removal.is_inside(photo, root) and video_removal.is_inside(video, root)
                 and is_browsable(photo, browse_roots()) and is_browsable(video, browse_roots())):
             errors.append({"file": f, "error": "path is outside the input directory"})
@@ -1210,7 +1222,7 @@ def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
             continue
         if not video.is_file():
             with _preview_lock:
-                row["kind"], row["video"], row["reason"] = "motion_only", "", "already a motion photo"
+                _after_cleanup(row, kind)
             skipped.append({"file": f, "reason": "MOV already gone"})
             continue
         problem = video_removal.verify_embedded_video(str(photo), str(video))
@@ -1224,7 +1236,7 @@ def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
             continue
         cleaned.append({"file": f, "video": row["video"], "action": action})
         with _preview_lock:
-            row["kind"], row["video"], row["reason"] = "motion_only", "", "already a motion photo"
+            _after_cleanup(row, kind)
     if gone:
         with _preview_lock:
             for f in gone:
