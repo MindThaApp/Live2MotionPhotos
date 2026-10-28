@@ -119,7 +119,18 @@ def make_dir(tmp_path):
     return root
 
 
+def _fs_case_insensitive(path):
+    probe = Path(path) / "CaseProbe.tmp"
+    probe.write_bytes(b"x")
+    try:
+        return (Path(path) / "caseprobe.tmp").exists()
+    finally:
+        probe.unlink()
+
+
 def test_preview_flags_the_conflict(tmp_path, monkeypatch, capsys):
+    if _fs_case_insensitive(tmp_path):
+        pytest.skip("needs a case-sensitive filesystem")
     root = make_dir(tmp_path)
     rows = run_main(monkeypatch, capsys, root, "--dry-run", "--overwrite")
     assert rows["IMG_1.jpeg"]["status"] == "skipped" and rows["IMG_1.jpeg"]["kind"] == "conflict"
