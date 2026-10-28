@@ -239,7 +239,7 @@ class ExifFail(Exception):
 @pytest.mark.parametrize("kw,expected", [
     ({"stderr": "Error: File is empty - x.jpg\n"}, "Error: File is empty - x.jpg"),
     ({"stdout": "Error: File is empty - x.jpg"}, "Error: File is empty - x.jpg"),
-    ({"stdout": '[{"SourceFile": "x.jpg", "Error": "File is empty"}]'}, "File is empty"),
+    ({"stdout": '[{"SourceFile": "x.jpg", "ExifTool:Error": "File is empty", "File:FileSize": 0}]'}, "File is empty"),
     ({}, "execute returned a non-zero exit status: 1"),
 ])
 def test_exiftool_message(kw, expected):

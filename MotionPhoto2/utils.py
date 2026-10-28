@@ -120,8 +120,9 @@ def exiftool_message(e) -> str:
             v = v.decode("utf-8", "replace")
         v = str(v or "").strip()
         if attr == "stdout" and v.startswith(("[", "{")):
-            try:                              # -json output: the message is in "Error"/"Warning"
-                v = " ".join(str(d.get(k)) for d in json.loads(v) if isinstance(d, dict) for k in ("Error", "Warning") if d.get(k))
+            try:                              # -json output: the message is in "ExifTool:Error"
+                v = " ".join(str(val) for d in json.loads(v) if isinstance(d, dict)
+                             for key, val in d.items() if key.rsplit(":", 1)[-1] == "Error" and val)
             except ValueError:
                 pass
         if v:
