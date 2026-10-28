@@ -196,6 +196,7 @@ class RunState:
             "kind": r.get("kind") if r.get("kind") in ROW_KINDS else "",
             "video": str(r.get("video", ""))[:1024],
             "photo": str(r.get("photo", ""))[:1024],
+            "bytes": r["bytes"] if isinstance(r.get("bytes"), int) and r["bytes"] > 0 else 0,
         })
         self.result_total += 1
 
@@ -668,6 +669,8 @@ def classify_row(r: dict) -> str:
 def _norm_row(r: dict) -> dict:
     out = {k: str(r.get(k, "")) for k in ("file", "status", "reason", "output", "video", "photo")}
     out["kind"] = classify_row(r)
+    b = r.get("bytes")
+    out["bytes"] = b if isinstance(b, int) and not isinstance(b, bool) and b > 0 else 0
     return out
 
 
@@ -775,8 +778,11 @@ def preview_status() -> dict:
     done = last_preview.get("done", set())
     with _preview_lock:
         rows = [{**r, "kind": classify_row(r), "done": r["file"] in done} for r in last_preview.get("rows", [])]
+    root_dir = Path(load_config().get("input_directory") or "")
     for r in rows:
         r["state"] = "converted" if r["done"] else r["kind"]
+        if r["kind"] in ("motion_leftover", "duplicate_video") and r.get("video"):
+            r["bytes"] = video_removal.file_size(root_dir / r["video"])
     counts: dict = {}
     for r in rows:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
@@ -789,6 +795,46 @@ def preview_status() -> dict:
             "cleanup": {"mode": video_removal.normalize_mode(cfg.get("video_removal_mode")),
                         "destination": video_removal.describe_destination(
                             cfg.get("video_removal_mode"), root, cfg.get("video_removal_folder"))}}
+
+
+def bin_applies(cfg: dict, action: str) -> bool:
+    """Does this action send things to the Recycle Bin? (convert: only with overwrite / delete video)"""
+    if video_removal.normalize_mode(cfg.get("video_removal_mode")) != "trash":
+        return False
+    return bool(cfg.get("delete_video") or cfg.get("overwrite")) if action == "convert" else True
+
+
+def bin_load(files: list, rows: list, cfg: dict, action: str) -> tuple:
+    """(bytes, items) these files would send to the bin, from the Preview rows."""
+    rowmap = {r["file"]: r for r in rows}
+    root = Path(cfg.get("input_directory") or "")
+    total, items = 0, 0
+    for f in dict.fromkeys(files):
+        r = rowmap.get(f)
+        if not r:
+            continue
+        if action == "convert":
+            if classify_row(r) == "ready" and r.get("bytes"):
+                total += r["bytes"]
+                items += int(bool(cfg.get("overwrite"))) + int(bool(cfg.get("delete_video")))
+        elif r.get("video"):
+            total += video_removal.file_size(root / r["video"])
+            items += 1
+    return total, items
+
+
+def bin_check(files: list, rows: list, cfg: dict, action: str) -> dict:
+    """The guard's verdict for this action: {"applies": False} unless the bin would be used."""
+    if not bin_applies(cfg, action):
+        return {"applies": False, "ok": True}
+    total, items = bin_load(files, rows, cfg, action)
+    if not items:
+        return {"applies": True, "ok": True, "estimate": 0, "files": 0, "cap": 0, "usage": None, "reason": ""}
+    return {"applies": True, **video_removal.bin_report(total, items, cfg.get("input_directory") or ".")}
+
+
+def bin_refusal(rep: dict) -> JSONResponse:
+    return JSONResponse({"error": rep["reason"], "bin_guard": True, "bin": rep}, status_code=409)
 
 
 def validate_selected(preview_id, files, cfg: dict, preview: dict, skipped: Optional[list] = None) -> list:
@@ -1149,6 +1195,9 @@ async def api_run_selected(request: Request):
                             status_code=409 if "Preview" in msg or "changed" in msg else 400)
     mark_preview_missing(body["preview_id"], [s["file"] for s in skipped if s["reason"] == "file no longer exists"])
     if files:
+        rep = bin_check(files, last_preview.get("rows", []), cfg, "convert")
+        if not rep["ok"]:
+            return bin_refusal(rep)
         threading.Thread(target=do_run, args=("manual", False, None, files, body["preview_id"], skipped),
                          daemon=True).start()
     return {"ok": True, "count": len(files), "skipped": skipped}
@@ -1188,7 +1237,26 @@ async def api_cleanup_movs(request: Request):
         msg = str(e)
         stale = "Preview" in msg or "changed" in msg
         return JSONResponse({"error": msg, "stale": stale}, status_code=409 if stale else 400)
+    rep = bin_check(files, pv.get("rows", []), cfg, "cleanup")
+    if not rep["ok"]:
+        return bin_refusal(rep)
     return cleanup_movs(files, rowmap, cfg, root)
+
+
+@app.post("/api/bin-check")
+async def api_bin_check(request: Request):
+    """Would these ticked Preview rows fit the Recycle Bin? Body: {"files": [...], "action": "convert"|"cleanup"}."""
+    try:
+        body = await request.json()
+        files, action = body.get("files"), body.get("action")
+        if action not in ("convert", "cleanup") or not isinstance(files, list) \
+                or not all(isinstance(f, str) for f in files):
+            raise ValueError("bad request")
+    except (ValueError, AttributeError):
+        return JSONResponse({"error": "Body must be {files: [...], action: convert|cleanup}"}, status_code=400)
+    if not last_preview:
+        load_preview()
+    return bin_check(files, last_preview.get("rows", []) if last_preview else [], load_config(), action)
 
 
 def _after_cleanup(row: dict, kind: str):

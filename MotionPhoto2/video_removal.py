@@ -501,3 +501,139 @@ def describe_destination(mode, root=None, folder=None) -> str:
     if mode == "move":
         return f"folder {removal_folder(root, folder) if root else (folder or DEFAULT_FOLDER_NAME)}"
     return "permanently deleted"
+
+
+# ─── Recycle Bin guard ───────────────────────────────────────────────────────
+# The Windows Recycle Bin has a per-drive size cap; an item that does not fit is
+# deleted for good, and older bin items can be purged to make room. So a run
+# that would send a lot to the bin refuses "trash" up front (never a silent delete).
+
+BIN_REFUSAL = "This run is too big for the Recycle Bin. Use 'Move to folder' instead."
+BIN_MAX_FILES = 500            # more items than this never go to the bin (override: L2M_BIN_MAX_FILES)
+BIN_MAX_FRACTION = 0.5         # estimate + current usage may use at most this share of the cap
+BIN_DEFAULT_FRACTION = 0.05    # cap assumed when the real one can't be read: 5% of the drive
+
+
+class BinTooBig(Exception):
+    """Raised when mode "trash" is refused for a run (message is user-facing)."""
+
+
+def _drive_root(path) -> str:
+    p = Path(path).resolve()
+    return p.drive + "\\" if p.drive else str(p.anchor or "/")
+
+
+def _volume_guid(drive_root: str) -> Optional[str]:
+    import ctypes
+    buf = ctypes.create_unicode_buffer(64)
+    if not ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(drive_root, buf, 64):
+        return None
+    s = buf.value                       # \\?\Volume{GUID}\
+    a, b = s.find("{"), s.find("}")
+    return s[a:b + 1].upper() if a >= 0 < b else None
+
+
+def read_bin_settings(path) -> dict:
+    """{"cap": bytes or None, "nuke": bool, "source": str} for the drive of `path`.
+    Windows: HKCU\\...\\Explorer\\BitBucket\\Volume\\{GUID} (MaxCapacity in MB, NukeOnDelete).
+    Anything else, or an unreadable key: cap None (the caller applies the default)."""
+    if os.name != "nt":
+        return {"cap": None, "nuke": False, "source": "default"}
+    try:
+        import winreg
+        guid = _volume_guid(_drive_root(path))
+        if not guid:
+            raise OSError("no volume GUID")
+        base = r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"
+        out = {"cap": None, "nuke": False, "source": "default"}
+        for sub in (base + "\\Volume\\" + guid, base):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub) as k:
+                    for name in ("MaxCapacity", "NukeOnDelete"):
+                        try:
+                            val = winreg.QueryValueEx(k, name)[0]
+                        except OSError:
+                            continue
+                        if name == "MaxCapacity" and out["cap"] is None and val:
+                            out["cap"], out["source"] = int(val) * 1024 * 1024, "registry"
+                        elif name == "NukeOnDelete" and val:
+                            out["nuke"] = True
+            except OSError:
+                continue
+        return out
+    except Exception:
+        return {"cap": None, "nuke": False, "source": "default"}
+
+
+def read_bin_usage(path) -> Optional[int]:
+    """Bytes now in the bin of this drive (this user's items), or None if unknown."""
+    if os.name != "nt":
+        return None
+    total, seen = 0, False
+    try:
+        for sid in os.scandir(_drive_root(path) + "$Recycle.Bin"):
+            try:
+                for dirpath, _dirs, files in os.walk(sid.path):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(dirpath, f))
+                        except OSError:
+                            pass
+                    seen = True
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return total if seen else None
+
+
+def drive_size(path) -> int:
+    return shutil.disk_usage(_drive_root(path)).total
+
+
+def bin_report(total_bytes: int, file_count: int, path) -> dict:
+    """Judge a run that would send `total_bytes` in `file_count` items to the bin.
+    Returns a dict with ok, reason (user-facing, empty if ok), estimate, cap, usage,
+    nuke, cap_source. L2M_BIN_CAP_MB / L2M_BIN_MAX_FILES override cap and file limit."""
+    s = read_bin_settings(path)
+    cap, source = s["cap"], s["source"]
+    env_cap = os.environ.get("L2M_BIN_CAP_MB")
+    if env_cap and env_cap.isdigit():
+        cap, source = int(env_cap) * 1024 * 1024, "override"
+    if cap is None:
+        try:
+            cap = int(drive_size(path) * BIN_DEFAULT_FRACTION)
+        except OSError:
+            cap = 0
+        source = "default"
+    usage = read_bin_usage(path)
+    max_files = BIN_MAX_FILES
+    if (env_files := os.environ.get("L2M_BIN_MAX_FILES")) and env_files.isdigit():
+        max_files = int(env_files)
+    reasons = []
+    if s["nuke"]:
+        reasons.append("the Recycle Bin is set to delete files immediately")
+    if file_count > max_files:
+        reasons.append(f"{file_count} items is more than {max_files}")
+    if cap and total_bytes + (usage or 0) > cap * BIN_MAX_FRACTION:
+        reasons.append("it would fill more than half of the Recycle Bin")
+    elif not cap:
+        reasons.append("the Recycle Bin size is unknown")
+    return {"ok": not reasons, "estimate": total_bytes, "files": file_count, "cap": cap, "usage": usage,
+            "nuke": s["nuke"], "cap_source": source,
+            "reason": (BIN_REFUSAL + " (" + "; ".join(reasons) + ")") if reasons else ""}
+
+
+def check_bin(total_bytes: int, file_count: int, path) -> dict:
+    """bin_report, raising BinTooBig when the run must not use the bin."""
+    rep = bin_report(total_bytes, file_count, path)
+    if not rep["ok"]:
+        raise BinTooBig(rep["reason"])
+    return rep
+
+
+def file_size(path) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0

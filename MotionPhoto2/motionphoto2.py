@@ -48,7 +48,7 @@ except ImportError:
 
 from Muxer import Muxer, MuxerInputError, OutputConflictError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import normalize_mode, skip_folders, describe_destination
+from video_removal import normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
 from utils import exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
@@ -71,7 +71,8 @@ class Unbuffered(object):
    def __getattr__(self, attr):
        return getattr(self.stream, attr)
 
-def emit_result(name, status: str, reason: str = "", output: str = "", kind: str = "", video: str = "", photo: str = ""):
+def emit_result(name, status: str, reason: str = "", output: str = "", kind: str = "", video: str = "", photo: str = "",
+                bin_bytes: int = 0):
     """One machine-readable line per file for the web UI's results table.
     kind (optional) is the finer classification the Preview filters on: ready,
     motion_leftover, motion_only, no_mov, no_photo, skipped, error. video is the
@@ -83,6 +84,8 @@ def emit_result(name, status: str, reason: str = "", output: str = "", kind: str
         d["video"] = str(video)
     if photo:
         d["photo"] = str(photo)
+    if bin_bytes:
+        d["bytes"] = int(bin_bytes)
     print("@@RESULT " + json.dumps(d), flush=True)
 
 
@@ -145,8 +148,42 @@ def planned_output(args, image: str, output_directory, output_file=None) -> str:
     return output_file or enrich_fname(str(image), "LIVE")
 
 
+def estimate_bin_load(args, only_images=None) -> tuple:
+    """(bytes, items) a real run would send to the bin, judged by file names: originals
+    replaced (--overwrite) plus videos removed (--delete-video) for every photo/video
+    pair with the same name. A cheap over-estimate (no metadata matching)."""
+    if args.input_directory is None:
+        n = int(bool(args.overwrite)) + int(bool(args.delete_video))
+        return (file_size(args.input_image) * bool(args.overwrite) + file_size(args.input_video) * bool(args.delete_video)), n
+    root = Path(args.input_directory).resolve()
+    walk = os.walk(root) if args.recursive else [(str(root), [], [f for f in os.listdir(root) if (root / f).is_file()])]
+    skip = {str(f) for f in skip_folders(str(root), args.video_removal_folder)}
+    vids, imgs = {}, []
+    for dirpath, dirs, names in walk:
+        dirs[:] = [d for d in dirs if d != EXTRACT_DIRNAME and str((Path(dirpath) / d).resolve()) not in skip]
+        for n in names:
+            full = Path(dirpath) / n
+            ext = full.suffix.lower()
+            if ext in (".mp4", ".mov"):
+                vids[str(full.with_suffix("")).lower()] = full
+            elif ext in (".heic", ".heif", ".avif", ".jpg", ".jpeg"):
+                imgs.append(full)
+    total, items, counted = 0, 0, set()
+    for img in imgs:
+        if only_images is not None and str(img.relative_to(root)) not in only_images:
+            continue
+        v = vids.get(str(img.with_suffix("")).lower())
+        if v is None:
+            continue
+        if args.overwrite:
+            total += file_size(img); items += 1
+        if args.delete_video and v not in counted:
+            counted.add(v); total += file_size(v); items += 1
+    return total, items
+
+
 def report_dry_run(args, name, image: str, video: str, output_directory, removal_kwargs, output_file=None,
-                   ext=None, claimed=None):
+                   ext=None, claimed=None, video_removed=True):
     """--dry-run: say what a real run would do for this pair, touch nothing.
     ext is the image's real extension (File:FileTypeExtension): the real run writes
     IMG.jpeg as IMG.jpg, so the preview must check that name. A path another file
@@ -167,7 +204,9 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
         notes.append(f"original photo replaced, old copy -> {dest}")
     if args.delete_video:
         notes.append(f"video removed -> {dest}")
-    emit_result(name, "planned", "dry run" + ("; " + "; ".join(notes) if notes else ""), out, kind="ready")
+    bin_bytes = (file_size(image) if args.overwrite else 0) + (file_size(video) if args.delete_video and video_removed else 0)
+    emit_result(name, "planned", "dry run" + ("; " + "; ".join(notes) if notes else ""), out, kind="ready",
+                bin_bytes=bin_bytes)
     if args.overwrite:
         print(f"[DRY-RUN] Would replace original photo {image}; old copy goes to {dest}")
     if args.delete_video:
@@ -531,6 +570,17 @@ def main():
         with open(args.only_file, encoding="utf-8") as fh:
             only_images = {str(Path(x)) for x in json.load(fh)}
 
+    if not args.dry_run and removal_kwargs['video_removal_mode'] == "trash" and (args.delete_video or args.overwrite):
+        try:
+            est_bytes, est_items = estimate_bin_load(args, only_images)
+            if est_items:
+                rep = check_bin(est_bytes, est_items, args.input_directory or args.input_image)
+                print(f"Recycle Bin: ~{est_bytes / 1e9:.2f} GB in {est_items} item(s) of ~{rep['cap'] / 1e9:.1f} GB cap")
+        except BinTooBig as e:
+            print(f"[ERROR] {e}")
+            emit_result("(run)", "error", str(e), kind="error")
+            sys.exit(3)
+
     logger = logging.getLogger("ExifTool")
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     
@@ -690,7 +740,8 @@ def main():
                                     except Exception:
                                         real_ext = None
                                     report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory,
-                                                   removal_kwargs, ext=real_ext, claimed=claimed_outputs)
+                                                   removal_kwargs, ext=real_ext, claimed=claimed_outputs,
+                                                   video_removed=last_photo_for_video)
                                 else:
                                     muxer = Muxer(
                                         image_fpath=str(input_image),
@@ -849,7 +900,8 @@ def main():
                         try:
                             if args.dry_run:
                                 report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs,
-                                               ext=img_meta.get('File:FileTypeExtension'), claimed=claimed_outputs)
+                                               ext=img_meta.get('File:FileTypeExtension'), claimed=claimed_outputs,
+                                               video_removed=last_photo_for_video)
                             else:
                                 muxer = Muxer(
                                     image_fpath=str(input_image),
