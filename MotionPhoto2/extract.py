@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from video_removal import find_embedded_video
+from video_removal import skip_dir_name, find_embedded_video, has_line_break, LINE_BREAK_REASON
 
 EXTRACT_DIRNAME = "_extracted"   # default output folder; the converter and watcher never scan it
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".avif"}
@@ -257,6 +257,8 @@ def strip_motion_xmp(et, still_tmp: str) -> str:
 
 def plan_extract(photo: str, et=None) -> tuple:
     """(data, Located) or raises ExtractError. No file is written."""
+    if has_line_break(photo):
+        raise ExtractError(LINE_BREAK_REASON)
     try:
         data = Path(photo).read_bytes()
     except OSError as e:
@@ -272,6 +274,8 @@ def extract_one(photo: str, out_dir: str, make_mov: bool = False, strip_still: b
     """Extract one photo. Returns {"outputs": [paths], "notes": [str]}; raises
     ExtractError if there is nothing to extract. In dry_run nothing is written
     (the outputs are the names that would be used)."""
+    if has_line_break(photo):
+        raise ExtractError(LINE_BREAK_REASON)     # never reaches exiftool
     if loc is None:
         data, loc = plan_extract(photo, et)
     video = data[loc.start:loc.end]
@@ -335,7 +339,8 @@ def _collect_images(root: Path, recursive: bool) -> list:
     out = []
     if recursive:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != EXTRACT_DIRNAME]
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != EXTRACT_DIRNAME
+                           and not skip_dir_name(d)]
             out += [str((Path(dirpath) / f).relative_to(root)) for f in filenames]
     else:
         out = [f for f in os.listdir(root) if (root / f).is_file()]

@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 
 from pathlib import Path
 
@@ -48,7 +49,7 @@ except ImportError:
 
 from Muxer import Muxer, MuxerInputError, OutputConflictError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
+from video_removal import skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
 from utils import exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
@@ -97,6 +98,21 @@ def get_metadata_safe(et, paths):
     paths = list(paths)
     if not paths:
         return [], {}
+    if any(has_line_break(p) for p in paths):     # pyexiftool would read them as extra arguments
+        metas, errors = [], {}
+        good = [p for p in paths if not has_line_break(p)]
+        good_metas, good_errors = get_metadata_safe(et, good)
+        it, gi = iter(good_metas), 0
+        for i, p in enumerate(paths):
+            if has_line_break(p):
+                errors[i] = LINE_BREAK_REASON
+                metas.append({})
+            else:
+                if gi in good_errors:
+                    errors[i] = good_errors[gi]
+                metas.append(next(it))
+                gi += 1
+        return metas, errors
     try:
         metas = et.get_metadata(paths)
         if len(metas) == len(paths):
@@ -148,38 +164,65 @@ def planned_output(args, image: str, output_directory, output_file=None) -> str:
     return output_file or enrich_fname(str(image), "LIVE")
 
 
-def estimate_bin_load(args, only_images=None) -> tuple:
-    """(bytes, items) a real run would send to the bin, judged by file names: originals
-    replaced (--overwrite) plus videos removed (--delete-video) for every photo/video
-    pair with the same name. A cheap over-estimate (no metadata matching)."""
+def estimate_bin_load(args, pairs=None, root=None) -> tuple:
+    """(bytes, items) a real run would send to the bin. In directory mode `pairs` is the
+    run's actual plan, {photo (relative path): video (relative path)} for the photos that
+    will be converted (name matching and EXIF matching alike): originals replaced
+    (--overwrite) plus videos removed (--delete-video), each video counted once. A cheap
+    over-estimate (a conflict or skip later only makes the run smaller)."""
     if args.input_directory is None:
         n = int(bool(args.overwrite)) + int(bool(args.delete_video))
         return (file_size(args.input_image) * bool(args.overwrite) + file_size(args.input_video) * bool(args.delete_video)), n
-    root = Path(args.input_directory).resolve()
-    walk = os.walk(root) if args.recursive else [(str(root), [], [f for f in os.listdir(root) if (root / f).is_file()])]
-    skip = {str(f) for f in skip_folders(str(root), args.video_removal_folder)}
-    vids, imgs = {}, []
-    for dirpath, dirs, names in walk:
-        dirs[:] = [d for d in dirs if d != EXTRACT_DIRNAME and str((Path(dirpath) / d).resolve()) not in skip]
-        for n in names:
-            full = Path(dirpath) / n
-            ext = full.suffix.lower()
-            if ext in (".mp4", ".mov"):
-                vids[str(full.with_suffix("")).lower()] = full
-            elif ext in (".heic", ".heif", ".avif", ".jpg", ".jpeg"):
-                imgs.append(full)
+    root = Path(root or args.input_directory).resolve()
     total, items, counted = 0, 0, set()
-    for img in imgs:
-        if only_images is not None and str(img.relative_to(root)) not in only_images:
-            continue
-        v = vids.get(str(img.with_suffix("")).lower())
-        if v is None:
-            continue
+    for img, v in (pairs or {}).items():
         if args.overwrite:
-            total += file_size(img); items += 1
+            total += file_size(root / img); items += 1
         if args.delete_video and v not in counted:
-            counted.add(v); total += file_size(v); items += 1
+            counted.add(v); total += file_size(root / v); items += 1
     return total, items
+
+
+def guard_bin(args, removal_kwargs, est_bytes: int, est_items: int, path) -> None:
+    """Exit with code 3 if a real run would send too much to the Recycle Bin (never a silent delete)."""
+    if args.dry_run or removal_kwargs['video_removal_mode'] != "trash" or not (args.delete_video or args.overwrite):
+        return
+    try:
+        if est_items:
+            rep = check_bin(est_bytes, est_items, path)
+            print(f"Recycle Bin: ~{est_bytes / 1e9:.2f} GB in {est_items} item(s) of ~{rep['cap'] / 1e9:.1f} GB cap")
+    except BinTooBig as e:
+        print(f"[ERROR] {e}")
+        emit_result("(run)", "error", str(e), kind="error")
+        sys.exit(3)
+
+
+def copy_unmuxed_file(source, dest, verbose: bool = False):
+    """Copy `source` to `dest` without ever replacing a file. An identical file already
+    there (a previous run) is skipped; a different one is kept and the copy gets a
+    unique name (`name (2).ext`). Returns the final path, or None if skipped."""
+    dest = Path(dest)
+    n = 1
+    while os.path.lexists(numbered_name(dest, n)):        # also finds the copy an earlier run made
+        if filecmp.cmp(source, numbered_name(dest, n), shallow=False):
+            if verbose:
+                print(f"[DEBUG][WARNING] File {source} already exists in output directory, skipping...")
+            return None
+        n += 1
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".mp2tmp.", suffix=".part")
+    os.close(fd)
+    try:
+        shutil.copy2(source, tmp)
+        final = publish_no_overwrite(tmp, dest)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    if final != dest:
+        print(f"[WARNING] {dest.name} already exists with different content, copied as {final.name}")
+    return final
 
 
 def report_dry_run(args, name, image: str, video: str, output_directory, removal_kwargs, output_file=None,
@@ -190,7 +233,8 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
     already owns (or another photo of this run writes) is reported as a conflict."""
     base = planned_output(args, image, output_directory, output_file)
     out = output_with_extension(base, ext)
-    why = output_conflict(out, image, video, claimed, rerun_ok=not args.overwrite and out == base)
+    why = output_conflict(out, image, video, claimed, rerun_ok=not args.overwrite and out == base,
+                           overwrite=bool(args.overwrite))
     if why:
         print(f"[DRY-RUN] Would skip {name}: {why}")
         emit_result(name, "skipped", why[0].upper() + why[1:], out, kind="conflict")
@@ -486,6 +530,11 @@ def main():
     if sys.stderr.encoding != 'UTF-8':
         sys.stderr = Unbuffered(codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict'))    
 
+    # An empty path would resolve to the current folder: never treat it as a folder
+    if args.input_directory is not None and not str(args.input_directory).strip():
+        print("[ERROR] Input directory is empty: choose a folder")
+        sys.exit(1)
+
     if args.extract:
         sys.exit(run_extract_mode(args))
 
@@ -526,14 +575,22 @@ def main():
 
     if args.output_directory is not None:
         output_directory = f"{Path(args.output_directory).resolve()}"
-        if os.path.exists(output_directory) is False:
-            os.mkdir(output_directory)
-        elif os.path.isfile(output_directory):
+        if os.path.isfile(output_directory):
             print("[ERROR] Output directory cannot be a file")
             sys.exit(1)
-        elif args.copy_unmuxed:
-            input_directory = f"{Path(args.input_directory).resolve()}"
-            if os.path.samefile(input_directory, output_directory): # Input directory and output directory cannot be same if copying unmuxed files
+        if os.path.exists(output_directory) is False:
+            # Only the last folder is created: never the whole chain, which would
+            # silently build a path under a missing mount point (drive not mounted).
+            if not os.path.isdir(os.path.dirname(output_directory)):
+                print(f"[ERROR] Output directory's parent folder does not exist: {os.path.dirname(output_directory)}")
+                sys.exit(1)
+            if not args.dry_run:
+                os.mkdir(output_directory)
+        else:
+            source_directory = f"{Path(args.input_directory).resolve()}" if args.input_directory is not None \
+                else f"{Path(args.input_image).resolve().parent}"
+            if os.path.samefile(source_directory, output_directory):
+                # Every output would land on its own source photo
                 print("[ERROR] Output directory cannot be the same as input directory")
                 sys.exit(1)
 
@@ -571,15 +628,15 @@ def main():
             only_images = {str(Path(x)) for x in json.load(fh)}
 
     if not args.dry_run and removal_kwargs['video_removal_mode'] == "trash" and (args.delete_video or args.overwrite):
-        try:
-            est_bytes, est_items = estimate_bin_load(args, only_images)
-            if est_items:
-                rep = check_bin(est_bytes, est_items, args.input_directory or args.input_image)
-                print(f"Recycle Bin: ~{est_bytes / 1e9:.2f} GB in {est_items} item(s) of ~{rep['cap'] / 1e9:.1f} GB cap")
-        except BinTooBig as e:
-            print(f"[ERROR] {e}")
-            emit_result("(run)", "error", str(e), kind="error")
+        why = trash_unavailable_reason(args.input_directory or args.input_image)
+        if why:
+            msg = f"Cannot use the Recycle Bin: {why}. {TRASH_HINT}"
+            print(f"[ERROR] {msg}")
+            emit_result("(run)", "error", msg, kind="error")
             sys.exit(3)
+        if args.input_directory is None:       # directory runs are judged once the pairs are known
+            est_bytes, est_items = estimate_bin_load(args)
+            guard_bin(args, removal_kwargs, est_bytes, est_items, args.input_image)
 
     logger = logging.getLogger("ExifTool")
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
@@ -599,7 +656,7 @@ def main():
                 # Recursive mode: walk through all subdirectories
                 for root, dirnames, filenames in os.walk(input_directory):
                     # never rescan videos that were moved aside by --delete-video
-                    dirnames[:] = [d for d in dirnames if d != EXTRACT_DIRNAME
+                    dirnames[:] = [d for d in dirnames if d != EXTRACT_DIRNAME and not skip_dir_name(d)
                                    and str((Path(root) / d).resolve()) not in skip_folders_]
                     for filename in filenames:
                         full_path = Path(root) / filename
@@ -611,6 +668,14 @@ def main():
                     if os.path.isfile(input_directory / filename):
                         files.append(filename)
             
+            # A line break in a name would be read by exiftool as extra arguments: such
+            # files are never handed to it. They are reported and left alone.
+            line_break_files = [f for f in files if has_line_break(f)]
+            files = [f for f in files if not has_line_break(f)]
+            for f in line_break_files:
+                print(f"[WARNING] Skipping {f!r}: {LINE_BREAK_REASON}")
+                emit_result(f, "error", LINE_BREAK_REASON, kind="error")
+
             # Filter videos and images while preserving relative paths
             videos = [
                 f for f in files
@@ -622,14 +687,18 @@ def main():
                 if Path(f).suffix.lower() in [".heic", ".heif", ".avif", ".jpg", ".jpeg"]
             ]
             
-            if only_images is not None:
-                images = [f for f in images if str(Path(f)) in only_images]
+            # `images` stays every photo of the folder: a video shared by several photos
+            # (HEIC + JPEG exports of one Live Photo) is only removed after the last photo
+            # that uses it, whether or not that photo was selected. `selected` is what is converted.
+            selected = {f for f in images if only_images is None or str(Path(f)) in only_images}
 
             unsupported = [
                 f for f in files
                 if Path(f).suffix.lower() not in [".mp4", ".mov", ".heic", ".heif", ".avif", ".jpg", ".jpeg"]
             ]
 
+            if args.copy_unmuxed:
+                unsupported += line_break_files      # copying never uses exiftool
             unmatched_images = []
             failed_pairs = []
             all_videos = list(videos)
@@ -673,9 +742,15 @@ def main():
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1
                 assigned_videos = set(assigned.values())
+                if args.input_directory is not None:
+                    est_bytes, est_items = estimate_bin_load(args, {k: v for k, v in assigned.items() if k in selected},
+                                                             input_directory)
+                    guard_bin(args, removal_kwargs, est_bytes, est_items, input_directory)
 
                 i = 0
                 for image in images:
+                    if image not in selected:
+                        continue        # only counted above (photos_left), not converted
                     i += 1
                     image_path = Path(image)
                     fname = str(image_path.with_suffix(''))
@@ -707,7 +782,7 @@ def main():
                     for video_fname in ([assigned[image]] if image in assigned else []):
                         if True:
                             report_duplicates(image, name_cands[image], assigned_videos)
-                            print(f"=========================[{i}/{len(images)}]")
+                            print(f"=========================[{i}/{len(selected)}]")
                             video = video_fname
                             if video in videos:
                                 videos.remove(video)     # matched: not an "unmuxed" video to copy
@@ -812,10 +887,15 @@ def main():
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1
                 assigned_videos = set(assigned.values())
+                est_bytes, est_items = estimate_bin_load(args, {k: v for k, v in assigned.items() if k in selected},
+                                                         input_directory)
+                guard_bin(args, removal_kwargs, est_bytes, est_items, input_directory)
 
                 # Match images to videos
                 i = 0
                 for img_idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
+                    if img not in selected:
+                        continue        # only counted above (photos_left), not converted
                     i += 1
                     if img_idx in image_errors:
                         print(f"[WARNING] Cannot read {img}: {image_errors[img_idx]}")
@@ -851,7 +931,7 @@ def main():
                     if args.verbose and content_id:
                         print(f"[DEBUG] Image {img} has ContentIdentifier: {content_id}")
                     if content_id and content_id.strip() in content_id_to_video:
-                        print(f"=========================[{i}/{len(images)}]")
+                        print(f"=========================[{i}/{len(selected)}]")
                         video = assigned[img]
                         claimed_videos.add(video)
                         report_duplicates(img, exif_cands_by_img[img], assigned_videos)
@@ -954,11 +1034,7 @@ def main():
                         print(f"[DRY-RUN] Would copy {file} to {output_subdirectory}")
                         continue
                     print(f"Copying {file} to {output_subdirectory}")
-                    if os.path.exists(output_subdirectory / file_path.name) and filecmp.cmp(input_directory / file, output_subdirectory / file_path.name):
-                        if args.verbose:
-                            print(f"[DEBUG][WARNING] File {file} already exists in output directory, skipping..." )
-                        continue
-                    shutil.copy2(input_directory / file, output_subdirectory)
+                    copy_unmuxed_file(input_directory / file, output_subdirectory / file_path.name, args.verbose)
             print("=" * 25)
 
             if not args.dry_run:
