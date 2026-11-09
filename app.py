@@ -32,14 +32,33 @@ from watchdog.observers import Observer
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR / "MotionPhoto2"))
 import video_removal  # noqa: E402  (shared with the muxer so all video removal goes through one helper)
-CONFIG_FILE = BASE_DIR / "config.json"
+# Where config.json, preview.json and .port live. Defaults to the app folder; the
+# desktop (Microsoft Store) build points it at %LOCALAPPDATA%\Live2Motion because its
+# install folder is read-only.
+DATA_DIR = Path(os.environ["LIVE2MOTION_DATA_DIR"]) if os.environ.get("LIVE2MOTION_DATA_DIR") else BASE_DIR
+CONFIG_FILE = DATA_DIR / "config.json"
 
-# MOTIONPHOTO2_BIN can override with a path to a compiled binary; otherwise
-# always run the vendored source directly (MotionPhoto2/) so bugfixes there
-# take effect without ever needing to build a binary, locally or on the server.
-BIN = [os.environ["MOTIONPHOTO2_BIN"]] if os.environ.get("MOTIONPHOTO2_BIN") else [
-    sys.executable, str(BASE_DIR / "MotionPhoto2" / "motionphoto2.py")
-]
+
+def motionphoto2_cmd() -> list:
+    """How to start the converter. MOTIONPHOTO2_BIN can override with a path to a compiled
+    binary. A frozen desktop build has no separate Python, so it re-runs its own exe with
+    --motionphoto2 (handled by desktop/live2motion_desktop.py). Otherwise always run the
+    vendored source directly (MotionPhoto2/) so bugfixes there take effect without ever
+    needing to build a binary, locally or on the server."""
+    if os.environ.get("MOTIONPHOTO2_BIN"):
+        return [os.environ["MOTIONPHOTO2_BIN"]]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--motionphoto2"]
+    return [sys.executable, str(BASE_DIR / "MotionPhoto2" / "motionphoto2.py")]
+
+
+BIN = motionphoto2_cmd()
+
+
+def bin_entry_point() -> str:
+    """The file that must exist for BIN to work: the script, or the exe itself when the
+    last element is a flag (frozen build: [exe, "--motionphoto2"])."""
+    return next((a for a in reversed(BIN) if not a.startswith("--")), BIN[0])
 
 IN_DOCKER = video_removal.in_docker()
 
@@ -588,7 +607,24 @@ def browse_roots() -> list:
     return roots
 
 
+def excluded_dirs() -> list:
+    """Folders that are never browsable or usable as input/output, whatever the roots say:
+    LIVE2MOTION_EXCLUDED_DIRS (os.pathsep separated). The Microsoft Store build sets it to
+    the AppData folders, because new files a packaged app writes there are redirected into
+    the package's private storage and would be deleted when the app is uninstalled."""
+    out = []
+    for c in os.environ.get("LIVE2MOTION_EXCLUDED_DIRS", "").split(os.pathsep):
+        try:
+            if c.strip():
+                out.append(Path(c.strip()).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return out
+
+
 def is_browsable(p: Path, roots: list) -> bool:
+    if any(p == x or x in p.parents for x in excluded_dirs()):
+        return False
     return any(p == r or r in p.parents for r in roots)
 
 
@@ -1039,8 +1075,9 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
     run_state.emit("$ " + " ".join(cmd))
     for sk in skipped_files or []:
         run_state.emit(f"Skipped {sk['file']}: {sk['reason']}")
-    if not Path(BIN[-1]).exists():
-        run_state.emit(f"✗ MotionPhoto2 entry point not found: {BIN[-1]}")
+    entry = bin_entry_point()
+    if not Path(entry).exists():
+        run_state.emit(f"✗ MotionPhoto2 entry point not found: {entry}")
         run_state.finish(127)
         return
     try:
@@ -1699,7 +1736,7 @@ def api_browse(path: str = ""):
 
 
 DEFAULT_PORT = 7000
-PORT_FILE = BASE_DIR / ".port"
+PORT_FILE = DATA_DIR / ".port"
 
 
 def find_available_port(preferred: int, host: str = "127.0.0.1", attempts: int = 50) -> int:
