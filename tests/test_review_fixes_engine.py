@@ -640,7 +640,7 @@ def _exif_run(tmp_path, monkeypatch, capsys, files, ids, unreadable_name):
             calls.append((Path(self.img).name, self.delete))
     monkeypatch.setattr(mp, "Muxer", M)
     monkeypatch.setattr(mp, "check_motion_photo",
-                        lambda p, et: (False, "cannot read") if unreadable_name in str(p) else (False, ""))
+                        lambda p, et: (False, "cannot read") if unreadable_name in str(p).replace("\\", "/") else (False, ""))
     monkeypatch.setenv("HOME", str(tmp_path))
     try:
         _, out, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--recursive", "--exif-match",
