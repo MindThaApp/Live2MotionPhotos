@@ -9,7 +9,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -91,17 +90,10 @@ def emit_result(name, status: str, reason: str = "", output: str = "", kind: str
     print("@@RESULT " + json.dumps(d), flush=True)
 
 
-def stem_variants(path) -> set:
-    """Lower-case file name without extension (folder ignored) plus the name without a
-    trailing ` (n)` copy counter, and without a `_n` counter when a number is left
-    (IMG_1 (1) -> img_1 (1), img_1; IMG_1_2 -> img_1_2, img_1; IMG_1 stays img_1, never img)."""
-    s = Path(path).stem.lower()
-    out = {s}
-    for pat in (r" \(\d+\)$", r"_\d+$"):
-        t = re.sub(pat, "", s)
-        if t != s and (pat.startswith(" ") or re.search(r"\d", t)):
-            out.add(t)
-    return out
+def warn_removal_off(unreadable, args):
+    if unreadable and args.delete_video:
+        print(f"[WARNING] {len(unreadable)} photo(s) cannot be read ({', '.join(unreadable[:5])}"
+              f"{', ...' if len(unreadable) > 5 else ''}): videos are NOT removed in this run")
 
 
 def get_metadata_safe(et, paths):
@@ -729,6 +721,7 @@ def main():
             failed_pairs = []
             all_videos = list(videos)
             claimed_videos = set()     # videos that belong to some photo (so are not "MOV without a photo")
+            unreadable_photos = []     # any unreadable photo turns video removal off for the whole run
             blocked_videos = set()     # videos a photo was skipped for (output conflict): keep them
             stats = {"converted": 0, "videos_removed": 0, "duplicates_kept": 0}
             reported_dupes = set()
@@ -764,9 +757,8 @@ def main():
                 name_cands = {image: name_candidates(image) for image in images
                               if not mp_state[image][1] and not mp_state[image][0]}
                 assigned = assign_videos(list(name_cands.items()))
-                for image in images:               # a photo we cannot read may still need its video
-                    if mp_state[image][1]:
-                        blocked_videos.update(name_candidates(image))
+                unreadable_photos += [image for image in images if mp_state[image][1]]
+                warn_removal_off(unreadable_photos, args)
                 photos_left = {}
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1
@@ -845,14 +837,14 @@ def main():
                                         real_ext = None
                                     report_dry_run(args, image, str(input_image), str(input_video), output_subdirectory,
                                                    removal_kwargs, ext=real_ext, claimed=claimed_outputs,
-                                                   video_removed=last_photo_for_video)
+                                                   video_removed=last_photo_for_video and not unreadable_photos)
                                 else:
                                     muxer = Muxer(
                                         image_fpath=str(input_image),
                                         video_fpath=str(input_video),
                                         exiftool=et,
                                         output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                        delete_video=args.delete_video and last_photo_for_video and video not in blocked_videos,
+                                        delete_video=args.delete_video and not unreadable_photos and last_photo_for_video and video not in blocked_videos,
                                         **removal_kwargs,
                                         delete_temp=not args.keep_temp,
                                         overwrite=args.overwrite,
@@ -917,21 +909,9 @@ def main():
                         exif_cands.append((img, list(content_id_to_video[cid])))
                 exif_cands_by_img = dict(exif_cands)
                 assigned = assign_videos(exif_cands)
-                unreadable_stems = set()
-                for idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
-                    if idx in image_errors or mp_state[img][1]:     # unreadable: its video must stay
-                        cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
-                        blocked_videos.update(content_id_to_video.get(cid, []))
-                        unreadable_stems |= stem_variants(img)
-                if unreadable_stems:
-                    # Its Live Photo id is unknown, so its video may have been matched to a sibling
-                    # in another folder or under another name (IMG_1 (1).JPEG): keep every video
-                    # whose base name looks the same, in any folder.
-                    similar = [v for v in videos if stem_variants(v) & unreadable_stems]
-                    blocked_videos.update(similar)
-                    if similar:
-                        print(f"[WARNING] Unreadable photo(s) in this run: keeping video(s) with the same base name: "
-                              f"{', '.join(sorted(similar))}")
+                # An unreadable photo has no known Live Photo id: no video can be proven unneeded
+                unreadable_photos += [img for idx, img in enumerate(images) if idx in image_errors or mp_state[img][1]]
+                warn_removal_off(unreadable_photos, args)
                 photos_left = {}
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1
@@ -1030,14 +1010,14 @@ def main():
                             if args.dry_run:
                                 report_dry_run(args, img, str(input_image), str(input_video), output_subdirectory, removal_kwargs,
                                                ext=img_meta.get('File:FileTypeExtension'), claimed=claimed_outputs,
-                                               video_removed=last_photo_for_video)
+                                               video_removed=last_photo_for_video and not unreadable_photos)
                             else:
                                 muxer = Muxer(
                                     image_fpath=str(input_image),
                                     video_fpath=str(input_video),
                                     exiftool=et,
                                     output_directory=str(output_subdirectory) if output_subdirectory else None,
-                                    delete_video=args.delete_video and last_photo_for_video and video not in blocked_videos,
+                                    delete_video=args.delete_video and not unreadable_photos and last_photo_for_video and video not in blocked_videos,
                                     **removal_kwargs,
                                     delete_temp=not args.keep_temp,
                                     overwrite=args.overwrite,
@@ -1092,6 +1072,9 @@ def main():
             print("=" * 25)
 
             if not args.dry_run:
+                if unreadable_photos and (args.delete_video):
+                    print(f"[SUMMARY] Video removal was turned off: {len(unreadable_photos)} unreadable photo(s) in this run "
+                          f"({', '.join(unreadable_photos[:5])}{', ...' if len(unreadable_photos) > 5 else ''})")
                 print(f"[SUMMARY] {stats['converted']} photo(s) converted, {stats['videos_removed']} video(s) removed, "
                       f"{stats['duplicates_kept']} duplicate video(s) kept")
             if failed_pairs:

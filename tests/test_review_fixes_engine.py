@@ -538,7 +538,7 @@ def test_cancel_during_dispose_never_deletes_the_merged_file(tmp_path, monkeypat
     assert len(merged) == 1                                       # merged photo kept (visible name or temp)
 
 
-def test_cancel_before_original_moved_removes_only_the_temp(tmp_path, monkeypatch):
+def test_cancel_before_original_moved_still_keeps_the_merged_file(tmp_path, monkeypatch):
     img, m = _protect_muxer(tmp_path)
 
     def cancelled_early(path, **k):
@@ -547,6 +547,7 @@ def test_cancel_before_original_moved_removes_only_the_temp(tmp_path, monkeypatc
     with pytest.raises(KeyboardInterrupt):
         m.mux()
     assert img.read_bytes() == JPEG and temps(tmp_path) == []
+    assert (tmp_path / "a (merged).jpg").exists()                 # duplicate is acceptable, a loss is not
 
 
 @pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
@@ -653,19 +654,13 @@ def _exif_run(tmp_path, monkeypatch, capsys, files, ids, unreadable_name):
 def test_exif_unreadable_photo_in_another_folder_blocks_the_video(tmp_path, monkeypatch, capsys):
     ids = {"IMG_1.JPEG": "ID", "IMG_1.MOV": "ID"}
     calls, out = _exif_run(tmp_path, monkeypatch, capsys, ["A/IMG_1.HEIC", "B/IMG_1.JPEG", "B/IMG_1.MOV"], ids, "A/IMG_1.HEIC")
-    assert calls == [("IMG_1.JPEG", False)] and "keeping video" in out
+    assert calls == [("IMG_1.JPEG", False)] and "NOT removed" in out
 
 
 def test_exif_unreadable_photo_blocks_copy_numbered_video(tmp_path, monkeypatch, capsys):
     ids = {"IMG_1 (1).JPEG": "ID", "IMG_1 (1).MOV": "ID"}
     calls, out = _exif_run(tmp_path, monkeypatch, capsys, ["IMG_1.HEIC", "IMG_1 (1).JPEG", "IMG_1 (1).MOV"], ids, "IMG_1.HEIC")
     assert calls == [("IMG_1 (1).JPEG", False)]
-
-
-def test_stem_variants():
-    v = mp.stem_variants
-    assert v("a/IMG_1 (1).JPEG") & v("b/img_1.MOV") and v("IMG_1_2.mov") & v("img_1.heic")
-    assert not v("IMG_2.MOV") & v("IMG_1.HEIC") and not v("IMG_3 (1).MOV") & v("IMG_1.HEIC")
 
 
 def test_still_in_place_check_uses_identity_not_size(tmp_path, monkeypatch, caplog):
@@ -695,3 +690,107 @@ def test_cancel_mid_dispose_rescues_merged_photo_to_visible_name(tmp_path, monke
     with pytest.raises(KeyboardInterrupt):
         m.mux()
     assert temps(tmp_path) == [] and (tmp_path / "a (merged).jpg").exists()
+
+
+# ── round 5 ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("mode", ["name", "exif", "selected"])
+def test_any_unreadable_photo_turns_video_removal_off_for_the_whole_run(tmp_path, monkeypatch, capsys, mode):
+    root = tmp_path / "in"
+    root.mkdir()
+    (root / "bad.HEIC").write_bytes(JPEG + b"\x00" * 50)          # unreadable, has no video of its own
+    (root / "ok.JPEG").write_bytes(JPEG + b"\x00" * 50)
+    (root / "ok.MOV").write_bytes(b"vid")
+    FakeET.ids = {"ok.JPEG": "ID", "ok.MOV": "ID"}
+    calls = []
+
+    class M:
+        def __init__(self, image_fpath, video_fpath, delete_video=False, **kw):
+            self.img, self.delete, self.output_fpath = image_fpath, delete_video, image_fpath
+
+        def mux(self):
+            calls.append((Path(self.img).name, self.delete))
+    monkeypatch.setattr(mp, "Muxer", M)
+    monkeypatch.setattr(mp, "check_motion_photo",
+                        lambda p, et: (False, "cannot read") if "bad" in str(p) else (False, ""))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    extra = ["--exif-match"] if mode == "exif" else []
+    if mode == "selected":
+        only = tmp_path / "only.json"
+        only.write_text(json.dumps(["ok.JPEG"]))
+        extra = ["--only-file", str(only)]
+    try:
+        _, out, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--delete-video",
+                            "--video-removal-mode", "move", *extra)
+    finally:
+        FakeET.ids = {}
+    assert calls == [("ok.JPEG", False)]
+    assert "videos are NOT removed in this run" in out and "bad.HEIC" in out
+    assert "Video removal was turned off" in out and (root / "ok.MOV").exists()
+
+
+def _linked_output(tmp_path):
+    img, m = _protect_muxer(tmp_path)
+    img.unlink()                                       # the original was set aside; a.jpg is free
+    tmp = tmp_path / ".mp2tmp.x.part"
+    tmp.write_bytes(b"MERGED")
+    os.link(tmp, m.output_fpath)                       # the output really is the same file as the temp
+    return m, tmp
+
+
+def test_keep_merged_recognises_a_published_output_when_ids_are_known(tmp_path):
+    m, tmp = _linked_output(tmp_path)
+    assert m._keep_merged(str(tmp)) == m.output_fpath
+    assert not list(tmp_path.glob("*(merged)*"))
+
+
+def test_keep_merged_never_trusts_zero_inode(tmp_path, monkeypatch):
+    m, tmp = _linked_output(tmp_path)
+    real = os.stat
+
+    def no_inodes(p, *a, **k):
+        r = real(p, *a, **k)
+        return type("S", (), {"st_ino": 0, "st_dev": r.st_dev})()
+    monkeypatch.setattr("Muxer.os.stat", no_inodes)
+    kept = m._keep_merged(str(tmp))
+    assert kept.endswith("(merged).jpg") and Path(kept).read_bytes() == b"MERGED"   # unknown ids: separate copy
+    assert Path(m.output_fpath).read_bytes() == b"MERGED"                           # nothing replaced or lost
+
+
+def test_keep_merged_never_trusts_unknown_device(tmp_path, monkeypatch):
+    m, tmp = _linked_output(tmp_path)
+    real = os.stat
+
+    def no_dev(p, *a, **k):
+        r = real(p, *a, **k)
+        return type("S", (), {"st_ino": r.st_ino, "st_dev": 0})()
+    monkeypatch.setattr("Muxer.os.stat", no_dev)
+    assert m._keep_merged(str(tmp)).endswith("(merged).jpg")
+
+
+@pytest.mark.parametrize("where", ["dispose_oserror", "dispose_interrupt", "publish_interrupt",
+                                   "publish_and_rescue_interrupt"])
+def test_merged_file_survives_every_failure_after_dispose_was_called(tmp_path, monkeypatch, where):
+    img, m = _protect_muxer(tmp_path)
+    real_dispose, real_pub = vr.dispose_file, utils.publish_no_overwrite
+    if where.startswith("dispose"):
+        exc = OSError if where == "dispose_oserror" else KeyboardInterrupt
+
+        def dispose(path, **k):
+            if exc is KeyboardInterrupt:
+                real_dispose(path, **k)                  # moved, then Cancel arrives
+            raise exc("boom")
+        monkeypatch.setattr("Muxer.dispose_file", dispose)
+    else:
+        calls = {"n": 0}
+
+        def pub(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1 or where == "publish_and_rescue_interrupt":
+                raise KeyboardInterrupt
+            return real_pub(*a, **k)
+        monkeypatch.setattr("Muxer.publish_no_overwrite", pub)
+    with pytest.raises((OSError, KeyboardInterrupt)):
+        m.mux()
+    survivors = [p for p in tmp_path.iterdir() if p.name.startswith(".mp2tmp.") or "(merged)" in p.name]
+    assert len(survivors) == 1 and survivors[0].read_bytes().startswith(JPEG) and len(survivors[0].read_bytes()) > len(JPEG)

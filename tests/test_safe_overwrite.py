@@ -87,7 +87,8 @@ def test_overwrite_aborts_and_keeps_original_if_set_aside_fails(tmp_path, monkey
     with pytest.raises(OSError):
         m.mux()
     assert img.read_bytes() == JPEG
-    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["a.jpg", "a.mp4"]
+    # the verified merged photo is never deleted once dispose was called: it is kept under a visible name
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["a (merged).jpg", "a.jpg", "a.mp4"]
 
 
 def test_extension_mismatch_original_goes_through_move_not_remove(tmp_path):
