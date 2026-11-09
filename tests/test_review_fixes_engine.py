@@ -96,6 +96,10 @@ def test_dry_run_shows_source_output_as_conflict_not_convert(tmp_path, capsys):
 
 # ── 5. line breaks in file names ───────────────────────────────────────────────
 
+no_newline_names = pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot create file names with line breaks")
+
+
+@no_newline_names
 def test_muxer_refuses_newline_names(tmp_path):
     img, vid = tmp_path / "a\nb.jpg", tmp_path / "a.mp4"
     img.write_bytes(JPEG)
@@ -109,6 +113,7 @@ def test_muxer_refuses_newline_names(tmp_path):
         Muxer(str(img2), str(vid2), StubExif("jpg"), no_xmp=True)
 
 
+@no_newline_names
 def test_scanner_skips_and_reports_newline_names_before_exiftool(tmp_path, monkeypatch, capsys):
     root = tmp_path / "in"
     root.mkdir()
@@ -146,6 +151,7 @@ def test_get_metadata_safe_never_passes_newline_paths(tmp_path):
     assert all("\n" not in p for c in calls for p in (c if isinstance(c, list) else [c]))
 
 
+@no_newline_names
 def test_is_motion_photo_and_extract_refuse_newline_paths(tmp_path):
     p = tmp_path / "a\nb.jpg"
     p.write_bytes(JPEG)
@@ -186,6 +192,9 @@ def test_user_sidecars_are_never_touched(tmp_path, overwrite):
     vid.write_bytes(MP4)
     sidecars = {"IMG.jpg.XMP": b"darktable sidecar", "IMG.jpg.xmp": b"digikam sidecar",
                 "IMG.LIVE.jpg.XMP": b"sidecar 2", "IMG.XMP.jpg": b"user file", "IMG.LIVE.XMP.jpg": b"user 2"}
+    (tmp_path / "CaseProbe").write_bytes(b"")
+    if (tmp_path / "caseprobe").exists():              # case-insensitive file system: one spelling only
+        del sidecars["IMG.jpg.xmp"]
     for name, data in sidecars.items():
         (tmp_path / name).write_bytes(data)
     m = Muxer(str(img), str(vid), XmpET("jpg"), overwrite=overwrite, video_removal_mode="delete",
@@ -525,7 +534,8 @@ def test_cancel_during_dispose_never_deletes_the_merged_file(tmp_path, monkeypat
     with pytest.raises(KeyboardInterrupt):
         m.mux()
     assert (tmp_path / "_originals" / "a.jpg").read_bytes() == JPEG
-    assert len(temps(tmp_path)) == 1                              # merged photo kept
+    merged = list(tmp_path.glob("a (merged)*.jpg")) + temps(tmp_path)
+    assert len(merged) == 1                                       # merged photo kept (visible name or temp)
 
 
 def test_cancel_before_original_moved_removes_only_the_temp(tmp_path, monkeypatch):
@@ -610,3 +620,78 @@ def test_scan_skips_only_the_apps_own_temp_prefixes(tmp_path, monkeypatch, capsy
     code, text, rows = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--dry-run")
     assert sorted(rows) == [".mp2holiday.jpg", "a.jpg"]
     assert vr.is_own_temp(".mp2tmp.q") and not vr.is_own_temp(".mp2holiday.jpg")
+
+
+# ── round 4 ────────────────────────────────────────────────────────────────────
+
+def _exif_run(tmp_path, monkeypatch, capsys, files, ids, unreadable_name):
+    root = tmp_path / "in"
+    for rel in files:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(b"vid" if rel.endswith("MOV") else JPEG + b"\x00" * 50)
+    FakeET.ids = ids
+    calls = []
+
+    class M:
+        def __init__(self, image_fpath, video_fpath, delete_video=False, **kw):
+            self.img, self.delete, self.output_fpath = image_fpath, delete_video, image_fpath
+
+        def mux(self):
+            calls.append((Path(self.img).name, self.delete))
+    monkeypatch.setattr(mp, "Muxer", M)
+    monkeypatch.setattr(mp, "check_motion_photo",
+                        lambda p, et: (False, "cannot read") if unreadable_name in str(p) else (False, ""))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        _, out, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--recursive", "--exif-match",
+                            "--delete-video", "--video-removal-mode", "move")
+    finally:
+        FakeET.ids = {}
+    return calls, out
+
+
+def test_exif_unreadable_photo_in_another_folder_blocks_the_video(tmp_path, monkeypatch, capsys):
+    ids = {"IMG_1.JPEG": "ID", "IMG_1.MOV": "ID"}
+    calls, out = _exif_run(tmp_path, monkeypatch, capsys, ["A/IMG_1.HEIC", "B/IMG_1.JPEG", "B/IMG_1.MOV"], ids, "A/IMG_1.HEIC")
+    assert calls == [("IMG_1.JPEG", False)] and "keeping video" in out
+
+
+def test_exif_unreadable_photo_blocks_copy_numbered_video(tmp_path, monkeypatch, capsys):
+    ids = {"IMG_1 (1).JPEG": "ID", "IMG_1 (1).MOV": "ID"}
+    calls, out = _exif_run(tmp_path, monkeypatch, capsys, ["IMG_1.HEIC", "IMG_1 (1).JPEG", "IMG_1 (1).MOV"], ids, "IMG_1.HEIC")
+    assert calls == [("IMG_1 (1).JPEG", False)]
+
+
+def test_stem_variants():
+    v = mp.stem_variants
+    assert v("a/IMG_1 (1).JPEG") & v("b/img_1.MOV") and v("IMG_1_2.mov") & v("img_1.heic")
+    assert not v("IMG_2.MOV") & v("IMG_1.HEIC") and not v("IMG_3 (1).MOV") & v("IMG_1.HEIC")
+
+
+def test_still_in_place_check_uses_identity_not_size(tmp_path, monkeypatch, caplog):
+    img, m = _protect_muxer(tmp_path)
+
+    def swapped(path, **k):
+        os.makedirs(tmp_path / "_originals")
+        os.rename(path, tmp_path / "_originals" / "a.jpg")
+        Path(path).write_bytes(b"\x00" * len(JPEG))          # a different file of the SAME size appears
+        raise KeyboardInterrupt
+    monkeypatch.setattr("Muxer.dispose_file", swapped)
+    with caplog.at_level("ERROR"), pytest.raises(KeyboardInterrupt):
+        m.mux()
+    merged = tmp_path / "a (merged).jpg"
+    assert merged.exists() and len(merged.read_bytes()) > len(JPEG)       # merged photo not deleted
+    assert any(str(merged) in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_cancel_mid_dispose_rescues_merged_photo_to_visible_name(tmp_path, monkeypatch):
+    img, m = _protect_muxer(tmp_path)
+
+    def interrupted(path, **k):
+        os.makedirs(tmp_path / "_originals")
+        os.rename(path, tmp_path / "_originals" / "a.jpg")
+        raise KeyboardInterrupt
+    monkeypatch.setattr("Muxer.dispose_file", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        m.mux()
+    assert temps(tmp_path) == [] and (tmp_path / "a (merged).jpg").exists()

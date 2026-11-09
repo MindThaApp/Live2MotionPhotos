@@ -9,6 +9,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -88,6 +89,19 @@ def emit_result(name, status: str, reason: str = "", output: str = "", kind: str
     if bin_bytes:
         d["bytes"] = int(bin_bytes)
     print("@@RESULT " + json.dumps(d), flush=True)
+
+
+def stem_variants(path) -> set:
+    """Lower-case file name without extension (folder ignored) plus the name without a
+    trailing ` (n)` copy counter, and without a `_n` counter when a number is left
+    (IMG_1 (1) -> img_1 (1), img_1; IMG_1_2 -> img_1_2, img_1; IMG_1 stays img_1, never img)."""
+    s = Path(path).stem.lower()
+    out = {s}
+    for pat in (r" \(\d+\)$", r"_\d+$"):
+        t = re.sub(pat, "", s)
+        if t != s and (pat.startswith(" ") or re.search(r"\d", t)):
+            out.add(t)
+    return out
 
 
 def get_metadata_safe(et, paths):
@@ -903,12 +917,21 @@ def main():
                         exif_cands.append((img, list(content_id_to_video[cid])))
                 exif_cands_by_img = dict(exif_cands)
                 assigned = assign_videos(exif_cands)
+                unreadable_stems = set()
                 for idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
                     if idx in image_errors or mp_state[img][1]:     # unreadable: its video must stay
                         cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
                         blocked_videos.update(content_id_to_video.get(cid, []))
-                        stem = str(Path(img).with_suffix(''))
-                        blocked_videos.update(v for v in videos if str(Path(v).with_suffix('')) == stem)
+                        unreadable_stems |= stem_variants(img)
+                if unreadable_stems:
+                    # Its Live Photo id is unknown, so its video may have been matched to a sibling
+                    # in another folder or under another name (IMG_1 (1).JPEG): keep every video
+                    # whose base name looks the same, in any folder.
+                    similar = [v for v in videos if stem_variants(v) & unreadable_stems]
+                    blocked_videos.update(similar)
+                    if similar:
+                        print(f"[WARNING] Unreadable photo(s) in this run: keeping video(s) with the same base name: "
+                              f"{', '.join(sorted(similar))}")
                 photos_left = {}
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1

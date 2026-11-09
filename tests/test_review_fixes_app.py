@@ -327,3 +327,13 @@ def test_suggestion_is_exposed_but_never_used_by_the_server(client, sec_env, mon
     assert not jobs
     html = (ROOT / "index.html").read_text(encoding="utf-8")
     assert "suggested_input_directory" in html
+
+
+def test_suggestion_only_until_a_config_was_ever_saved(client, sec_env, monkeypatch):
+    home = sec_env / "home"
+    (home / "Pictures").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    assert client.get("/api/config").json()["suggested_input_directory"] == str(home / "Pictures")
+    (sec_env / "config.json").write_text(json.dumps({"input_directory": ""}))       # saved once, field left empty
+    assert client.get("/api/config").json()["suggested_input_directory"] == ""

@@ -1267,7 +1267,8 @@ def root():
 def api_get_config():
     cfg = load_config()
     out = {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
-    out["suggested_input_directory"] = suggested_input_dir()   # the UI pre-fills an empty field; the server never does
+    # Offered only until a config has ever been saved; the UI pre-fills an empty field, the server never does
+    out["suggested_input_directory"] = "" if CONFIG_FILE.exists() else suggested_input_dir()
     out["docker"] = IN_DOCKER                 # the UI explains that Recycle Bin falls back to a folder there
     # folders that no longer exist (drive unplugged, renamed...): the UI shows a warning
     out["missing_paths"] = [k for k in ("input_directory", "output_directory")

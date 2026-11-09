@@ -246,6 +246,11 @@ class Muxer:
         (`IMG (merged).HEIC`, `IMG (merged) (2).HEIC`...); if that fails it stays at its temp path."""
         out = Path(self.output_fpath)
         try:
+            if os.path.exists(out) and os.path.samefile(new_fpath, out):
+                return str(out)                   # the publish itself had worked: only the temp name is left
+        except OSError:
+            pass
+        try:
             return str(publish_no_overwrite(new_fpath, out.with_name(f"{out.stem} (merged){out.suffix}")))
         except Exception:
             return new_fpath
@@ -416,12 +421,24 @@ class Muxer:
                 # From here on the merged file may be the only copy: set before dispose_file so a
                 # Cancel / Ctrl+C in the middle of it can never delete the merged file.
                 original_set_aside = True
+                before = os.stat(self.image_fpath)
                 try:
                     action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
                                           root=self.video_removal_root, folder=self.video_removal_folder)
                 except BaseException:
-                    if os.path.lexists(self.image_fpath) and os.path.getsize(self.image_fpath) == image_size:
-                        original_set_aside = False       # provably still in its place: the temp can go
+                    try:
+                        now = os.stat(self.image_fpath)
+                        in_place = (now.st_dev, now.st_ino, now.st_size, now.st_mtime_ns) == \
+                                   (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    except OSError:
+                        in_place = False
+                    if in_place:
+                        original_set_aside = False       # provably the same file, still in its place: the temp can go
+                    else:
+                        kept = self._keep_merged(new_fpath)
+                        self.logger.error("Interrupted while setting the original aside. The verified merged "
+                                          "photo is kept at %s (the original is in the removal folder or "
+                                          "the trash, or still in place)", kept)
                     raise
                 self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
                 # the original is gone from its place: never replace anything that appeared there since
