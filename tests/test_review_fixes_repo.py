@@ -22,3 +22,7 @@ def test_state_and_secrets_are_ignored():
 def test_dockerfile_has_no_world_writable_dirs():
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "chmod 777" not in text and "chown ${UID}:${GID}" in text
+
+
+def test_config_tmp_is_ignored():
+    assert "config.json.tmp" in lines(".gitignore") and "config.json.tmp" in lines(".dockerignore")

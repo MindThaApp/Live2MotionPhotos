@@ -47,10 +47,10 @@ except ImportError:
             group.add_argument = lambda *a, **kw: orig_add_argument(*a, **_strip_gooey_kwargs(kw))
             return group
 
-from Muxer import Muxer, MuxerInputError, OutputConflictError
+from Muxer import Muxer, MuxerInputError, OutputConflictError, AlreadyConvertedError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
-from utils import exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
+from video_removal import is_inside, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
+from utils import ALREADY_CONVERTED, exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
 logging.basicConfig(
@@ -237,7 +237,8 @@ def report_dry_run(args, name, image: str, video: str, output_directory, removal
                            overwrite=bool(args.overwrite))
     if why:
         print(f"[DRY-RUN] Would skip {name}: {why}")
-        emit_result(name, "skipped", why[0].upper() + why[1:], out, kind="conflict")
+        emit_result(name, "skipped", why[0].upper() + why[1:], out,
+                    kind="skipped" if why.startswith(ALREADY_CONVERTED) else "conflict")
         return
     claim_output(claimed, out)
     print(f"[DRY-RUN] Would convert {name} + {video} -> {out}")
@@ -573,6 +574,12 @@ def main():
         print("[ERROR] Copy Unmuxed cannot be used with delete-video option")
         sys.exit(1)
 
+    if args.output_directory is not None and args.input_directory is not None and args.recursive \
+            and is_inside(Path(args.output_directory).resolve(), Path(args.input_directory).resolve()):
+        # a recursive scan would pick the earlier results up again (and copy-unmuxed would nest them)
+        print("[ERROR] Output directory cannot be inside the input directory when processing recursively")
+        sys.exit(1)
+
     if args.output_directory is not None:
         output_directory = f"{Path(args.output_directory).resolve()}"
         if os.path.isfile(output_directory):
@@ -613,6 +620,10 @@ def main():
             
     # Where --delete-video sends videos; in directory mode they must stay inside the input directory
     removal_root = f"{Path(args.input_directory).resolve()}" if args.input_directory is not None else None
+    if removal_root and (args.delete_video or args.overwrite) \
+            and removal_folder(removal_root, args.video_removal_folder) == Path(removal_root).resolve():
+        print("[ERROR] The folder for removed originals cannot be the input folder itself (use a subfolder such as _originals)")
+        sys.exit(1)
     removal_kwargs = {
         'video_removal_mode': normalize_mode(args.video_removal_mode),
         'video_removal_folder': args.video_removal_folder,
@@ -670,6 +681,7 @@ def main():
             
             # A line break in a name would be read by exiftool as extra arguments: such
             # files are never handed to it. They are reported and left alone.
+            files = [f for f in files if not os.path.basename(f).startswith(".mp2")]   # the app's own temp files
             line_break_files = [f for f in files if has_line_break(f)]
             files = [f for f in files if not has_line_break(f)]
             for f in line_break_files:
@@ -833,11 +845,16 @@ def main():
                                     )
                                     muxer.mux()
                                     after_mux(image, muxer)
+                            except AlreadyConvertedError as e:
+                                blocked_videos.add(video)
+                                print(f"Skipping {image}: {e}")
+                                emit_result(image, "skipped", str(e), kind="skipped")
                             except OutputConflictError as e:
                                 blocked_videos.add(video)
                                 print(f"[WARNING] Skipping {image}: {e}")
                                 emit_result(image, "skipped", str(e), kind="conflict")
                             except MuxerInputError as e:
+                                blocked_videos.add(video)      # a photo that shares this video failed: never remove it
                                 print(f"[WARNING] Skipping {image}: {e}")
                                 emit_result(image, "error", str(e), kind="error")
                                 failed_pairs.append((image, str(e)))
@@ -998,11 +1015,16 @@ def main():
                                 )
                                 muxer.mux()
                                 after_mux(img, muxer)
+                        except AlreadyConvertedError as e:
+                            blocked_videos.add(video)
+                            print(f"Skipping {img}: {e}")
+                            emit_result(img, "skipped", str(e), kind="skipped")
                         except OutputConflictError as e:
                             blocked_videos.add(video)
                             print(f"[WARNING] Skipping {img}: {e}")
                             emit_result(img, "skipped", str(e), kind="conflict")
                         except MuxerInputError as e:
+                            blocked_videos.add(video)      # a photo that shares this video failed: never remove it
                             print(f"[WARNING] Skipping {img}: {e}")
                             emit_result(img, "error", str(e), kind="error")
                             failed_pairs.append((img, str(e)))

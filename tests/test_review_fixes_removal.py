@@ -27,21 +27,51 @@ def test_trash_refused_in_docker_and_nothing_touched(tmp_path, monkeypatch):
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".Trash")]
 
 
-def test_trash_refused_on_non_fixed_windows_drives(tmp_path, monkeypatch):
+def _fake_ctypes(volume, kind):
+    """ctypes stand-in: GetVolumePathNameW reports `volume`, GetDriveTypeW(volume) reports kind."""
     import types
-    monkeypatch.delenv("LIVE2MOTION_DOCKER", raising=False)
+    seen = {}
+
+    def vol(path, buf, n):
+        seen["path"] = path
+        buf.value = volume
+        return 1 if volume is not None else 0
+
+    def drive(root):
+        seen["root"] = root
+        return kind
+    return types.SimpleNamespace(
+        create_unicode_buffer=lambda n: types.SimpleNamespace(value=""),
+        windll=types.SimpleNamespace(kernel32=types.SimpleNamespace(GetVolumePathNameW=vol, GetDriveTypeW=drive))), seen
+
+
+def test_trash_refused_on_non_fixed_windows_drives(tmp_path, monkeypatch):
     monkeypatch.setattr(vr, "in_docker", lambda: False)
     monkeypatch.setattr(vr, "is_windows", lambda: True)
     for kind in (0, 1, 2, 4, 5, 6):                      # unknown, no root, removable, network, cd, ram
-        fake = types.SimpleNamespace(windll=types.SimpleNamespace(
-            kernel32=types.SimpleNamespace(GetDriveTypeW=lambda root, kind=kind: kind)))
+        fake, _ = _fake_ctypes("E:\\", kind)
         monkeypatch.setitem(sys.modules, "ctypes", fake)
         assert "Recycle Bin" in vr.trash_unavailable_reason("E:\\photos")
-    fixed = types.SimpleNamespace(windll=types.SimpleNamespace(
-        kernel32=types.SimpleNamespace(GetDriveTypeW=lambda root: vr.DRIVE_FIXED)))
-    monkeypatch.setitem(sys.modules, "ctypes", fixed)
+    fake, _ = _fake_ctypes("C:\\", vr.DRIVE_FIXED)
+    monkeypatch.setitem(sys.modules, "ctypes", fake)
     assert vr.trash_unavailable_reason("C:\\photos") == ""
     assert "UNC" in vr.trash_unavailable_reason("\\\\nas\\share\\photos")
+
+
+def test_trash_checks_the_real_volume_of_a_folder_mounted_usb_stick(monkeypatch):
+    monkeypatch.setattr(vr, "in_docker", lambda: False)
+    monkeypatch.setattr(vr, "is_windows", lambda: True)
+    # C:\mnt\usb is a removable volume mounted into a folder of the fixed C: drive
+    fake, seen = _fake_ctypes("C:\\mnt\\usb\\", 2)
+    monkeypatch.setitem(sys.modules, "ctypes", fake)
+    assert "Recycle Bin" in vr.trash_unavailable_reason("C:\\mnt\\usb\\DCIM")
+    assert seen["root"] == "C:\\mnt\\usb\\"            # the drive type was asked for the real volume
+    fake, _ = _fake_ctypes(None, vr.DRIVE_FIXED)       # GetVolumePathNameW fails: refuse
+    monkeypatch.setitem(sys.modules, "ctypes", fake)
+    assert "could not be determined" in vr.trash_unavailable_reason("C:\\x")
+    fake, _ = _fake_ctypes("\\\\?\\Volume{1}\\", vr.DRIVE_FIXED)
+    monkeypatch.setitem(sys.modules, "ctypes", fake)
+    assert vr.trash_unavailable_reason("C:\\x")               # \\?\ style volume names are refused (conservative)
 
 
 def test_bin_guard_refuses_unavailable_trash_and_unknown_windows_cap(monkeypatch):
@@ -189,3 +219,42 @@ def test_move_refuses_to_build_a_removal_folder_under_a_missing_parent(tmp_path)
     with pytest.raises(OSError, match="parent does not exist"):
         vr.dispose_file(f, "move", root=root, folder=str(tmp_path / "mnt" / "nas" / "orig"))
     assert f.exists() and not (tmp_path / "mnt").exists()
+
+
+# ── round 2 ────────────────────────────────────────────────────────────────────
+
+def test_same_volume_move_removes_new_link_if_source_cannot_be_unlinked(tmp_path, monkeypatch):
+    src = tmp_path / "a.mov"
+    src.write_bytes(b"DATA")
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    real_unlink = os.unlink
+
+    def locked(p, *a, **k):
+        if Path(p) == src:
+            raise PermissionError("locked")
+        return real_unlink(p, *a, **k)
+    monkeypatch.setattr(vr.os, "unlink", locked)
+    with pytest.raises(vr.SourceNotRemoved):
+        vr.safe_move(src, dest_dir / "a.mov")
+    assert src.read_bytes() == b"DATA" and list(dest_dir.iterdir()) == []      # no link, no copy left behind
+
+
+def test_scan_skips_the_apps_own_temp_files(tmp_path, monkeypatch, capsys):
+    import json
+    import motionphoto2 as mp
+    from test_preview_filters import JPEG, VIDEO, FakeET
+    root = tmp_path / "in"
+    root.mkdir()
+    for n in ("a.jpg", ".mp2xmp.abc.jpg", ".mp2tmp.x.jpg"):
+        (root / n).write_bytes(JPEG)
+    (root / "a.mov").write_bytes(VIDEO)
+    monkeypatch.setattr(mp.exiftool, "ExifToolHelper", FakeET)
+    monkeypatch.setattr(sys, "argv", ["mp", "--input-directory", str(root), "--dry-run"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        mp.main()
+    except SystemExit:
+        pass
+    files = [json.loads(line[9:])["file"] for line in capsys.readouterr().out.splitlines() if line.startswith("@@RESULT ")]
+    assert files == ["a.jpg"] and vr.skip_dir_name(".mp2xmp.dir")

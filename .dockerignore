@@ -9,3 +9,4 @@ config.json
 .env
 preview.json
 .port
+config.json.tmp

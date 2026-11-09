@@ -241,3 +241,42 @@ def test_saving_schedule_or_watch_needs_an_input_folder(client, sec_env):
 def test_selected_conversion_and_cleanup_refuse_empty_input(sec_env):
     with pytest.raises(ValueError, match="No input folder"):
         appmod.validate_selected("x", ["a.jpg"], {"input_directory": ""}, {"id": "x", "fingerprint": appmod.preview_fingerprint({"input_directory": ""})})
+
+
+# ── round 2 ────────────────────────────────────────────────────────────────────
+
+def test_unparsable_config_is_never_overwritten(sec_env, monkeypatch):
+    cfg = sec_env / "config.json"
+    cfg.write_text('{"access_token": "mine", oops')
+    before = cfg.read_bytes()
+    monkeypatch.setenv("LIVE2MOTION_HOST", "0.0.0.0")
+    monkeypatch.delenv("LIVE2MOTION_TOKEN", raising=False)
+    with pytest.raises(SystemExit):
+        appmod.ensure_token("0.0.0.0")                     # refuses to start instead of generating + saving
+    with pytest.raises(appmod.ConfigUnreadable):
+        appmod.save_config({"a": 1})
+    assert appmod.remember_folder("input_directory", str(sec_env)) is False
+    assert cfg.read_bytes() == before and not (sec_env / "config.json.tmp").exists()
+
+
+def test_api_save_refused_for_unparsable_config(client, sec_env, monkeypatch):
+    root = sec_env / "photos"
+    root.mkdir()
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(root))
+    (sec_env / "config.json").write_text("not json")
+    r = client.post("/api/config", json={**appmod.DEFAULT_CONFIG, "input_directory": str(root)})
+    assert r.status_code == 409 and (sec_env / "config.json").read_text() == "not json"
+
+
+def test_config_rejects_output_inside_input_and_removal_folder_equal_to_input(sec_env, monkeypatch):
+    root = sec_env / "photos"
+    (root / "out").mkdir(parents=True)
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(sec_env))
+    cfg = {"input_directory": str(root), "output_directory": str(root / "out"), "recursive": True}
+    with pytest.raises(ValueError, match="inside the input folder"):
+        appmod.validate_config(cfg)
+    appmod.validate_config({**cfg, "recursive": False})
+    for folder in (".", str(root)):
+        with pytest.raises(ValueError, match="cannot be the input folder"):
+            appmod.check_config_paths({"input_directory": str(root), "video_removal_folder": folder})
+    appmod.check_config_paths({"input_directory": str(root), "video_removal_folder": "_originals"})

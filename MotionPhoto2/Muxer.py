@@ -18,6 +18,7 @@ from utils import (
     write_temp,
     output_with_extension,
     output_conflict,
+    ALREADY_CONVERTED,
     claim_output,
 )
 from video_removal import has_line_break, LINE_BREAK_REASON, publish_no_overwrite, jpeg_scan_tail, heic_image_items, find_embedded_video, verify_muxed_output, remove_video, dispose_file, normalize_mode
@@ -36,6 +37,11 @@ logging.basicConfig(
 class MuxerInputError(Exception):
     """Raised for per-file input problems (missing image/video) that should
     be skipped rather than aborting a whole directory batch."""
+    pass
+
+
+class AlreadyConvertedError(MuxerInputError):
+    """The output exists and already holds this video: skipped, never replaced."""
     pass
 
 
@@ -132,7 +138,6 @@ class Muxer:
             raise MuxerInputError(LINE_BREAK_REASON)
 
         self.org_outfpath = self.output_fpath
-        self.output_existed = False   # set by check_output_collision
 
         self.delete_temp = delete_temp
         self.xmp = etree.fromstring(const.XMP)
@@ -229,9 +234,11 @@ class Muxer:
         why = output_conflict(self.output_fpath, self.image_fpath, self.video_fpath,
                               self.claimed_outputs, rerun_ok=rerun_ok, overwrite=self.overwrite)
         if why:
+            if why.startswith(ALREADY_CONVERTED):
+                self.logger.info(why)
+                raise AlreadyConvertedError(why)
             self.logger.error(why)
             raise OutputConflictError(why)
-        self.output_existed = os.path.lexists(self.output_fpath)
         claim_output(self.claimed_outputs, self.output_fpath)
 
     def merge_xmp(self, xmp: str):
@@ -391,6 +398,7 @@ class Muxer:
         self.logger.info("Writing output file: %s", self.output_fpath)
         new_fpath = write_temp(os.path.dirname(os.path.abspath(self.output_fpath)), merged_bytes,
                                stat_from=self.image_fpath)
+        original_set_aside = False
         try:
             problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)
             if problem:
@@ -398,23 +406,29 @@ class Muxer:
             if protect:
                 action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
                                       root=self.video_removal_root, folder=self.video_removal_folder)
+                original_set_aside = True
                 self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
                 # the original is gone from its place: never replace anything that appeared there since
-                self.output_fpath = str(publish_no_overwrite(new_fpath, self.output_fpath))
+                try:
+                    self.output_fpath = str(publish_no_overwrite(new_fpath, self.output_fpath))
+                except BaseException as e:
+                    msg = (f"Could not put the merged photo in place ({e}). The original was set aside ({action}) "
+                           f"and the verified merged photo is kept at {new_fpath}")
+                    self.logger.error(msg)
+                    raise MuxerInputError(msg) from e
             elif self.overwrite is True:
                 os.replace(new_fpath, self.output_fpath)       # "delete" mode, verified above
-            elif self.output_existed:
-                os.replace(new_fpath, self.output_fpath)       # an earlier result of this same conversion
             else:
                 try:
                     publish_no_overwrite(new_fpath, self.output_fpath, unique=False)
                 except FileExistsError:
                     raise OutputConflictError(f"output would overwrite {self.output_fpath}, which appeared during the conversion")
         finally:
-            try:
-                os.remove(new_fpath)       # still there only if it was not published
-            except FileNotFoundError:
-                pass
+            if not original_set_aside:         # afterwards it may be the only copy: never remove it
+                try:
+                    os.remove(new_fpath)       # still there only if it was not published
+                except FileNotFoundError:
+                    pass
 
         if self.delete_video is True:
             problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)

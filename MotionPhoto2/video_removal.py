@@ -60,7 +60,14 @@ def trash_unavailable_reason(path) -> str:
         p = os.path.abspath(str(path))
         try:
             import ctypes
-            kind = ctypes.windll.kernel32.GetDriveTypeW(_drive_root(p))
+            # The real volume of the folder, not just its drive letter: a USB stick or
+            # network share can be mounted into a folder of a fixed drive (C:\\mnt\\usb).
+            buf = ctypes.create_unicode_buffer(1024)
+            if not ctypes.windll.kernel32.GetVolumePathNameW(p, buf, 1024) or not buf.value:
+                raise OSError("GetVolumePathNameW failed")
+            if buf.value.startswith("\\\\"):
+                return "network (UNC) folders have no Recycle Bin, files would be deleted permanently"
+            kind = ctypes.windll.kernel32.GetDriveTypeW(buf.value)
         except Exception:
             return "the drive type could not be determined, so a permanent delete cannot be ruled out"
         if kind != DRIVE_FIXED:
@@ -97,7 +104,8 @@ def skip_dir_name(name: str) -> bool:
     legacy one) and trash folders (.Trash-1000, .Trash, $RECYCLE.BIN) that the trash
     backends create inside the scanned folder. Their files are already set aside."""
     low = str(name).lower()
-    return (low in (DEFAULT_FOLDER_NAME.lower(), *(n.lower() for n in LEGACY_FOLDER_NAMES), "$recycle.bin")
+    return (low.startswith(".mp2")      # the app's own temp files (.mp2tmp.*, .mp2xmp.*, .mp2mv.*)
+            or low in (DEFAULT_FOLDER_NAME.lower(), *(n.lower() for n in LEGACY_FOLDER_NAMES), "$recycle.bin")
             or low.startswith(".trash"))
 
 
@@ -540,6 +548,8 @@ def safe_move(src, dest) -> Path:
     if same_volume(src, dest.parent):
         try:
             return publish_no_overwrite_keep(src, dest)
+        except SourceNotRemoved:
+            raise                      # linking worked: copying would only leave a second copy
         except OSError as e:
             logger.info("Cannot link %s on this file system (%s), copying instead", src, e)
     fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".mp2mv.", suffix=".part")
@@ -562,9 +572,9 @@ def safe_move(src, dest) -> Path:
     return final
 
 
-def publish_no_overwrite_keep(src, dest) -> Path:
-    """os.link src under a free name next to dest (name (2).ext, ...), then remove src.
-    Raises OSError (before anything changed) if hard links are not possible."""
+def _link_free_name(src, dest) -> Path:
+    """os.link src under a free name next to dest (name (2).ext, ...).
+    Raises OSError (nothing changed) if hard links are not possible."""
     dest = Path(dest)
     n = 1
     while True:
@@ -574,9 +584,28 @@ def publish_no_overwrite_keep(src, dest) -> Path:
             os.link(src, cand)
         except FileExistsError:
             continue
-        break
-    os.unlink(src)
+        return cand
+
+
+def publish_no_overwrite_keep(src, dest) -> Path:
+    """Hard link src under a free name, then remove src (a rename that never overwrites).
+    If src cannot be removed (locked), the new link is removed again, but only while it
+    is still the same file as src, and the error is raised: no second copy is left."""
+    cand = _link_free_name(src, dest)
+    try:
+        os.unlink(src)
+    except OSError:
+        try:
+            if os.path.samefile(src, cand):
+                os.unlink(cand)
+        except OSError:
+            pass
+        raise SourceNotRemoved(f"could not remove {src} after linking it to {cand}")
     return cand
+
+
+class SourceNotRemoved(OSError):
+    """The source stayed in place (nothing lost); the move failed."""
 
 
 def _move(path: Path, root: Path, folder) -> Path:

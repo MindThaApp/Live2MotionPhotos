@@ -354,3 +354,119 @@ def test_cli_refuses_empty_input_directory(tmp_path, monkeypatch, capsys):
     code, out, _ = run_cli(monkeypatch, capsys, "--input-directory", "")
     assert code == 1 and "empty" in out
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.jpg", "a.mov"]
+
+
+# ── round 2 ────────────────────────────────────────────────────────────────────
+
+def test_protect_path_keeps_verified_merged_photo_if_publish_fails_after_original_set_aside(tmp_path, monkeypatch, caplog):
+    img, vid = tmp_path / "a.jpg", tmp_path / "a.mp4"
+    img.write_bytes(JPEG)
+    vid.write_bytes(MP4)
+
+    def disk_full(*a, **k):
+        raise OSError("No space left on device")
+    monkeypatch.setattr("Muxer.publish_no_overwrite", disk_full)
+    m = Muxer(str(img), str(vid), StubExif("jpg"), overwrite=True, no_xmp=True, video_removal_mode="move",
+              video_removal_root=str(tmp_path))
+    with caplog.at_level("ERROR"), pytest.raises(MuxerInputError, match="verified merged photo is kept at"):
+        m.mux()
+    assert (tmp_path / "_originals" / "a.jpg").read_bytes() == JPEG            # the original, set aside
+    kept = [p for p in tmp_path.iterdir() if p.name.startswith(".mp2tmp.")]
+    assert len(kept) == 1 and kept[0].read_bytes().startswith(JPEG) and len(kept[0].read_bytes()) > len(JPEG)
+    assert any(str(kept[0]) in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_rerun_skips_existing_output_and_blocks_video(tmp_path, monkeypatch, capsys):
+    root, out = tmp_path / "in", tmp_path / "out"
+    root.mkdir()
+    out.mkdir()
+    (root / "a.jpg").write_bytes(JPEG)
+    (root / "a.mp4").write_bytes(MP4)
+    monkeypatch.setattr(mp, "check_motion_photo", lambda p, et: (False, ""))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class ET(XmpET):
+        def __init__(self, *a, **k):
+            super().__init__("jpg")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    args = ("--input-directory", str(root), "--output-directory", str(out), "--delete-video",
+            "--video-removal-mode", "move")
+    code, _, rows = run_cli(monkeypatch, capsys, *args, et=ET)
+    assert rows["a.jpg"]["status"] == "converted"
+    (out / "a.jpg").write_bytes((out / "a.jpg").read_bytes() + b"EDITED")     # user edits the result
+    (root / "a.mp4").write_bytes(MP4)                                           # video back for the rerun
+    edited = (out / "a.jpg").read_bytes()
+    code, text, rows = run_cli(monkeypatch, capsys, *args, et=ET)
+    assert rows["a.jpg"]["status"] == "skipped" and "already converted" in rows["a.jpg"]["reason"]
+    assert (out / "a.jpg").read_bytes() == edited and (root / "a.mp4").exists()   # not replaced, video kept
+
+
+def test_output_may_never_be_the_input_video_or_image(tmp_path):
+    img, vid = tmp_path / "a.jpg", tmp_path / "a.mp4"
+    img.write_bytes(JPEG)
+    vid.write_bytes(MP4)
+    assert "source video" in utils.output_conflict(str(vid), str(img), str(vid), rerun_ok=True)
+    assert "source video" in utils.output_conflict(str(vid), str(img), str(vid), overwrite=True)
+    m = Muxer(str(img), str(vid), StubExif("jpg"), output_fpath=str(vid), no_xmp=True)
+    with pytest.raises(OutputConflictError):
+        m.mux()
+    assert vid.read_bytes() == MP4
+
+
+def test_cli_refuses_output_inside_input_when_recursive(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "in"
+    (root / "out").mkdir(parents=True)
+    (root / "a.jpg").write_bytes(JPEG)
+    code, text, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--recursive",
+                            "--output-directory", str(root / "out"))
+    assert code == 1 and "inside the input directory" in text
+    code, text, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--recursive",
+                            "--output-directory", str(root / "newout"))
+    assert code == 1 and not (root / "newout").exists()
+
+
+def test_cli_refuses_removal_folder_equal_to_input(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "in"
+    root.mkdir()
+    (root / "a.jpg").write_bytes(JPEG)
+    (root / "a.mov").write_bytes(VIDEO)
+    for folder in (str(root), "."):
+        code, text, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--delete-video",
+                                "--video-removal-mode", "move", "--video-removal-folder", folder)
+        assert code == 1 and "cannot be the input folder" in text
+    assert sorted(p.name for p in root.iterdir()) == ["a.jpg", "a.mov"]
+
+
+@pytest.mark.parametrize("exif", [False, True])
+def test_failed_photo_blocks_shared_video_removal(tmp_path, monkeypatch, capsys, exif):
+    root = tmp_path / "in"
+    root.mkdir()
+    for n in ("a.HEIC", "a.JPEG"):
+        (root / n).write_bytes(JPEG + b"\x00" * 50)
+    (root / "a.MOV").write_bytes(b"vid")
+    FakeET.ids = {"a.HEIC": "ID-A", "a.JPEG": "ID-A", "a.MOV": "ID-A"}
+    calls = []
+
+    class M:
+        def __init__(self, image_fpath, video_fpath, delete_video=False, **kw):
+            self.img, self.delete, self.output_fpath = image_fpath, delete_video, image_fpath
+
+        def mux(self):
+            first = not calls
+            calls.append((Path(self.img).name, self.delete))
+            if first:                                  # the first photo fails, the last one succeeds
+                raise MuxerInputError("exiftool cannot read the photo")
+    monkeypatch.setattr(mp, "Muxer", M)
+    monkeypatch.setattr(mp, "check_motion_photo", lambda p, et: (False, ""))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        run_cli(monkeypatch, capsys, "--input-directory", str(root), "--delete-video", "--video-removal-mode",
+                "move", *(["--exif-match"] if exif else []))
+    finally:
+        FakeET.ids = {}
+    assert len(calls) == 2 and calls[1][1] is False         # the last photo no longer removes the video

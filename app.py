@@ -320,6 +320,22 @@ MAX_STR_LEN = 4096
 # exposed or changed through the API: "host", "access_token", "browse_roots", "log_file".
 
 
+class ConfigUnreadable(RuntimeError):
+    """config.json exists but cannot be parsed: it is never overwritten."""
+
+
+def config_problem() -> str:
+    """"" if config.json is absent or a valid JSON object, else why it cannot be used."""
+    if not CONFIG_FILE.exists():
+        return ""
+    try:
+        if not isinstance(json.loads(CONFIG_FILE.read_text(encoding="utf-8")), dict):
+            return f"{CONFIG_FILE} is not a JSON object"
+    except (OSError, ValueError) as e:
+        return f"{CONFIG_FILE} cannot be read ({e})"
+    return ""
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
@@ -334,7 +350,10 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     """Atomic write: a crash mid-save never leaves a truncated config.json. The file may
-    hold the access token, so it is created readable by its owner only."""
+    hold the access token, so it is created readable by its owner only. An existing
+    config.json that cannot be parsed is never replaced: fix or move it by hand."""
+    if config_problem():
+        raise ConfigUnreadable(config_problem())
     tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -367,7 +386,10 @@ def remember_folder(key: str, path: str) -> bool:
         return False
     cfg = load_config()
     if cfg.get(key) != str(p):
-        save_config({**cfg, key: str(p)})
+        try:
+            save_config({**cfg, key: str(p)})
+        except ConfigUnreadable:
+            return False
     return True
 
 
@@ -396,6 +418,13 @@ def validate_config(data) -> dict:
         clean[key] = value
     if "video_removal_mode" in clean and clean["video_removal_mode"] not in video_removal.MODES:
         raise ValueError(f"'video_removal_mode' must be one of: {', '.join(video_removal.MODES)}")
+    out_dir, in_dir = clean.get("output_directory", "").strip(), clean.get("input_directory", "").strip()
+    if out_dir and in_dir and clean.get("recursive", True):
+        try:
+            if video_removal.is_inside(Path(out_dir).expanduser(), Path(in_dir).expanduser()):
+                raise ValueError("The output folder cannot be inside the input folder (it would be scanned again)")
+        except (OSError, RuntimeError):
+            pass
     if clean.get("overwrite") and clean.get("output_directory", "").strip():
         raise ValueError("Overwrite and Output Directory cannot be used together: clear the output folder or untick overwrite")
     if clean.get("schedule_cron"):
@@ -569,6 +598,13 @@ def check_config_paths(clean: dict):
             p = p.resolve()
         except (OSError, RuntimeError):
             raise ValueError(f"'{key}' is not a valid path")
+        if key == "video_removal_folder" and base:
+            try:
+                if p == Path(base).expanduser().resolve():
+                    raise ValueError("'video_removal_folder' cannot be the input folder itself "
+                                     "(use a subfolder such as _originals)")
+            except (OSError, RuntimeError):
+                pass
         if not is_browsable(p, roots):
             raise ValueError(f"'{key}' is outside the allowed folders")
 
@@ -617,12 +653,14 @@ def ensure_token(host: str) -> Optional[str]:
     token (saved to config.json, mode 0600) or None if one was already configured or none
     is needed. Raises SystemExit if no token can be established: the server must not
     start open to the network."""
+    if config_problem():
+        raise SystemExit(f"Refusing to start: {config_problem()}. Fix or remove it (it was not touched).")
     if not token_required() or get_token():
         return None
     token = secrets.token_urlsafe(32)
     try:
         persist_token(token)
-    except OSError as e:
+    except (OSError, ConfigUnreadable) as e:
         bar = "!" * 72
         print(f"\n{bar}\n Refusing to start: listening on {host} needs an access token and none is\n"
               f" configured. Could not save a generated one ({e}).\n"
@@ -1250,7 +1288,10 @@ async def api_save_config(request: Request):
     if cfg.get("overwrite") and str(cfg.get("output_directory") or "").strip():
         return JSONResponse({"error": "Overwrite and Output Directory cannot be used together: "
                                       "clear the output folder or untick overwrite"}, status_code=400)
-    save_config(cfg)
+    try:
+        save_config(cfg)
+    except ConfigUnreadable as e:
+        return JSONResponse({"error": f"Settings not saved: {e}. Fix or remove config.json first."}, status_code=409)
     apply_schedule(cfg)
     if cfg.get("watch_enabled"):
         start_watcher(cfg)
@@ -1654,6 +1695,8 @@ def find_available_port(preferred: int, host: str = "127.0.0.1", attempts: int =
 
 if __name__ == "__main__":
     host = get_host()
+    if config_problem():
+        raise SystemExit(f"Refusing to start: {config_problem()}. Fix or remove it (it was not touched).")
     port = find_available_port(DEFAULT_PORT, host)
     if port != DEFAULT_PORT:
         print(f"Port {DEFAULT_PORT} is already in use - using port {port} instead.")

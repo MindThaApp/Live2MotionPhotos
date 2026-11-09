@@ -95,14 +95,18 @@ def _norm_path(path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
+ALREADY_CONVERTED = "already converted"
+
+
 def output_conflict(output: str, source: str, video: str = None, claimed=None, rerun_ok: bool = False,
                     overwrite: bool = False):
     """Why writing `output` for `source` would destroy another file, or None if it is safe.
 
     Safe: the output is the source itself and `overwrite` was asked for, or the output does
-    not exist yet. Without overwrite the source itself is never a valid output. With
-    rerun_ok (the name comes straight from the source, not overwrite mode) an existing
-    file that already contains this video is an earlier result of the same conversion.
+    not exist yet. Without overwrite the source itself is never a valid output, and the
+    source video never is. With rerun_ok (the name comes straight from the source, not
+    overwrite mode) an existing file that already contains this video is reported as
+    "already converted": skipped, never replaced (the user may have edited it since).
     `claimed` is a set shared by the whole run: two sources must not map to one output."""
     key = _norm_path(output)
     if claimed is not None and key in claimed:
@@ -111,13 +115,20 @@ def output_conflict(output: str, source: str, video: str = None, claimed=None, r
         same = os.path.samefile(output, source)
     except OSError:
         same = _norm_path(output) == _norm_path(source)
+    if video:
+        try:
+            if os.path.samefile(output, video):
+                return f"output would overwrite {output}, which is the source video"
+        except OSError:
+            if _norm_path(output) == _norm_path(video):
+                return f"output would overwrite {output}, which is the source video"
     if same:
         if overwrite:
             return None
         return f"output would overwrite {output}, which is the source photo itself (overwrite is off)"
     if os.path.lexists(output):
         if rerun_ok and video and input_output_binary_compare(video, output):
-            return None
+            return f"{ALREADY_CONVERTED}: {output} already exists and holds this video (never replaced)"
         return f"output would overwrite {output}, an existing file that is not this photo"
     return None
 
