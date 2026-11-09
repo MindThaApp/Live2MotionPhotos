@@ -99,12 +99,35 @@ def removal_folder(root, folder=None) -> Path:
     return (folder if folder.is_absolute() else root / folder).resolve()
 
 
+OWN_TEMP_PREFIXES = (".mp2tmp.", ".mp2xmp.", ".mp2mv.")     # the app's own temp files
+
+
+def is_own_temp(name: str) -> bool:
+    return str(name).lower().startswith(OWN_TEMP_PREFIXES)
+
+
+def same_folder(a, b) -> bool:
+    """Same folder? samefile when both exist (catches symlinks and case-insensitive file
+    systems such as macOS/Windows), else a normcase + resolve comparison."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+
+
+def inside_folder(path, parent) -> bool:
+    """Is path the folder `parent` or below it? Compares every ancestor with same_folder,
+    so differently-cased spellings of one folder are recognised."""
+    p = Path(path).resolve()
+    return any(same_folder(x, parent) for x in (p, *p.parents))
+
+
 def skip_dir_name(name: str) -> bool:
     """Folder names a scan never enters at any depth: our own removal folders (and the
     legacy one) and trash folders (.Trash-1000, .Trash, $RECYCLE.BIN) that the trash
     backends create inside the scanned folder. Their files are already set aside."""
     low = str(name).lower()
-    return (low.startswith(".mp2")      # the app's own temp files (.mp2tmp.*, .mp2xmp.*, .mp2mv.*)
+    return (is_own_temp(low)
             or low in (DEFAULT_FOLDER_NAME.lower(), *(n.lower() for n in LEGACY_FOLDER_NAMES), "$recycle.bin")
             or low.startswith(".trash"))
 

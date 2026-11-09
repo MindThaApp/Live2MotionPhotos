@@ -241,6 +241,15 @@ class Muxer:
             raise OutputConflictError(why)
         claim_output(self.claimed_outputs, self.output_fpath)
 
+    def _keep_merged(self, new_fpath: str) -> str:
+        """Give the kept merged photo a visible unique name next to the output
+        (`IMG (merged).HEIC`, `IMG (merged) (2).HEIC`...); if that fails it stays at its temp path."""
+        out = Path(self.output_fpath)
+        try:
+            return str(publish_no_overwrite(new_fpath, out.with_name(f"{out.stem} (merged){out.suffix}")))
+        except Exception:
+            return new_fpath
+
     def merge_xmp(self, xmp: str):
         try:
             xmp = etree.fromstring(xmp)
@@ -404,18 +413,28 @@ class Muxer:
             if problem:
                 raise MuxerInputError(f"Original kept, merged output failed verification: {problem}")
             if protect:
-                action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
-                                      root=self.video_removal_root, folder=self.video_removal_folder)
+                # From here on the merged file may be the only copy: set before dispose_file so a
+                # Cancel / Ctrl+C in the middle of it can never delete the merged file.
                 original_set_aside = True
+                try:
+                    action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
+                                          root=self.video_removal_root, folder=self.video_removal_folder)
+                except BaseException:
+                    if os.path.lexists(self.image_fpath) and os.path.getsize(self.image_fpath) == image_size:
+                        original_set_aside = False       # provably still in its place: the temp can go
+                    raise
                 self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
                 # the original is gone from its place: never replace anything that appeared there since
                 try:
                     self.output_fpath = str(publish_no_overwrite(new_fpath, self.output_fpath))
                 except BaseException as e:
+                    kept = self._keep_merged(new_fpath)
                     msg = (f"Could not put the merged photo in place ({e}). The original was set aside ({action}) "
-                           f"and the verified merged photo is kept at {new_fpath}")
+                           f"and the verified merged photo is kept at {kept}")
                     self.logger.error(msg)
-                    raise MuxerInputError(msg) from e
+                    if isinstance(e, Exception):
+                        raise MuxerInputError(msg) from e
+                    raise                    # Cancel / Ctrl+C: stop the run, nothing was removed
             elif self.overwrite is True:
                 os.replace(new_fpath, self.output_fpath)       # "delete" mode, verified above
             else:

@@ -49,7 +49,7 @@ except ImportError:
 
 from Muxer import Muxer, MuxerInputError, OutputConflictError, AlreadyConvertedError
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import is_inside, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
+from video_removal import is_own_temp, same_folder, inside_folder, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
 from utils import ALREADY_CONVERTED, exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
@@ -575,7 +575,7 @@ def main():
         sys.exit(1)
 
     if args.output_directory is not None and args.input_directory is not None and args.recursive \
-            and is_inside(Path(args.output_directory).resolve(), Path(args.input_directory).resolve()):
+            and inside_folder(args.output_directory, args.input_directory):
         # a recursive scan would pick the earlier results up again (and copy-unmuxed would nest them)
         print("[ERROR] Output directory cannot be inside the input directory when processing recursively")
         sys.exit(1)
@@ -621,7 +621,7 @@ def main():
     # Where --delete-video sends videos; in directory mode they must stay inside the input directory
     removal_root = f"{Path(args.input_directory).resolve()}" if args.input_directory is not None else None
     if removal_root and (args.delete_video or args.overwrite) \
-            and removal_folder(removal_root, args.video_removal_folder) == Path(removal_root).resolve():
+            and same_folder(removal_folder(removal_root, args.video_removal_folder), removal_root):
         print("[ERROR] The folder for removed originals cannot be the input folder itself (use a subfolder such as _originals)")
         sys.exit(1)
     removal_kwargs = {
@@ -681,7 +681,7 @@ def main():
             
             # A line break in a name would be read by exiftool as extra arguments: such
             # files are never handed to it. They are reported and left alone.
-            files = [f for f in files if not os.path.basename(f).startswith(".mp2")]   # the app's own temp files
+            files = [f for f in files if not is_own_temp(os.path.basename(f))]   # the app's own temp files
             line_break_files = [f for f in files if has_line_break(f)]
             files = [f for f in files if not has_line_break(f)]
             for f in line_break_files:
@@ -750,6 +750,9 @@ def main():
                 name_cands = {image: name_candidates(image) for image in images
                               if not mp_state[image][1] and not mp_state[image][0]}
                 assigned = assign_videos(list(name_cands.items()))
+                for image in images:               # a photo we cannot read may still need its video
+                    if mp_state[image][1]:
+                        blocked_videos.update(name_candidates(image))
                 photos_left = {}
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1
@@ -900,6 +903,12 @@ def main():
                         exif_cands.append((img, list(content_id_to_video[cid])))
                 exif_cands_by_img = dict(exif_cands)
                 assigned = assign_videos(exif_cands)
+                for idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
+                    if idx in image_errors or mp_state[img][1]:     # unreadable: its video must stay
+                        cid = str(img_meta.get('MakerNotes:ContentIdentifier') or "").strip()
+                        blocked_videos.update(content_id_to_video.get(cid, []))
+                        stem = str(Path(img).with_suffix(''))
+                        blocked_videos.update(v for v in videos if str(Path(v).with_suffix('')) == stem)
                 photos_left = {}
                 for v in assigned.values():
                     photos_left[v] = photos_left.get(v, 0) + 1

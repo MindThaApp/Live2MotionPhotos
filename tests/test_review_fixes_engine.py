@@ -470,3 +470,143 @@ def test_failed_photo_blocks_shared_video_removal(tmp_path, monkeypatch, capsys,
     finally:
         FakeET.ids = {}
     assert len(calls) == 2 and calls[1][1] is False         # the last photo no longer removes the video
+
+
+# ── round 3 ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("exif", [False, True])
+def test_unreadable_photo_blocks_removal_of_its_video(tmp_path, monkeypatch, capsys, exif):
+    root = tmp_path / "in"
+    root.mkdir()
+    for n in ("a.HEIC", "a.JPEG"):
+        (root / n).write_bytes(JPEG + b"\x00" * 50)
+    (root / "a.MOV").write_bytes(b"vid")
+    FakeET.ids = {"a.HEIC": "ID-A", "a.JPEG": "ID-A", "a.MOV": "ID-A"}
+    calls = []
+
+    class M:
+        def __init__(self, image_fpath, video_fpath, delete_video=False, **kw):
+            self.img, self.delete, self.output_fpath = image_fpath, delete_video, image_fpath
+
+        def mux(self):
+            calls.append((Path(self.img).name, self.delete))
+    monkeypatch.setattr(mp, "Muxer", M)
+    monkeypatch.setattr(mp, "check_motion_photo",
+                        lambda p, et: (False, "cannot read") if str(p).endswith("HEIC") else (False, ""))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        run_cli(monkeypatch, capsys, "--input-directory", str(root), "--delete-video", "--video-removal-mode",
+                "move", *(["--exif-match"] if exif else []))
+    finally:
+        FakeET.ids = {}
+    assert calls == [("a.JPEG", False)]            # converted, but the video stays for the unreadable HEIC
+
+
+def _protect_muxer(tmp_path):
+    img, vid = tmp_path / "a.jpg", tmp_path / "a.mp4"
+    img.write_bytes(JPEG)
+    vid.write_bytes(MP4)
+    return img, Muxer(str(img), str(vid), StubExif("jpg"), overwrite=True, no_xmp=True, video_removal_mode="move",
+                      video_removal_root=str(tmp_path))
+
+
+def temps(tmp_path):
+    return [p for p in tmp_path.iterdir() if p.name.startswith(".mp2tmp.")]
+
+
+def test_cancel_during_dispose_never_deletes_the_merged_file(tmp_path, monkeypatch):
+    img, m = _protect_muxer(tmp_path)
+
+    def cancelled_midway(path, **k):
+        os.makedirs(tmp_path / "_originals")
+        os.rename(path, tmp_path / "_originals" / "a.jpg")      # the original already moved...
+        raise KeyboardInterrupt                                  # ...when Cancel arrives
+    monkeypatch.setattr("Muxer.dispose_file", cancelled_midway)
+    with pytest.raises(KeyboardInterrupt):
+        m.mux()
+    assert (tmp_path / "_originals" / "a.jpg").read_bytes() == JPEG
+    assert len(temps(tmp_path)) == 1                              # merged photo kept
+
+
+def test_cancel_before_original_moved_removes_only_the_temp(tmp_path, monkeypatch):
+    img, m = _protect_muxer(tmp_path)
+
+    def cancelled_early(path, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr("Muxer.dispose_file", cancelled_early)
+    with pytest.raises(KeyboardInterrupt):
+        m.mux()
+    assert img.read_bytes() == JPEG and temps(tmp_path) == []
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_cancel_during_publish_propagates_and_keeps_merged_file(tmp_path, monkeypatch, caplog, exc):
+    img, m = _protect_muxer(tmp_path)
+    real = utils.publish_no_overwrite
+    n = {"calls": 0}
+
+    def cancel_first(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise exc()
+        return real(*a, **k)
+    monkeypatch.setattr("Muxer.publish_no_overwrite", cancel_first)
+    with caplog.at_level("ERROR"), pytest.raises(exc):
+        m.mux()
+    merged = tmp_path / "a (merged).jpg"
+    assert merged.exists() and len(merged.read_bytes()) > len(JPEG)
+    assert (tmp_path / "_originals" / "a.jpg").read_bytes() == JPEG
+    assert any(str(merged) in r.getMessage() for r in caplog.records)
+
+
+def test_failed_publish_gives_merged_photo_a_visible_name_in_the_error(tmp_path, monkeypatch):
+    img, m = _protect_muxer(tmp_path)
+    real = utils.publish_no_overwrite
+    n = {"calls": 0}
+
+    def fail_first(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise OSError("No space left on device")
+        return real(*a, **k)
+    monkeypatch.setattr("Muxer.publish_no_overwrite", fail_first)
+    (tmp_path / "a (merged).jpg").write_bytes(b"USER FILE")      # never replaced: next unique name
+    with pytest.raises(MuxerInputError, match=r"a \(merged\) \(2\)\.jpg"):
+        m.mux()
+    assert (tmp_path / "a (merged).jpg").read_bytes() == b"USER FILE"
+    assert (tmp_path / "a (merged) (2).jpg").read_bytes().startswith(JPEG) and temps(tmp_path) == []
+
+
+def test_folder_comparison_survives_alias_spellings(tmp_path):
+    root = tmp_path / "in"
+    (root / "out").mkdir(parents=True)
+    alias = tmp_path / "ALIAS"                    # stands in for a differently-cased path on macOS
+    alias.symlink_to(root, target_is_directory=True)
+    assert vr.same_folder(alias, root) and vr.same_folder(root, root / ".")
+    assert vr.inside_folder(alias / "out", root) and vr.inside_folder(root / "new" / "deeper", alias)
+    assert not vr.inside_folder(tmp_path / "other", root)
+    assert vr.same_folder(tmp_path / "missing", tmp_path / "missing")
+
+
+def test_cli_catches_aliased_output_and_removal_folders(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "in"
+    (root / "out").mkdir(parents=True)
+    (root / "a.jpg").write_bytes(JPEG)
+    alias = tmp_path / "ALIAS"
+    alias.symlink_to(root, target_is_directory=True)
+    code, text, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--recursive",
+                            "--output-directory", str(alias / "out"))
+    assert code == 1 and "inside the input directory" in text
+    code, text, _ = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--delete-video",
+                            "--video-removal-mode", "move", "--video-removal-folder", str(alias))
+    assert code == 1 and "cannot be the input folder" in text
+
+
+def test_scan_skips_only_the_apps_own_temp_prefixes(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "in"
+    root.mkdir()
+    for n in ("a.jpg", ".mp2tmp.x.jpg", ".mp2xmp.y.jpg", ".mp2mv.z.jpg", ".mp2holiday.jpg"):
+        (root / n).write_bytes(JPEG)
+    code, text, rows = run_cli(monkeypatch, capsys, "--input-directory", str(root), "--dry-run")
+    assert sorted(rows) == [".mp2holiday.jpg", "a.jpg"]
+    assert vr.is_own_temp(".mp2tmp.q") and not vr.is_own_temp(".mp2holiday.jpg")

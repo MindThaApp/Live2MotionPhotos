@@ -258,3 +258,4 @@ def test_scan_skips_the_apps_own_temp_files(tmp_path, monkeypatch, capsys):
         pass
     files = [json.loads(line[9:])["file"] for line in capsys.readouterr().out.splitlines() if line.startswith("@@RESULT ")]
     assert files == ["a.jpg"] and vr.skip_dir_name(".mp2xmp.dir")
+    assert not vr.skip_dir_name(".mp2holiday")

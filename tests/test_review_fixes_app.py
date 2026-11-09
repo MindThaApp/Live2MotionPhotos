@@ -280,3 +280,50 @@ def test_config_rejects_output_inside_input_and_removal_folder_equal_to_input(se
         with pytest.raises(ValueError, match="cannot be the input folder"):
             appmod.check_config_paths({"input_directory": str(root), "video_removal_folder": folder})
     appmod.check_config_paths({"input_directory": str(root), "video_removal_folder": "_originals"})
+
+
+# ── round 3: suggested input folder (UI pre-fill only) ────────────────────────
+
+def test_suggested_input_is_pictures_folder_or_empty(sec_env, monkeypatch):
+    home = sec_env / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    assert appmod.suggested_input_dir() == ""                        # no Pictures folder: no fallback to home
+    (home / "Pictures").mkdir(parents=True)
+    assert appmod.suggested_input_dir() == str(home / "Pictures")
+    redirected = sec_env / "OneDrive" / "Pictures"
+    redirected.mkdir(parents=True)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: redirected)     # known folder wins
+    assert appmod.suggested_input_dir() == str(redirected)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: sec_env / "gone")  # known folder missing
+    assert appmod.suggested_input_dir() == ""
+    monkeypatch.setattr(appmod, "IN_DOCKER", True)
+    assert appmod.suggested_input_dir() == ""
+
+
+def test_known_folder_failure_gives_none(monkeypatch):
+    monkeypatch.setattr(appmod.sys, "platform", "win32")
+    import types
+    boom = types.SimpleNamespace(windll=types.SimpleNamespace(shell32=types.SimpleNamespace(
+        SHGetKnownFolderPath=lambda *a: 1)))
+    monkeypatch.setitem(sys.modules, "ctypes", types.SimpleNamespace(
+        Structure=object, c_ubyte=int, c_wchar_p=lambda: None, POINTER=lambda x: x, byref=lambda x: x,
+        windll=boom.windll))
+    assert appmod.windows_pictures_dir() is None
+
+
+def test_suggestion_is_exposed_but_never_used_by_the_server(client, sec_env, monkeypatch):
+    home = sec_env / "home"
+    (home / "Pictures").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
+    cfg = client.get("/api/config").json()
+    assert cfg["suggested_input_directory"] == str(home / "Pictures") and cfg["input_directory"] == ""
+    assert client.post("/api/run").status_code == 400                      # still refuses an empty input
+    assert appmod.load_config()["input_directory"] == ""
+    jobs = []
+    monkeypatch.setattr(appmod.scheduler, "add_job", lambda *a, **k: jobs.append(a))
+    appmod.apply_schedule(appmod.load_config() | {"schedule_enabled": True})
+    assert not jobs
+    html = (ROOT / "index.html").read_text(encoding="utf-8")
+    assert "suggested_input_directory" in html

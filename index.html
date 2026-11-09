@@ -709,6 +709,9 @@ async function loadConfig() {
     const el = document.getElementById(id); if (!el) continue;
     el.type === 'checkbox' ? (el.checked = !!c[id]) : (el.value = c[id] ?? '');
   }
+  // Only a pre-filled suggestion for the form: nothing runs on it until the user presses Run / Save
+  const inEl = document.getElementById('input_directory');
+  if (inEl && !inEl.value && c.suggested_input_directory) inEl.value = c.suggested_input_directory;
   const mw = document.getElementById('missing_warn'), miss = c.missing_paths || [];
   mw.textContent = miss.length ? 'Warning: saved folder not found: ' + miss.map(k => c[k]).join(', ') + '. Pick another folder.' : '';
   mw.style.display = miss.length ? '' : 'none';

@@ -72,6 +72,19 @@ def windows_pictures_dir() -> Optional[Path]:
         return None
 
 
+def suggested_input_dir() -> str:
+    """Pre-filled value for an empty input field in the UI (never used by a run itself):
+    the Windows Pictures known folder (follows OneDrive/iCloud redirection) or ~/Pictures.
+    Empty if it cannot be determined or does not exist: no fallback to the home folder."""
+    if IN_DOCKER:
+        return ""
+    pics = windows_pictures_dir() or (Path.home() / "Pictures")
+    try:
+        return str(pics) if pics.is_dir() else ""
+    except OSError:
+        return ""
+
+
 def default_input_dir() -> str:
     """Where the folder browser starts when nothing is configured (never a run target):
     Docker: /data. Native: the user's Pictures folder, else the home folder."""
@@ -421,7 +434,7 @@ def validate_config(data) -> dict:
     out_dir, in_dir = clean.get("output_directory", "").strip(), clean.get("input_directory", "").strip()
     if out_dir and in_dir and clean.get("recursive", True):
         try:
-            if video_removal.is_inside(Path(out_dir).expanduser(), Path(in_dir).expanduser()):
+            if video_removal.inside_folder(Path(out_dir).expanduser(), Path(in_dir).expanduser()):
                 raise ValueError("The output folder cannot be inside the input folder (it would be scanned again)")
         except (OSError, RuntimeError):
             pass
@@ -600,7 +613,7 @@ def check_config_paths(clean: dict):
             raise ValueError(f"'{key}' is not a valid path")
         if key == "video_removal_folder" and base:
             try:
-                if p == Path(base).expanduser().resolve():
+                if video_removal.same_folder(p, Path(base).expanduser()):
                     raise ValueError("'video_removal_folder' cannot be the input folder itself "
                                      "(use a subfolder such as _originals)")
             except (OSError, RuntimeError):
@@ -1254,6 +1267,7 @@ def root():
 def api_get_config():
     cfg = load_config()
     out = {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
+    out["suggested_input_directory"] = suggested_input_dir()   # the UI pre-fills an empty field; the server never does
     out["docker"] = IN_DOCKER                 # the UI explains that Recycle Bin falls back to a folder there
     # folders that no longer exist (drive unplugged, renamed...): the UI shows a warning
     out["missing_paths"] = [k for k in ("input_directory", "output_directory")
