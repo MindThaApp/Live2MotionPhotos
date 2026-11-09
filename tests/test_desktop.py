@@ -18,6 +18,13 @@ import app as appmod  # noqa: E402
 import live2motion_desktop as desk  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _restore_run_state(monkeypatch):
+    """stop_server / begin_shutdown mark the shared run_state as closing: undo it after each test."""
+    for attr in ("closing", "running", "process", "cancel_requested", "cancel_file"):
+        monkeypatch.setattr(appmod.run_state, attr, getattr(appmod.run_state, attr))
+
+
 # ─── app.py hooks ───────────────────────────────────────────────────────────────
 
 def test_data_dir_env_moves_config_preview_and_port(tmp_path):
@@ -166,13 +173,3 @@ def test_server_serves_ui_requires_token_and_stops(tmp_path, monkeypatch):
     assert not thread.is_alive()
 
 
-def test_cancel_active_run_uses_kill_tree(monkeypatch):
-    killed = []
-    monkeypatch.setattr(appmod, "kill_process_tree", lambda p: killed.append(p))
-    monkeypatch.setattr(appmod.run_state, "running", False)
-    assert not desk.cancel_active_run(appmod)
-    monkeypatch.setattr(appmod.run_state, "running", True)
-    monkeypatch.setattr(appmod.run_state, "process", "PROC")
-    monkeypatch.setattr(appmod.run_state, "cancel_requested", False)
-    assert desk.cancel_active_run(appmod)
-    assert killed == ["PROC"] and appmod.run_state.cancel_requested

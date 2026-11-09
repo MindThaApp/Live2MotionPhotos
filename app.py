@@ -32,6 +32,13 @@ from watchdog.observers import Observer
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR / "MotionPhoto2"))
 import video_removal  # noqa: E402  (shared with the muxer so all video removal goes through one helper)
+import run_cancel  # noqa: E402  (the converter's cooperative-cancel contract)
+
+CANCEL_FILE_ENV = run_cancel.CANCEL_FILE_ENV
+CANCELLED_EXIT = run_cancel.CANCELLED_EXIT
+# How long Cancel / closing the app waits for the converter to finish its current file
+# before force-stopping it (a hung converter). One file normally takes seconds.
+COOPERATIVE_CANCEL_TIMEOUT = float(os.environ.get("LIVE2MOTION_CANCEL_TIMEOUT") or 600)
 # Where config.json, preview.json and .port live. Defaults to the app folder; the
 # desktop (Microsoft Store) build points it at %LOCALAPPDATA%\Live2Motion because its
 # install folder is read-only.
@@ -175,6 +182,8 @@ class RunState:
         self.stats: dict = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
         self.history: list = []
         self.cancel_requested = False
+        self.cancel_file: Optional[str] = None   # the converter stops between files once this file exists
+        self.closing = False                     # app is shutting down: no new runs of any kind
         self.dry_run = False
         self._file_log: Optional[logging.Logger] = None
         self._file_log_path = ""
@@ -185,7 +194,7 @@ class RunState:
         """Take the run lock. reset=False (cleanup of leftover videos) keeps the last
         run's log and results; it only blocks other runs while it works."""
         with self._lock:
-            if self.running:
+            if self.running or self.closing:
                 return False
             self.running = True
             self.trigger = trigger
@@ -386,6 +395,7 @@ def save_config(cfg: dict):
     config.json that cannot be parsed is never replaced: fix or move it by hand."""
     if config_problem():
         raise ConfigUnreadable(config_problem())
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)   # LIVE2MOTION_DATA_DIR may not exist yet
     tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -611,15 +621,9 @@ def excluded_dirs() -> list:
     """Folders that are never browsable or usable as input/output, whatever the roots say:
     LIVE2MOTION_EXCLUDED_DIRS (os.pathsep separated). The Microsoft Store build sets it to
     the AppData folders, because new files a packaged app writes there are redirected into
-    the package's private storage and would be deleted when the app is uninstalled."""
-    out = []
-    for c in os.environ.get("LIVE2MOTION_EXCLUDED_DIRS", "").split(os.pathsep):
-        try:
-            if c.strip():
-                out.append(Path(c.strip()).expanduser().resolve())
-        except (OSError, RuntimeError, ValueError):
-            pass
-    return out
+    the package's private storage and would be deleted when the app is uninstalled.
+    The converter reads the same variable and never descends into them while scanning."""
+    return video_removal.env_excluded_dirs()
 
 
 def is_browsable(p: Path, roots: list) -> bool:
@@ -656,6 +660,24 @@ def check_config_paths(clean: dict):
                 pass
         if not is_browsable(p, roots):
             raise ValueError(f"'{key}' is outside the allowed folders")
+
+
+def assert_run_paths(cfg: dict):
+    """The check every run path makes before it starts (manual, schedule, watcher,
+    Extract): the input, output and removal folders (and an Extract input file) of the
+    settings actually used must be allowed folders, never an excluded one. A config.json
+    edited by hand or restored from elsewhere is caught here, not only on save.
+    Raises ValueError with a user-facing message."""
+    try:
+        check_config_paths({k: cfg.get(k) for k in PATH_CONFIG_KEYS if cfg.get(k)})
+        if f := cfg.get("input_file"):
+            p = Path(f).expanduser().resolve()
+            if not is_browsable(p, browse_roots()):
+                raise ValueError("'input_file' is outside the allowed folders")
+    except ValueError as e:
+        raise ValueError(f"Refusing to run: {e}. Choose other folders in the settings.") from None
+    except (OSError, RuntimeError):
+        raise ValueError("Refusing to run: a folder setting is not a valid path") from None
 
 
 TOKEN_IN_QUERY = re.compile(r"([?&]token=)[^&\s\"']*", re.IGNORECASE)
@@ -772,9 +794,21 @@ def build_extract_cmd(cfg: dict) -> list:
     return cmd
 
 
+FORCE_KILL_LEFTOVERS = (
+    "A forced stop can leave, in the photo folders: dot-prefixed temp files "
+    "(.mp2tmp.*.part = a verified merged photo not yet renamed, .mp2mv.*.part = a "
+    "copy of a file being moved, .mp2xmp.* = metadata scratch files). If it hit "
+    "between setting an original aside and putting the merged photo in place, the "
+    "original is in the Recycle Bin or the removal folder (_originals) and the merged "
+    "photo is the .mp2tmp.*.part file next to where it belongs. Nothing is deleted.")
+
+
 def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
-    """Stop the MotionPhoto2 child and everything it started (notably its
-    exiftool helper) so cancelling leaves no orphans."""
+    """Force-stop the MotionPhoto2 child and everything it started (notably its
+    exiftool helper) so it leaves no orphans. Last resort only: a normal Cancel is
+    cooperative (request_cancel) and waits for the current file. On Windows this is
+    TerminateProcess, which gives the converter no chance to clean up; see
+    FORCE_KILL_LEFTOVERS for what that can leave behind."""
     if proc.poll() is not None:
         return
     if sys.platform == "win32":
@@ -799,6 +833,104 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
         os.killpg(pgid, signal.SIGKILL)       # anything still in the group (exiftool)
     except ProcessLookupError:
         pass
+
+
+# ─── Cancel and shutdown ──────────────────────────────────────────────────────
+
+def new_cancel_file_path() -> str:
+    """A unique, not yet existing path for one run's stop flag (in the temp folder)."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), f"l2m_cancel_{os.getpid()}_{uuid.uuid4().hex}.flag")
+
+
+def _raise_cancel_flag(path: str) -> bool:
+    """Create the stop flag (a new empty file; an existing one is left as it is)."""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:
+        pass
+    except OSError as e:
+        run_state.emit(f"✗ Could not ask the converter to stop ({e})")
+        return False
+    return True
+
+
+def _cancel_watchdog(proc: subprocess.Popen, timeout: float):
+    """Last resort: force-stop a converter that did not stop within `timeout` seconds."""
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        run_state.emit(f"✗ The converter did not stop within {int(timeout)} s: force-stopping it. "
+                       + FORCE_KILL_LEFTOVERS)
+        kill_process_tree(proc)
+
+
+def request_cancel() -> bool:
+    """Cooperative cancel (Cancel button, closing the app, all platforms): the converter
+    finishes the file it is working on and stops at the next safe point, so an overwrite
+    (set the original aside, put the merged photo in place) is never cut in half. It is
+    force-stopped only if it has not ended after COOPERATIVE_CANCEL_TIMEOUT seconds.
+    Returns True if a run was active."""
+    if not run_state.running:
+        return False
+    run_state.cancel_requested = True       # do_run checks it before and right after starting the converter
+    proc, flag = run_state.process, run_state.cancel_file
+    if proc is None or flag is None or proc.poll() is not None:
+        return True
+    if getattr(proc, "_l2m_cancel_asked", False):
+        return True
+    proc._l2m_cancel_asked = True
+    run_state.emit("⬛ Stopping after the current file…")
+    # If the flag cannot be created the converter will not stop by itself; it is still never
+    # killed at once (that could cut an overwrite in half), only after the timeout.
+    _raise_cancel_flag(flag)
+    threading.Thread(target=_cancel_watchdog, args=(proc, COOPERATIVE_CANCEL_TIMEOUT),
+                     name="live2motion-cancel-watchdog", daemon=True).start()
+    return True
+
+
+def wait_until_idle(timeout: float, poll: float = 0.1) -> bool:
+    deadline = time.monotonic() + timeout
+    while run_state.running:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
+def start_closing() -> bool:
+    """Refuse every new run from now on and ask the active one to stop after its current
+    file. Does not wait. Returns True if a run was active."""
+    with run_state._lock:
+        run_state.closing = True
+    return request_cancel()
+
+
+def begin_shutdown(timeout: Optional[float] = None) -> bool:
+    """The app is closing: refuse every new run (manual, schedule, watcher, cleanup),
+    cooperatively cancel the active one and wait until it has ended, so the converter is
+    never left running without the app. Returns True once nothing runs."""
+    start_closing()
+    if timeout is None:
+        timeout = COOPERATIVE_CANCEL_TIMEOUT + 60    # the watchdog force-stops a hung converter before this
+    if wait_until_idle(timeout):
+        return True
+    proc = run_state.process
+    if proc is not None and proc.poll() is None:     # never orphan the child
+        kill_process_tree(proc)
+    return wait_until_idle(15)
+
+
+def busy_response() -> Optional[JSONResponse]:
+    """409 when no new run may start: the app is closing or a run is going."""
+    if run_state.closing:
+        return JSONResponse({"error": "Live2Motion Photos is closing: no new runs are started"}, status_code=409)
+    if run_state.running:
+        return JSONResponse({"error": "Already running"}, status_code=409)
+    return None
 
 
 # ─── Preview (dry run) that can be acted on ──────────────────────────────────
@@ -852,6 +984,7 @@ def _save_preview():
     data = {"id": last_preview["id"], "fingerprint": last_preview["fingerprint"],
             "created": last_preview["created"], "rows": last_preview["rows"],
             "done": sorted(last_preview["done"])}
+    p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(data), encoding="utf-8")
     os.replace(tmp, p)
@@ -1061,6 +1194,17 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         run_state.emit("✗ No input folder is configured: choose one first. Nothing was run.")
         run_state.finish(2)
         return
+    try:
+        assert_run_paths(cfg)
+    except ValueError as e:
+        run_state.emit(f"▶ Triggered by: {trigger}")
+        run_state.emit(f"✗ {e} Nothing was run.")
+        run_state.finish(2)
+        return
+    if run_state.cancel_requested:       # cancelled (or the app started closing) before the converter started
+        run_state.emit("⬛ Cancelled before the converter started. Nothing was run.")
+        run_state.finish(CANCELLED_EXIT)
+        return
     only_path = None
     if only_files and extract is None:
         import tempfile
@@ -1080,6 +1224,8 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         run_state.emit(f"✗ MotionPhoto2 entry point not found: {entry}")
         run_state.finish(127)
         return
+    cancel_file = new_cancel_file_path()
+    run_state.cancel_file = cancel_file
     try:
         # utf-8 + errors="replace": the child forces UTF-8 output, and non-ASCII
         # (e.g. Windows) filenames must not abort the read loop.
@@ -1088,19 +1234,23 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
             else {"start_new_session": True}
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1, **group,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            env={**os.environ, CANCEL_FILE_ENV: cancel_file}, **group,
         )
         run_state.process = proc
-        if run_state.cancel_requested:   # cancelled before the process existed
-            kill_process_tree(proc)
+        if run_state.cancel_requested:   # cancelled while the process was starting
+            request_cancel()
         for raw in proc.stdout:
             run_state.emit(raw.rstrip())
         proc.wait()
+        if proc.returncode == CANCELLED_EXIT and run_state.cancel_requested:
+            run_state.emit("⬛ Cancelled: stopped after the current file")
         run_state.emit(f"{'✓' if proc.returncode == 0 else '✗'} Exited with code {proc.returncode}")
         if proc.returncode == 0 and run_state.dry_run and extract is None and not only_files:
             rows = [r for _, r in run_state.read_results(0)[0]]
             set_preview(preview_fingerprint(cfg), rows)
-        elif proc.returncode == 0 and only_files and preview_id:
+        elif proc.returncode in (0, CANCELLED_EXIT) and only_files and preview_id:
+            # a cancelled run reports "converted" only for photos it finished completely
             mark_preview_done(preview_id, [r["file"] for _, r in run_state.read_results(0)[0]
                                            if r["status"] == "converted"])
         run_state.finish(proc.returncode)
@@ -1108,11 +1258,13 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         run_state.emit(f"✗ Exception: {exc}")
         run_state.finish(-1)
     finally:
-        if only_path:
-            try:
-                os.remove(only_path)
-            except OSError:
-                pass
+        run_state.cancel_file = None
+        for own in (only_path, cancel_file):     # both are this run's own temp files
+            if own:
+                try:
+                    os.remove(own)
+                except OSError:
+                    pass
 
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
@@ -1123,6 +1275,11 @@ def apply_schedule(cfg: dict):
     except Exception:
         pass
     if cfg.get("schedule_enabled") and cfg.get("schedule_cron") and str(cfg.get("input_directory") or "").strip():
+        try:
+            assert_run_paths(cfg)
+        except ValueError as e:
+            print(f"[scheduler] Not scheduled: {e}", flush=True)
+            return str(e)
         try:
             scheduler.add_job(
                 lambda: threading.Thread(target=do_run, args=("schedule",), daemon=True).start(),
@@ -1254,6 +1411,11 @@ def start_watcher(cfg: dict):
     stop_watcher()
     path = str(cfg.get("input_directory") or "").strip()
     if path and os.path.isdir(path):
+        try:
+            assert_run_paths(cfg)
+        except ValueError as e:
+            print(f"[watcher] Not watching: {e}", flush=True)
+            return str(e)
         watch_observer = Observer()
         skip = video_removal.skip_folders(path, cfg.get("video_removal_folder"))
         watch_observer.schedule(MediaHandler(cfg.get("watch_debounce", 300), skip, cfg.get("watch_stable_seconds", 10)), path, recursive=True)
@@ -1362,8 +1524,8 @@ def api_preview():
 async def api_run_selected(request: Request):
     """Convert exactly the ticked files of the latest Preview, without rescanning.
     Body: {"preview_id": "...", "files": ["rel/path.jpg", ...]}."""
-    if run_state.running:
-        return JSONResponse({"error": "Already running"}, status_code=409)
+    if (busy := busy_response()) is not None:
+        return busy
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -1393,8 +1555,8 @@ async def api_cleanup_movs(request: Request):
     Body: {"preview_id": "...", "files": [photo rel paths]}. Each MOV is removed only
     after the photo is re-verified to contain an identical embedded video; the
     configured removal mode applies (bin by default, move to folder, or delete)."""
-    if run_state.running:
-        return JSONResponse({"error": "Already running"}, status_code=409)
+    if (busy := busy_response()) is not None:
+        return busy
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -1517,8 +1679,8 @@ def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
 @app.post("/api/run")
 def api_run(dry_run: Optional[bool] = None):
     """dry_run=true|false overrides the saved "dry_run" setting for this run."""
-    if run_state.running:
-        return JSONResponse({"error": "Already running"}, status_code=409)
+    if (busy := busy_response()) is not None:
+        return busy
     if not str(load_config().get("input_directory") or "").strip():
         return JSONResponse({"error": "No input folder is configured: choose one first"}, status_code=400)
     threading.Thread(target=do_run, args=("manual", dry_run), daemon=True).start()
@@ -1562,8 +1724,8 @@ async def api_extract(request: Request, dry_run: Optional[bool] = None):
     Optional JSON body overrides the saved settings for this run (input_directory,
     input_file, output_directory, recursive, extract_mov, extract_still, dry_run);
     ?dry_run=true|false overrides both."""
-    if run_state.running:
-        return JSONResponse({"error": "Already running"}, status_code=409)
+    if (busy := busy_response()) is not None:
+        return busy
     try:
         raw = await request.body()
         overrides = validate_extract_request(json.loads(raw) if raw.strip() else {})
@@ -1588,11 +1750,8 @@ async def api_extract(request: Request, dry_run: Optional[bool] = None):
 
 @app.post("/api/cancel")
 def api_cancel():
-    if run_state.running:
-        run_state.cancel_requested = True
-        proc = run_state.process
-        if proc:
-            kill_process_tree(proc)
+    """Cooperative: the converter stops after the file it is working on (see request_cancel)."""
+    if request_cancel():
         return {"ok": True}
     return JSONResponse({"error": "Not running"}, status_code=400)
 

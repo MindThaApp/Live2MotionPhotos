@@ -9,7 +9,8 @@ window (pywebview + Microsoft Edge WebView2) instead of a browser tab.
 - A random access token is generated for every start and handed to the window, so
   other programs or other Windows users on this computer cannot drive the API.
 - One instance at a time: a second start brings the existing window to the front.
-- Closing the window stops a running conversion (after asking) and shuts the server down.
+- Closing the window during a run asks first, then lets the converter finish the file it
+  is working on (cooperative cancel), waits for the run to end, and only then closes.
 - Settings, logs and the window's storage live in %LOCALAPPDATA%\\Live2Motion. Inside an
   MSIX package Windows redirects that folder into the package's private storage.
 
@@ -24,6 +25,7 @@ import os
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -78,6 +80,18 @@ def appdata_dirs(env=None) -> list:
     return out
 
 
+def packaged_excluded_dirs(env=None) -> list:
+    """Everything the packaged app never uses as input/output and never scans into: the
+    AppData folders, the temp folder(s) (may be redirected outside AppData) and the
+    read-only install folder."""
+    env = os.environ if env is None else env
+    out = appdata_dirs(env)
+    for c in (env.get("TEMP"), env.get("TMP"), tempfile.gettempdir(), str(install_dir())):
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
 def is_packaged() -> bool:
     """True when running with MSIX package identity."""
     if sys.platform != "win32":
@@ -104,7 +118,7 @@ def configure_environment(data: Path, token: str, packaged: bool, env=None) -> N
         env["PATH"] = str(exiftool_dir) + os.pathsep + env.get("PATH", "")
     if packaged:
         extra = [d for d in env.get("LIVE2MOTION_EXCLUDED_DIRS", "").split(os.pathsep) if d]
-        env["LIVE2MOTION_EXCLUDED_DIRS"] = os.pathsep.join(extra + appdata_dirs(env))
+        env["LIVE2MOTION_EXCLUDED_DIRS"] = os.pathsep.join(extra + packaged_excluded_dirs(env))
 
 
 # ─── Converter subprocess mode ──────────────────────────────────────────────────
@@ -122,7 +136,12 @@ def run_motionphoto2(args: list) -> int:
         runpy.run_path(str(script), run_name="__main__")
     except SystemExit as e:
         code = e.code
-        return code if isinstance(code, int) else (0 if code is None else 1)
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        print(code, file=sys.stderr, flush=True)   # SystemExit("message"): like Python, show it and exit 1
+        return 1
     return 0
 
 
@@ -216,12 +235,19 @@ def message_box(text: str, title: str = WINDOW_TITLE, yes_no: bool = False) -> b
 
 # ─── Server ─────────────────────────────────────────────────────────────────────
 
+SO_EXCLUSIVEADDRUSE = getattr(socket, "SO_EXCLUSIVEADDRUSE", -5)   # Windows: ~SO_REUSEADDR
+
+
 def bind_loopback_socket(preferred: int = PREFERRED_PORT) -> socket.socket:
     """A listening-ready socket on 127.0.0.1: the preferred port if free, else any free
-    port. No SO_REUSEADDR: on Windows it would let us share a port another app uses."""
+    port. No SO_REUSEADDR: on Windows it would let us share a port another app uses. On
+    Windows SO_EXCLUSIVEADDRUSE is set too, so no other process (even one using
+    SO_REUSEADDR) can bind the same address and receive the window's requests and token."""
     for port in (preferred, 0):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            if sys.platform == "win32":
+                sock.setsockopt(socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)
             sock.bind(("127.0.0.1", port))
             return sock
         except OSError:
@@ -253,19 +279,16 @@ def wait_started(server, thread: threading.Thread, timeout: float = 30.0) -> boo
 
 
 def cancel_active_run(appmod) -> bool:
-    """Same as the Cancel button (/api/cancel). True if a run was cancelled."""
-    state = appmod.run_state
-    if not state.running:
-        return False
-    state.cancel_requested = True
-    proc = state.process
-    if proc:
-        appmod.kill_process_tree(proc)
-    return True
+    """Same as the Cancel button (/api/cancel): cooperative, the converter stops after the
+    file it is working on. True if a run was active."""
+    return appmod.request_cancel()
 
 
 def stop_server(server, thread: threading.Thread, appmod, timeout: float = 15.0) -> bool:
-    cancel_active_run(appmod)
+    """App exit: no new runs, stop the active one after its current file and wait for it
+    (appmod.begin_shutdown: force-stop only for a hung converter), then stop the server."""
+    idle = appmod.begin_shutdown()
+    print(f"Runs finished before exit: {idle}", flush=True)
     server.should_exit = True
     thread.join(timeout)
     return not thread.is_alive()
@@ -273,21 +296,54 @@ def stop_server(server, thread: threading.Thread, appmod, timeout: float = 15.0)
 
 # ─── Window ─────────────────────────────────────────────────────────────────────
 
+CLOSE_QUESTION = "A run is in progress. Stop after the current file and close?"
+
+
+class CloseController:
+    """The window's close button during a run: ask; on Yes stop after the current file
+    (cooperative cancel, no new runs), keep the window open while the run ends, then
+    close it. Nothing is force-killed here."""
+
+    def __init__(self, appmod, destroy, ask=None, spawn=None):
+        self.appmod = appmod
+        self.destroy = destroy
+        self.ask = ask or (lambda: message_box(CLOSE_QUESTION, yes_no=True))
+        self.spawn = spawn or (lambda fn: threading.Thread(target=fn, name="live2motion-close",
+                                                           daemon=True).start())
+        self.stopping = False
+        self.done = False
+
+    def on_closing(self) -> bool:
+        if self.done:
+            return True
+        if self.stopping:
+            return False         # already finishing the current file: closes by itself afterwards
+        if not self.appmod.run_state.running:
+            return True          # main() still waits for any run that starts in the meantime
+        if not self.ask():
+            return False
+        self.stopping = True
+        self.appmod.start_closing()
+        self.spawn(self._finish)
+        return False
+
+    def _finish(self):
+        idle = self.appmod.begin_shutdown()
+        print(f"Run ended before closing the window: {idle}", flush=True)
+        self.done = True
+        try:
+            self.destroy()
+        except Exception as e:
+            print(f"Window close failed: {e!r}", flush=True)
+
+
 def run_window(url: str, appmod, data: Path) -> None:
     import webview
 
     window = webview.create_window(WINDOW_TITLE, url, width=1240, height=880,
                                    min_size=(900, 600), text_select=True)
-
-    def on_closing():
-        if appmod.run_state.running:
-            if not message_box("A conversion is still running.\n\nStop it and close Live2Motion Photos?",
-                               yes_no=True):
-                return False
-            cancel_active_run(appmod)
-        return True
-
-    window.events.closing += on_closing
+    closer = CloseController(appmod, window.destroy)
+    window.events.closing += closer.on_closing
     webview.start(gui="edgechromium", private_mode=False, storage_path=str(data / "webview"))
 
 
@@ -355,12 +411,15 @@ def main(argv: Optional[list] = None) -> int:
         try:
             run_window(f"http://127.0.0.1:{port}/?token={token}", appmod, data)
         except Exception as e:
+            appmod.start_closing()    # no new runs; the active one stops after its current file
             print(f"Window failed: {e!r}", flush=True)
             message_box("Live2Motion Photos needs the Microsoft Edge WebView2 Runtime, which could not be "
                         "started.\n\nInstall it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 "
                         f"and try again.\n\nDetails: {e}")
-        stopped = stop_server(server, thread, appmod)
-        print(f"Server stopped cleanly: {stopped}", flush=True)
+        finally:
+            # Every way out (window closed, window crashed, Ctrl+C): wait for the run, then stop.
+            stopped = stop_server(server, thread, appmod)
+            print(f"Server stopped cleanly: {stopped}", flush=True)
         return 0
     finally:
         instance.release()
