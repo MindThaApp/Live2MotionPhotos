@@ -1250,7 +1250,7 @@ async def lifespan(application: FastAPI):
     scheduler.shutdown(wait=False)
     stop_watcher()
 
-app = FastAPI(title="Live2Motion Photos", lifespan=lifespan, dependencies=[Depends(api_guard)])
+app = FastAPI(title="Live2Motion Photos", version="1.1.0", lifespan=lifespan, dependencies=[Depends(api_guard)])
 
 
 @app.exception_handler(ApiDenied)
