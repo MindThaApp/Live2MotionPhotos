@@ -127,6 +127,21 @@ The no-overwrite publish, safe_move, trash only on fixed drives, refusal when ou
 input, refusal on unreadable photos, the bin size check and the token/Host/Origin guards are
 all untouched. The existing 319 tests still pass.
 
+## Review fixes (after the review of this branch)
+
+The engine is now changed, minimally: `MotionPhoto2/run_cancel.py` adds the cooperative
+cancel (checked only between files; one file's work, including the overwrite set-aside and
+publish, runs as a critical section), and the recursive scans skip
+`LIVE2MOTION_EXCLUDED_DIRS`. No existing guard was changed. app.py adds `request_cancel`,
+`begin_shutdown` (no new runs while closing) and `assert_run_paths` on every run path.
+Packaged exclusions now also cover TEMP and the install folder.
+
+Rebuilt locally from commit 8f2bd6f (copy in `store-build\src-8f2bd6f\`):
+`store-build\out\run-20261109-190737\packages\`. All build.ps1 smoke tests passed,
+including `-GuiSmoke`. The frozen `Live2Motion.exe --motionphoto2` exits with 4 and prints
+`[CANCELLED]` when the cancel-flag file exists, and exits 0 when it does not.
+`pytest -q`: 355 passed.
+
 ## Tests
 
 - `pytest -q`: **333 passed** (319 existing + 14 new). `ruff check .`: all checks passed.
