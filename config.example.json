@@ -6,7 +6,7 @@
   "incremental_mode": false,
   "copy_unmuxed": false,
   "overwrite": false,
-  "delete_video": true,
+  "delete_video": false,
   "video_removal_mode": "move",
   "video_removal_folder": "",
   "keep_temp": false,

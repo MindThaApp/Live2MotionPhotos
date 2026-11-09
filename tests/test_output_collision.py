@@ -14,7 +14,7 @@ pytest.importorskip("exiftool")
 pytest.importorskip("lxml")
 
 import motionphoto2 as mp  # noqa: E402
-from Muxer import Muxer, OutputConflictError  # noqa: E402
+from Muxer import Muxer, OutputConflictError, AlreadyConvertedError  # noqa: E402
 from test_preview_filters import JPEG, FakeET  # noqa: E402
 from test_safe_overwrite import MP4, StubExif  # noqa: E402
 
@@ -93,8 +93,10 @@ def test_output_dir_existing_other_file_refused_but_rerun_allowed(tmp_path):
     (out / "a.jpg").unlink()
     Muxer(str(img), str(vid), StubExif("jpg"), output_directory=str(out), no_xmp=True).mux()
     first = (out / "a.jpg").read_bytes()
-    Muxer(str(img), str(vid), StubExif("jpg"), output_directory=str(out), no_xmp=True).mux()   # same conversion again
-    assert (out / "a.jpg").read_bytes() == first
+    (out / "a.jpg").write_bytes(first + b"USER EDIT")          # edited later in another tool
+    with pytest.raises(AlreadyConvertedError):                   # same conversion again: skipped, never replaced
+        Muxer(str(img), str(vid), StubExif("jpg"), output_directory=str(out), no_xmp=True).mux()
+    assert (out / "a.jpg").read_bytes() == first + b"USER EDIT"
 
 
 def test_two_sources_one_output_in_a_run(tmp_path):

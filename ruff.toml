@@ -9,3 +9,4 @@ ignore = ["E701", "E702", "E722", "E741"]
 
 [lint.per-file-ignores]
 "app.py" = ["E402"]   # imports after the sys.path tweak for MotionPhoto2/
+"tests/test_review_fixes_app.py" = ["F811"]   # fixtures imported from other test modules

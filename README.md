@@ -259,7 +259,9 @@ By default the server listens on `127.0.0.1` (this computer only); in Docker the
 - **Native:** set `LIVE2MOTION_HOST=0.0.0.0` (or `"host": "0.0.0.0"` in `config.json`).
 - **Docker:** set `LIVE2MOTION_BIND=0.0.0.0` in `.env`.
 
-When you do, also set an access token, via `LIVE2MOTION_TOKEN` or `"access_token"` in `config.json`. Every `/api` request must then carry it; the web UI asks for it once and remembers it in the browser. The app prints a warning at startup if it is reachable beyond localhost without a token. With no token and localhost-only, there is no prompt.
+A token is mandatory whenever the server is reachable beyond this computer: in Docker, and on any non-loopback bind. Set it with `LIVE2MOTION_TOKEN` or `"access_token"` in `config.json`. If none is configured, one is generated on first start, saved to `config.json` (readable by you only) and printed once as a link (`http://localhost:7000/?token=...`); open it and the browser remembers the token. If a token cannot be saved, the server refuses to start. Every `/api` request must carry the token; without one configured, such a server answers 401. Localhost-only native runs need no token.
+
+The `Host` header is checked on every API request (also in Docker) against DNS-rebinding: loopback names, IP addresses and the names in `LIVE2MOTION_ALLOWED_HOSTS` (comma separated, e.g. `nas.lan,photos.example.org`) are answered, anything else gets 403. Set it when you open the UI by a DNS name on your network.
 
 Other protections: state-changing requests whose `Origin` doesn't match the `Host` are rejected (CSRF); the folder browser only enters allowed roots (home, the input/output folders and their parents up to two levels, Windows drives; override with `LIVE2MOTION_BROWSE_ROOTS` or `"browse_roots": [...]` in `config.json`) and does not follow symlinks out of them; `/api/config` validates every field; the Docker container runs as non-root. `host`, `access_token` and `browse_roots` can only be set in `config.json`/environment, never through the web UI.
 

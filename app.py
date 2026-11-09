@@ -3,10 +3,12 @@
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -70,8 +72,22 @@ def windows_pictures_dir() -> Optional[Path]:
         return None
 
 
+def suggested_input_dir() -> str:
+    """Pre-filled value for an empty input field in the UI (never used by a run itself):
+    the Windows Pictures known folder (follows OneDrive/iCloud redirection) or ~/Pictures.
+    Empty if it cannot be determined or does not exist: no fallback to the home folder."""
+    if IN_DOCKER:
+        return ""
+    pics = windows_pictures_dir() or (Path.home() / "Pictures")
+    try:
+        return str(pics) if pics.is_dir() else ""
+    except OSError:
+        return ""
+
+
 def default_input_dir() -> str:
-    """Docker: /data. Native: the user's Pictures folder, else the home folder."""
+    """Where the folder browser starts when nothing is configured (never a run target):
+    Docker: /data. Native: the user's Pictures folder, else the home folder."""
     if IN_DOCKER:
         return "/data"
     pics = windows_pictures_dir() or (Path.home() / "Pictures")
@@ -84,7 +100,10 @@ def default_input_dir() -> str:
 
 
 DEFAULT_CONFIG = {
-    "input_directory": default_input_dir(),
+    # Empty means "not configured": runs, the schedule and the watcher refuse to start. It is
+    # never widened to Pictures or the home folder. Only Docker has a natural default: the
+    # one folder that was mounted for the app (/data).
+    "input_directory": "/data" if IN_DOCKER else "",
     "output_directory": "",
     "recursive": True,
     "exif_match": True,
@@ -143,13 +162,17 @@ class RunState:
         self.skipped_files: list = []      # full paths of already-muxed photos
         self.input_dir: str = ""
 
-    def start(self, trigger: str) -> bool:
+    def start(self, trigger: str, reset: bool = True) -> bool:
+        """Take the run lock. reset=False (cleanup of leftover videos) keeps the last
+        run's log and results; it only blocks other runs while it works."""
         with self._lock:
             if self.running:
                 return False
             self.running = True
             self.trigger = trigger
             self.start_time = datetime.now().isoformat()
+            if not reset:
+                return True
             self.lines.clear()
             self.line_total = 0
             self.results.clear()
@@ -258,6 +281,12 @@ class RunState:
             if m:
                 self.stats["current_file"] = Path(m.group(1).strip()).name
 
+    def release(self):
+        """Give the run lock back after a start(reset=False)."""
+        with self._lock:
+            self.running = False
+            self.process = None
+
     def finish(self, exit_code: int):
         elapsed = ""
         if self.start_time:
@@ -304,25 +333,54 @@ MAX_STR_LEN = 4096
 # exposed or changed through the API: "host", "access_token", "browse_roots", "log_file".
 
 
+class ConfigUnreadable(RuntimeError):
+    """config.json exists but cannot be parsed: it is never overwritten."""
+
+
+def config_problem() -> str:
+    """"" if config.json is absent or a valid JSON object, else why it cannot be used."""
+    if not CONFIG_FILE.exists():
+        return ""
+    try:
+        if not isinstance(json.loads(CONFIG_FILE.read_text(encoding="utf-8")), dict):
+            return f"{CONFIG_FILE} is not a JSON object"
+    except (OSError, ValueError) as e:
+        return f"{CONFIG_FILE} cannot be read ({e})"
+    return ""
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             cfg = {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
             # Older configs have no mode (or a bad one); fall back to the default
             cfg["video_removal_mode"] = video_removal.normalize_mode(cfg.get("video_removal_mode"))
-            if not str(cfg.get("input_directory") or "").strip():
-                cfg["input_directory"] = default_input_dir()
             return cfg
         except Exception:
             pass
-    return {**DEFAULT_CONFIG, "input_directory": default_input_dir()}
+    return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg: dict):
-    """Atomic write: a crash mid-save never leaves a truncated config.json."""
+    """Atomic write: a crash mid-save never leaves a truncated config.json. The file may
+    hold the access token, so it is created readable by its owner only. An existing
+    config.json that cannot be parsed is never replaced: fix or move it by hand."""
+    if config_problem():
+        raise ConfigUnreadable(config_problem())
     tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cfg, indent=2))
     os.replace(tmp, CONFIG_FILE)
+
+
+def input_root(cfg: dict) -> Path:
+    """The configured input folder as an absolute path, or ValueError if none is set.
+    Path("") would resolve to the current folder: an empty setting must never become a target."""
+    value = str(cfg.get("input_directory") or "").strip()
+    if not value:
+        raise ValueError("No input folder is configured: choose one first")
+    return Path(value).expanduser().resolve()
 
 
 def remember_folder(key: str, path: str) -> bool:
@@ -341,7 +399,10 @@ def remember_folder(key: str, path: str) -> bool:
         return False
     cfg = load_config()
     if cfg.get(key) != str(p):
-        save_config({**cfg, key: str(p)})
+        try:
+            save_config({**cfg, key: str(p)})
+        except ConfigUnreadable:
+            return False
     return True
 
 
@@ -370,6 +431,13 @@ def validate_config(data) -> dict:
         clean[key] = value
     if "video_removal_mode" in clean and clean["video_removal_mode"] not in video_removal.MODES:
         raise ValueError(f"'video_removal_mode' must be one of: {', '.join(video_removal.MODES)}")
+    out_dir, in_dir = clean.get("output_directory", "").strip(), clean.get("input_directory", "").strip()
+    if out_dir and in_dir and clean.get("recursive", True):
+        try:
+            if video_removal.inside_folder(Path(out_dir).expanduser(), Path(in_dir).expanduser()):
+                raise ValueError("The output folder cannot be inside the input folder (it would be scanned again)")
+        except (OSError, RuntimeError):
+            pass
     if clean.get("overwrite") and clean.get("output_directory", "").strip():
         raise ValueError("Overwrite and Output Directory cannot be used together: clear the output folder or untick overwrite")
     if clean.get("schedule_cron"):
@@ -397,6 +465,33 @@ def get_token() -> str:
     return str(os.environ.get("LIVE2MOTION_TOKEN") or load_config().get("access_token") or "")
 
 
+def token_required() -> bool:
+    """A token is mandatory whenever the server is not reachable from this computer only:
+    in Docker (the container sees the published port, whatever it is bound to) and on any
+    non-loopback bind. Loopback-only native runs stay promptless."""
+    return IN_DOCKER or get_host() not in LOOPBACK_HOSTS
+
+
+def allowed_hosts() -> set:
+    """Host names a request may be addressed to: loopback, anything in
+    LIVE2MOTION_ALLOWED_HOSTS (comma separated, no port) and, when bound to one specific
+    address, that address."""
+    names = set(LOOPBACK_HOSTS)
+    names |= {h.strip().lower() for h in os.environ.get("LIVE2MOTION_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    host = get_host()
+    if host not in ("0.0.0.0", "::", ""):
+        names.add(host.lower())
+    return names
+
+
+def _is_ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
 class ApiDenied(Exception):
     def __init__(self, status: int, message: str):
         self.status, self.message = status, message
@@ -420,6 +515,8 @@ def check_origin(request: Request):
 def check_token(request: Request):
     token = get_token()
     if not token:
+        if token_required():
+            raise ApiDenied(401, "Access token required (none is configured on the server)")   # fail closed
         return
     supplied = request.headers.get("x-live2motion-token", "")
     # EventSource cannot set headers, so the progress stream also accepts a query param
@@ -430,13 +527,13 @@ def check_token(request: Request):
 
 
 def check_host_header(request: Request):
-    """Stop DNS-rebinding when only reachable locally: a loopback-bound server
-    only answers requests addressed to a loopback name."""
-    if IN_DOCKER or get_host() not in LOOPBACK_HOSTS:
+    """Stop DNS rebinding: a page on an attacker's domain whose name was re-pointed at this
+    server sends that domain as Host. Only loopback names, LIVE2MOTION_ALLOWED_HOSTS and IP
+    literals (a rebinding attack needs a DNS name) are answered, in Docker and on LAN binds too."""
+    name = (urlsplit("//" + request.headers.get("host", "")).hostname or "").lower()
+    if name in allowed_hosts() or (name and _is_ip_literal(name)):
         return
-    name = urlsplit("//" + request.headers.get("host", "")).hostname or ""
-    if name not in LOOPBACK_HOSTS:
-        raise ApiDenied(403, "Unexpected Host header")
+    raise ApiDenied(403, "Unexpected Host header")
 
 
 def api_guard(request: Request):
@@ -514,6 +611,13 @@ def check_config_paths(clean: dict):
             p = p.resolve()
         except (OSError, RuntimeError):
             raise ValueError(f"'{key}' is not a valid path")
+        if key == "video_removal_folder" and base:
+            try:
+                if video_removal.same_folder(p, Path(base).expanduser()):
+                    raise ValueError("'video_removal_folder' cannot be the input folder itself "
+                                     "(use a subfolder such as _originals)")
+            except (OSError, RuntimeError):
+                pass
         if not is_browsable(p, roots):
             raise ValueError(f"'{key}' is outside the allowed folders")
 
@@ -541,18 +645,42 @@ def install_log_redaction():
 install_log_redaction()
 
 
-def warn_if_exposed(host: str):
-    if host in LOOPBACK_HOSTS or get_token():
-        return
-    # docker-compose tells us where it publishes the port; loopback there is safe
-    if IN_DOCKER and os.environ.get("LIVE2MOTION_PUBLISH_ADDR") in LOOPBACK_HOSTS:
-        return
-    bar = "!" * 72
-    print(f"\n{bar}\n SECURITY WARNING: listening on {host} with NO access token.\n"
-          " Anyone who can reach this port can browse folders and delete videos.\n"
-          " Set LIVE2MOTION_TOKEN (or \"access_token\" in config.json), or bind to\n"
-          f" 127.0.0.1 / publish the Docker port on 127.0.0.1 only.\n{bar}\n",
-          file=sys.stderr, flush=True)
+def persist_token(token: str):
+    """Save a generated token into config.json (kept private to its owner). Tries the
+    atomic save first; a single-file Docker bind mount cannot be replaced, so it falls
+    back to rewriting the file in place."""
+    cfg = {**load_config(), "access_token": token}
+    try:
+        save_config(cfg)
+    except OSError:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=2))
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def ensure_token(host: str) -> Optional[str]:
+    """Make sure a non-loopback / Docker server has a token. Returns a newly generated
+    token (saved to config.json, mode 0600) or None if one was already configured or none
+    is needed. Raises SystemExit if no token can be established: the server must not
+    start open to the network."""
+    if config_problem():
+        raise SystemExit(f"Refusing to start: {config_problem()}. Fix or remove it (it was not touched).")
+    if not token_required() or get_token():
+        return None
+    token = secrets.token_urlsafe(32)
+    try:
+        persist_token(token)
+    except (OSError, ConfigUnreadable) as e:
+        bar = "!" * 72
+        print(f"\n{bar}\n Refusing to start: listening on {host} needs an access token and none is\n"
+              f" configured. Could not save a generated one ({e}).\n"
+              f" Set LIVE2MOTION_TOKEN (or \"access_token\" in config.json), or bind to 127.0.0.1.\n{bar}\n",
+              file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    return token
 
 
 # ─── Run logic ────────────────────────────────────────────────────────────────
@@ -778,10 +906,13 @@ def preview_status() -> dict:
     done = last_preview.get("done", set())
     with _preview_lock:
         rows = [{**r, "kind": classify_row(r), "done": r["file"] in done} for r in last_preview.get("rows", [])]
-    root_dir = Path(load_config().get("input_directory") or "")
+    try:
+        root_dir = input_root(load_config())
+    except ValueError:
+        root_dir = None
     for r in rows:
         r["state"] = "converted" if r["done"] else r["kind"]
-        if r["kind"] in ("motion_leftover", "duplicate_video") and r.get("video"):
+        if root_dir and r["kind"] in ("motion_leftover", "duplicate_video") and r.get("video"):
             r["bytes"] = video_removal.file_size(root_dir / r["video"])
     counts: dict = {}
     for r in rows:
@@ -807,7 +938,10 @@ def bin_applies(cfg: dict, action: str) -> bool:
 def bin_load(files: list, rows: list, cfg: dict, action: str) -> tuple:
     """(bytes, items) these files would send to the bin, from the Preview rows."""
     rowmap = {r["file"]: r for r in rows}
-    root = Path(cfg.get("input_directory") or "")
+    try:
+        root = input_root(cfg)
+    except ValueError:
+        return 0, 0
     total, items = 0, 0
     for f in dict.fromkeys(files):
         r = rowmap.get(f)
@@ -848,7 +982,7 @@ def validate_selected(preview_id, files, cfg: dict, preview: dict, skipped: Opti
         raise ValueError("Preview is out of date: settings changed since the preview")
     if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
         raise ValueError("'files' must be a non-empty list of paths")
-    root = Path(cfg.get("input_directory") or "").expanduser().resolve()
+    root = input_root(cfg)
     if not root.is_dir() or not is_browsable(root, browse_roots()):
         raise ValueError("Input directory is not available")
     out = []
@@ -886,6 +1020,11 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         cfg.update(extract)
     if dry_run is not None:
         cfg["dry_run"] = dry_run      # per-request override of the config toggle
+    if not (extract is not None and cfg.get("input_file")) and not str(cfg.get("input_directory") or "").strip():
+        run_state.emit(f"▶ Triggered by: {trigger}")
+        run_state.emit("✗ No input folder is configured: choose one first. Nothing was run.")
+        run_state.finish(2)
+        return
     only_path = None
     if only_files and extract is None:
         import tempfile
@@ -946,7 +1085,7 @@ def apply_schedule(cfg: dict):
         scheduler.remove_job("mp_cron")
     except Exception:
         pass
-    if cfg.get("schedule_enabled") and cfg.get("schedule_cron"):
+    if cfg.get("schedule_enabled") and cfg.get("schedule_cron") and str(cfg.get("input_directory") or "").strip():
         try:
             scheduler.add_job(
                 lambda: threading.Thread(target=do_run, args=("schedule",), daemon=True).start(),
@@ -1076,7 +1215,7 @@ class MediaHandler(FileSystemEventHandler):
 def start_watcher(cfg: dict):
     global watch_observer
     stop_watcher()
-    path = cfg.get("input_directory", "")
+    path = str(cfg.get("input_directory") or "").strip()
     if path and os.path.isdir(path):
         watch_observer = Observer()
         skip = video_removal.skip_folders(path, cfg.get("video_removal_folder"))
@@ -1128,6 +1267,8 @@ def root():
 def api_get_config():
     cfg = load_config()
     out = {k: cfg[k] for k in CONFIG_TYPES}   # never expose host/access_token
+    # Offered only until a config has ever been saved; the UI pre-fills an empty field, the server never does
+    out["suggested_input_directory"] = "" if CONFIG_FILE.exists() else suggested_input_dir()
     out["docker"] = IN_DOCKER                 # the UI explains that Recycle Bin falls back to a folder there
     # folders that no longer exist (drive unplugged, renamed...): the UI shows a warning
     out["missing_paths"] = [k for k in ("input_directory", "output_directory")
@@ -1156,10 +1297,16 @@ async def api_save_config(request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
     # Keep server-side settings (host, access_token, browse_roots) the UI can't see
     cfg = {**load_config(), **cfg}
+    if (cfg.get("schedule_enabled") or cfg.get("watch_enabled")) and not str(cfg.get("input_directory") or "").strip():
+        return JSONResponse({"error": "Choose an input folder before enabling the schedule or the folder watcher"},
+                            status_code=400)
     if cfg.get("overwrite") and str(cfg.get("output_directory") or "").strip():
         return JSONResponse({"error": "Overwrite and Output Directory cannot be used together: "
                                       "clear the output folder or untick overwrite"}, status_code=400)
-    save_config(cfg)
+    try:
+        save_config(cfg)
+    except ConfigUnreadable as e:
+        return JSONResponse({"error": f"Settings not saved: {e}. Fix or remove config.json first."}, status_code=409)
     apply_schedule(cfg)
     if cfg.get("watch_enabled"):
         start_watcher(cfg)
@@ -1226,7 +1373,7 @@ async def api_cleanup_movs(request: Request):
             raise ValueError("Preview is out of date: settings changed since the preview")
         if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
             raise ValueError("'files' must be a non-empty list of paths")
-        root = Path(cfg.get("input_directory") or "").expanduser().resolve()
+        root = input_root(cfg)
         if not root.is_dir() or not is_browsable(root, browse_roots()):
             raise ValueError("Input directory is not available")
         rowmap = {r["file"]: r for r in pv.get("rows", [])}
@@ -1237,10 +1384,22 @@ async def api_cleanup_movs(request: Request):
         msg = str(e)
         stale = "Preview" in msg or "changed" in msg
         return JSONResponse({"error": msg, "stale": stale}, status_code=409 if stale else 400)
+    unreadable = [r["file"] for r in pv.get("rows", []) if str(r.get("reason", "")).lower().startswith("unreadable")]
+    if unreadable:
+        # An unreadable photo has no known Live Photo id: no leftover video can be proven unneeded
+        shown = ", ".join(unreadable[:5]) + (", ..." if len(unreadable) > 5 else "")
+        return JSONResponse({"error": f"Cleanup refused: this Preview has {len(unreadable)} unreadable photo(s) "
+                                      f"({shown}). Fix or move them, then run Preview again.",
+                             "unreadable": unreadable}, status_code=409)
     rep = bin_check(files, pv.get("rows", []), cfg, "cleanup")
     if not rep["ok"]:
         return bin_refusal(rep)
-    return cleanup_movs(files, rowmap, cfg, root)
+    if not run_state.start("cleanup", reset=False):      # the run lock: never while a run (or watcher run) is going
+        return JSONResponse({"error": "Already running"}, status_code=409)
+    try:
+        return cleanup_movs(files, rowmap, cfg, root)
+    finally:
+        run_state.release()
 
 
 @app.post("/api/bin-check")
@@ -1323,6 +1482,8 @@ def api_run(dry_run: Optional[bool] = None):
     """dry_run=true|false overrides the saved "dry_run" setting for this run."""
     if run_state.running:
         return JSONResponse({"error": "Already running"}, status_code=409)
+    if not str(load_config().get("input_directory") or "").strip():
+        return JSONResponse({"error": "No input folder is configured: choose one first"}, status_code=400)
     threading.Thread(target=do_run, args=("manual", dry_run), daemon=True).start()
     return {"ok": True}
 
@@ -1537,185 +1698,6 @@ def api_browse(path: str = ""):
         return JSONResponse({"error": "Permission denied"}, status_code=403)
 
 
-VIDEO_EXTS = {".mov", ".mp4"}
-PHOTO_EXTS = {".heic", ".jpg", ".jpeg"}
-MAX_LIVE_PHOTO_SECS = 5.0
-
-
-def _batch_tag(paths: list[str], tag: str) -> dict[str, str]:
-    """Return {path: tag_value} for a list of files, via one exiftool call."""
-    values: dict[str, str] = {}
-    if not paths:
-        return values
-    chunk = 500
-    for i in range(0, len(paths), chunk):
-        batch = paths[i:i + chunk]
-        try:
-            r = subprocess.run(
-                ["exiftool", "-q", "-p", f"$SourceFile\t${tag}"] + batch,
-                capture_output=True, text=True, timeout=60,
-            )
-            for line in r.stdout.splitlines():
-                parts = line.split("\t", 1)
-                if len(parts) == 2 and parts[1].strip():
-                    values[parts[0]] = parts[1].strip()
-        except Exception:
-            pass
-    return values
-
-
-def _batch_durations(video_paths: list[str]) -> dict[str, float]:
-    """Return {path: duration_secs} for a list of video files, via one exiftool call."""
-    durations: dict[str, float] = {}
-    if not video_paths:
-        return durations
-    chunk = 500
-    for i in range(0, len(video_paths), chunk):
-        batch = video_paths[i:i + chunk]
-        try:
-            r = subprocess.run(
-                ["exiftool", "-q", "-p", "$SourceFile\t$Duration#"] + batch,
-                capture_output=True, text=True, timeout=60,
-            )
-            for line in r.stdout.splitlines():
-                parts = line.strip().split("\t", 1)
-                if len(parts) == 2:
-                    try:
-                        durations[parts[0]] = float(parts[1])
-                    except ValueError:
-                        durations[parts[0]] = 999.0
-        except Exception:
-            pass
-    return durations
-
-
-def _walk_media(input_dir: str) -> tuple[list[str], list[str]]:
-    """Recursively collect (photo_paths, video_paths) under input_dir, any subfolder."""
-    photo_paths, video_paths = [], []
-    skip = {str(f) for f in video_removal.skip_folders(input_dir, load_config().get("video_removal_folder"))}
-    for root, _dirs, files in os.walk(input_dir, followlinks=True):
-        _dirs[:] = [d for d in _dirs if str(Path(root, d).resolve()) not in skip]   # don't rescan removed videos
-        try:
-            for f in files:
-                fp = Path(root) / f
-                suf = fp.suffix.lower()
-                if suf in VIDEO_EXTS:
-                    video_paths.append(str(fp))
-                elif suf in PHOTO_EXTS:
-                    photo_paths.append(str(fp))
-        except OSError:
-            continue   # skip unreadable/unmounted symlink targets
-    return photo_paths, video_paths
-
-
-def _pair_by_content_id(photo_paths: list[str], video_paths: list[str]) -> list[tuple[str, str]]:
-    """Pair photos to videos by Apple's ContentIdentifier tag — the same identifier
-    MotionPhoto2's --exif-match mode uses (motionphoto2.py's content_id_to_video map),
-    so folder location and filename never matter, only the id embedded in both files."""
-    photo_ids = _batch_tag(photo_paths, "MakerNotes:ContentIdentifier")
-    video_ids = _batch_tag(video_paths, "QuickTime:ContentIdentifier")
-
-    id_to_video: dict[str, str] = {}
-    for path, cid in video_ids.items():
-        id_to_video.setdefault(cid, path)
-
-    return [(photo, id_to_video[cid]) for photo, cid in photo_ids.items() if cid in id_to_video]
-
-
-def _filter_deletable(pairs: list[tuple[str, str]]) -> tuple[list[dict], int]:
-    """Given (photo, video) pairs matched by ContentIdentifier, keep only those where
-    the video is short enough to be a Live Photo clip AND the photo is confirmed to
-    contain an identical copy of it — only then is the standalone video
-    truly redundant and safe to offer for deletion."""
-    if not pairs:
-        return [], 0
-
-    # Standalone clips longer than a Live Photo must never be offered for deletion,
-    # even if they coincidentally share a ContentIdentifier lookup.
-    vid_paths = list({v for _, v in pairs})
-    durations = _batch_durations(vid_paths)
-    pairs = [(p, v) for p, v in pairs if durations.get(v, 999.0) <= MAX_LIVE_PHOTO_SECS]
-    if not pairs:
-        return [], 0
-
-    # Offer a video only if the photo really contains it: the embedded video must
-    # equal the standalone one in size and SHA-256 (a ContentIdentifier match, or
-    # a different clip that shares one, is not proof).
-    muxed: set[tuple[str, str]] = set()
-    for photo, vid in pairs:
-        problem = video_removal.verify_embedded_video(photo, vid)
-        if problem == "":
-            muxed.add((photo, vid))
-
-    videos, total_bytes, seen = [], 0, set()
-    for photo, vid in pairs:
-        if (photo, vid) in muxed and vid not in seen:
-            seen.add(vid)
-            try:
-                size = Path(vid).stat().st_size
-            except OSError:
-                continue
-            videos.append({"path": vid, "name": Path(vid).name, "size": size})
-            total_bytes += size
-    return videos, total_bytes
-
-
-@app.get("/api/cleanup-preview")
-def api_cleanup_preview():
-    """Videos paired (by ContentIdentifier) with photos logged as skipped (already
-    muxed) in the last run. Searches the whole input directory tree, not just the
-    photo's own folder, since the true pair can live in any subfolder."""
-    photos = run_state.skipped_files
-    if not photos or not run_state.input_dir or not Path(run_state.input_dir).is_dir():
-        return {"count": 0, "total_bytes": 0, "videos": [], "skipped_photos": len(photos)}
-
-    _, video_paths = _walk_media(run_state.input_dir)
-    pairs = _pair_by_content_id(photos, video_paths)
-    videos, total_bytes = _filter_deletable(pairs)
-    return {"count": len(videos), "total_bytes": total_bytes, "videos": videos,
-            "skipped_photos": len(photos)}
-
-
-@app.get("/api/cleanup-scan")
-def api_cleanup_scan():
-    """Walk the whole input directory tree and find video files whose ContentIdentifier
-    matches a photo that's already a motion photo — mirroring exactly how MotionPhoto2's
-    --exif-match mode pairs files, so folder location and filename never matter."""
-    cfg = load_config()
-    input_dir = cfg.get("input_directory", "")
-    if not input_dir or not Path(input_dir).is_dir():
-        return JSONResponse({"error": "Input directory not configured or not found"}, status_code=400)
-
-    photo_paths, video_paths = _walk_media(input_dir)
-    if not photo_paths or not video_paths:
-        return {"count": 0, "total_bytes": 0, "videos": [], "scanned": 0}
-
-    pairs = _pair_by_content_id(photo_paths, video_paths)
-    videos, total_bytes = _filter_deletable(pairs)
-    return {"count": len(videos), "total_bytes": total_bytes, "videos": videos,
-            "scanned": len(pairs)}
-
-
-@app.delete("/api/cleanup")
-async def api_cleanup(request: Request):
-    """Remove a list of video files by path (inside the input directory only),
-    using the configured video_removal_mode."""
-    body = await request.json()
-    paths = body.get("paths", [])
-    cfg = load_config()
-    root = cfg.get("input_directory", "")
-    if not root or not Path(root).is_dir():
-        return JSONResponse({"error": "Input directory not configured or not found"}, status_code=400)
-    deleted, errors = [], []
-    for path in paths:
-        try:
-            video_removal.remove_video(path, cfg["video_removal_mode"], root, cfg.get("video_removal_folder"))
-            deleted.append(path)
-        except Exception as e:
-            errors.append({"file": path, "error": str(e)})
-    return {"deleted": len(deleted), "errors": errors}
-
-
 DEFAULT_PORT = 7000
 PORT_FILE = BASE_DIR / ".port"
 
@@ -1735,6 +1717,8 @@ def find_available_port(preferred: int, host: str = "127.0.0.1", attempts: int =
 
 if __name__ == "__main__":
     host = get_host()
+    if config_problem():
+        raise SystemExit(f"Refusing to start: {config_problem()}. Fix or remove it (it was not touched).")
     port = find_available_port(DEFAULT_PORT, host)
     if port != DEFAULT_PORT:
         print(f"Port {DEFAULT_PORT} is already in use - using port {port} instead.")
@@ -1743,5 +1727,11 @@ if __name__ == "__main__":
     except OSError:
         pass
     print(f"Live2Motion Photos will be available at http://localhost:{port} (listening on {host})")
-    warn_if_exposed(host)
+    new_token = ensure_token(host)
+    if new_token:
+        print("\nThis server is reachable beyond this computer, so it needs an access token.\n"
+              "A new one was generated and saved to config.json (readable by you only).\n"
+              f"Open this link once; the browser remembers it:\n  http://localhost:{port}/?token={new_token}\n", flush=True)
+    elif token_required():
+        print("Access token required: set up from LIVE2MOTION_TOKEN or \"access_token\" in config.json.", flush=True)
     uvicorn.run("app:app", host=host, port=port, reload=False, log_level="info")

@@ -3,6 +3,7 @@ import exiftool
 import os
 import sys
 import shutil
+import tempfile
 
 from pathlib import Path
 from lxml import etree
@@ -14,12 +15,13 @@ from utils import (
     extract_still_image_time,
     read_file,
     enrich_fname,
-    atomic_write,
+    write_temp,
     output_with_extension,
     output_conflict,
+    ALREADY_CONVERTED,
     claim_output,
 )
-from video_removal import jpeg_scan_tail, heic_image_items, find_embedded_video, verify_muxed_output, remove_video, dispose_file, normalize_mode
+from video_removal import has_line_break, LINE_BREAK_REASON, publish_no_overwrite, jpeg_scan_tail, heic_image_items, find_embedded_video, verify_muxed_output, remove_video, dispose_file, normalize_mode
 
 import constants as const
 from SamsungTags import SamsungTags
@@ -35,6 +37,11 @@ logging.basicConfig(
 class MuxerInputError(Exception):
     """Raised for per-file input problems (missing image/video) that should
     be skipped rather than aborting a whole directory batch."""
+    pass
+
+
+class AlreadyConvertedError(MuxerInputError):
+    """The output exists and already holds this video: skipped, never replaced."""
     pass
 
 
@@ -82,6 +89,9 @@ class Muxer:
         self.claimed_outputs = claimed_outputs
         self.exiftool = exiftool
 
+        if has_line_break(self.image_fpath) or has_line_break(self.video_fpath):
+            raise MuxerInputError(LINE_BREAK_REASON)
+
         if os.path.isfile(self.image_fpath) is False:
             self.logger.error("Image file doesn't exist")
             raise MuxerInputError("Image file doesn't exist")
@@ -124,6 +134,9 @@ class Muxer:
             )
         )
         
+        if has_line_break(self.output_fpath):
+            raise MuxerInputError(LINE_BREAK_REASON)
+
         self.org_outfpath = self.output_fpath
 
         self.delete_temp = delete_temp
@@ -219,11 +232,32 @@ class Muxer:
         """Never write over a file that is not the photo being replaced."""
         rerun_ok = not self.overwrite and self.output_fpath == self.org_outfpath
         why = output_conflict(self.output_fpath, self.image_fpath, self.video_fpath,
-                              self.claimed_outputs, rerun_ok=rerun_ok)
+                              self.claimed_outputs, rerun_ok=rerun_ok, overwrite=self.overwrite)
         if why:
+            if why.startswith(ALREADY_CONVERTED):
+                self.logger.info(why)
+                raise AlreadyConvertedError(why)
             self.logger.error(why)
             raise OutputConflictError(why)
         claim_output(self.claimed_outputs, self.output_fpath)
+
+    def _keep_merged(self, new_fpath: str) -> str:
+        """Give the kept merged photo a visible unique name next to the output
+        (`IMG (merged).HEIC`, `IMG (merged) (2).HEIC`...); if that fails it stays at its temp path."""
+        out = Path(self.output_fpath)
+        try:
+            if os.path.exists(out):
+                a, b = os.stat(new_fpath), os.stat(out)
+                # Only trust "same file" when both file ids are really known (0 means unknown)
+                if a.st_ino and b.st_ino and a.st_dev and b.st_dev and os.path.samestat(a, b):
+                    return str(out)               # the publish itself had worked: only the temp name is left
+                self.logger.warning("Cannot prove that %s is the merged photo: keeping a separate copy", out)
+        except OSError:
+            pass
+        try:
+            return str(publish_no_overwrite(new_fpath, out.with_name(f"{out.stem} (merged){out.suffix}")))
+        except Exception:
+            return new_fpath
 
     def merge_xmp(self, xmp: str):
         try:
@@ -329,12 +363,18 @@ class Muxer:
             if image_type == "jpg":
                 self.set_microvideo_tags(samsung_tail.get_video_size())
 
-            xmp_updated = self.output_fpath + ".XMP"
+            # Temp files get random mkstemp names: a name derived from the photo (IMG.HEIC.XMP)
+            # can be the user's own sidecar (darktable / digiKam IMG.HEIC.xmp) on a
+            # case-insensitive file system.
+            out_dir = os.path.dirname(os.path.abspath(self.output_fpath))
+            fd, xmp_updated = tempfile.mkstemp(dir=out_dir, prefix=".mp2xmp.", suffix=".xmp")
             self._tmp_files.append(xmp_updated)
-            with open(xmp_updated, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
                 f.write(etree.tostring(self.xmp, pretty_print=True))
 
-            xmp_image = enrich_fname(self.output_fpath, "XMP")
+            # exiftool picks the file type from the extension, so keep the photo's
+            fd, xmp_image = tempfile.mkstemp(dir=out_dir, prefix=".mp2xmp.", suffix=Path(self.output_fpath).suffix)
+            os.close(fd)
             self._tmp_files.append(xmp_image)
             shutil.copyfile(self.image_fpath, xmp_image)
             self.exiftool.execute(
@@ -368,35 +408,59 @@ class Muxer:
         video_footer = samsung_tail.video_footer()
         merged_bytes += video_footer
 
-        # Overwrite keeps the original photo (trash / move) unless mode is "delete":
-        # write the merged file next to it first, then set the original aside, then
-        # move the new file into place. One of the two always exists.
+        # Always write the merged photo to a unique temp file next to the output first and
+        # verify it; only then does it take its final name. Overwrite keeps the original
+        # (trash / move) unless mode is "delete": the original is set aside before the new
+        # file moves into place, so one of the two always exists.
         protect = self.overwrite is True and normalize_mode(self.video_removal_mode) != "delete"
         self.logger.info("Writing output file: %s", self.output_fpath)
-        new_fpath = None
-        if protect:
-            new_fpath = os.path.join(os.path.dirname(self.output_fpath), ".mp2new." + os.path.basename(self.output_fpath))
-            atomic_write(new_fpath, merged_bytes, stat_from=self.image_fpath)
+        new_fpath = write_temp(os.path.dirname(os.path.abspath(self.output_fpath)), merged_bytes,
+                               stat_from=self.image_fpath)
+        original_set_aside = False
+        try:
             problem = verify_muxed_output(new_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)
             if problem:
-                os.remove(new_fpath)
                 raise MuxerInputError(f"Original kept, merged output failed verification: {problem}")
-            try:
-                action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
-                                      root=self.video_removal_root, folder=self.video_removal_folder)
-            except BaseException:
-                os.remove(new_fpath)    # original untouched
-                raise
-            self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
-            os.replace(new_fpath, self.output_fpath)
-        else:
-            atomic_write(self.output_fpath, merged_bytes, stat_from=self.image_fpath)
-
-        if self.delete_temp is True and xmp_updated is not None:
-            os.remove(xmp_updated)
-            self.logger.debug("Delete: %s", xmp_updated)
-            os.remove(xmp_image)
-            self.logger.debug("Delete: %s", xmp_image)
+            if protect:
+                # From here on the merged file may be the only copy: set before dispose_file so a
+                # Cancel / Ctrl+C in the middle of it can never delete the merged file.
+                original_set_aside = True
+                try:
+                    action = dispose_file(self.image_fpath, mode=self.video_removal_mode,
+                                          root=self.video_removal_root, folder=self.video_removal_folder)
+                except BaseException:
+                    # Whatever happened inside, the merged file is never deleted now: a duplicate
+                    # is acceptable, a loss is not.
+                    kept = self._keep_merged(new_fpath)
+                    self.logger.error("Setting the original aside failed or was interrupted. The verified merged "
+                                      "photo is kept at %s (the original is in the removal folder or the "
+                                      "trash, or still in place)", kept)
+                    raise
+                self.logger.debug("Original photo set aside (%s): %s", action, self.image_fpath)
+                # the original is gone from its place: never replace anything that appeared there since
+                try:
+                    self.output_fpath = str(publish_no_overwrite(new_fpath, self.output_fpath))
+                except BaseException as e:
+                    kept = self._keep_merged(new_fpath)
+                    msg = (f"Could not put the merged photo in place ({e}). The original was set aside ({action}) "
+                           f"and the verified merged photo is kept at {kept}")
+                    self.logger.error(msg)
+                    if isinstance(e, Exception):
+                        raise MuxerInputError(msg) from e
+                    raise                    # Cancel / Ctrl+C: stop the run, nothing was removed
+            elif self.overwrite is True:
+                os.replace(new_fpath, self.output_fpath)       # "delete" mode, verified above
+            else:
+                try:
+                    publish_no_overwrite(new_fpath, self.output_fpath, unique=False)
+                except FileExistsError:
+                    raise OutputConflictError(f"output would overwrite {self.output_fpath}, which appeared during the conversion")
+        finally:
+            if not original_set_aside:         # afterwards it may be the only copy: never remove it
+                try:
+                    os.remove(new_fpath)       # still there only if it was not published
+                except FileNotFoundError:
+                    pass
 
         if self.delete_video is True:
             problem = verify_muxed_output(self.output_fpath, self.video_fpath, video_offset, image_size, image_scan, image_end, heic_items)

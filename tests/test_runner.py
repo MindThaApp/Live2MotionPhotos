@@ -62,7 +62,7 @@ def test_popen_decodes_utf8_filenames(monkeypatch, tmp_path):
     out = tmp_path / "o.py"
     out.write_text("import sys;sys.stdout.buffer.write('caf\\u00e9 \\u65e5\\u672c\\n'.encode('utf-8')+b'\\xff\\n')")
     monkeypatch.setattr(appmod, "BIN", [sys.executable, str(out)])
-    monkeypatch.setattr(appmod, "load_config", lambda: {**appmod.DEFAULT_CONFIG, "input_directory": ""})
+    monkeypatch.setattr(appmod, "load_config", lambda: {**appmod.DEFAULT_CONFIG, "input_directory": str(tmp_path)})
     st = appmod.RunState()
     monkeypatch.setattr(appmod, "run_state", st)
     appmod.do_run("test")

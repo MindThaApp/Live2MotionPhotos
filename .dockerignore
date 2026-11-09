@@ -6,3 +6,7 @@ __pycache__/
 config.json
 *.log
 .DS_Store
+.env
+preview.json
+.port
+config.json.tmp

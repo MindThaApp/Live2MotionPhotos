@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import constants as const
-from video_removal import find_embedded_video
+from video_removal import find_embedded_video, publish_no_overwrite, has_line_break, LINE_BREAK_REASON
 
 
 def extract_track_number(metadata: str) -> str:
@@ -43,11 +43,11 @@ def read_file(fpath: str) -> bytes:
         return f.read()
 
 
-def atomic_write(target: str, data: bytes, stat_from: str = None) -> None:
-    """Write data to target atomically: temp file in the same directory,
-    flush + fsync, then os.replace. The target is untouched if anything fails."""
-    directory = os.path.dirname(os.path.abspath(target))
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mp2tmp.", suffix=".part")
+def write_temp(directory: str, data: bytes, stat_from: str = None, suffix: str = ".part") -> str:
+    """Write data to a new, uniquely named temp file (mkstemp, never derived from a
+    photo's name) in `directory`: flush + fsync, optionally copy the timestamps/mode
+    of `stat_from`. Returns its path; the temp file is removed if anything fails."""
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mp2tmp.", suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -55,7 +55,25 @@ def atomic_write(target: str, data: bytes, stat_from: str = None) -> None:
             os.fsync(f.fileno())
         if stat_from is not None:
             shutil.copystat(stat_from, tmp)
-        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return tmp
+
+
+def atomic_write(target: str, data: bytes, stat_from: str = None, exclusive: bool = False) -> None:
+    """Write data to target atomically: temp file in the same directory,
+    flush + fsync, then os.replace. The target is untouched if anything fails.
+    exclusive=True never replaces an existing target (FileExistsError instead)."""
+    tmp = write_temp(os.path.dirname(os.path.abspath(target)), data, stat_from)
+    try:
+        if exclusive:
+            publish_no_overwrite(tmp, target, unique=False)
+        else:
+            os.replace(tmp, target)
     except BaseException:
         try:
             os.remove(tmp)
@@ -77,12 +95,18 @@ def _norm_path(path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
-def output_conflict(output: str, source: str, video: str = None, claimed=None, rerun_ok: bool = False):
+ALREADY_CONVERTED = "already converted"
+
+
+def output_conflict(output: str, source: str, video: str = None, claimed=None, rerun_ok: bool = False,
+                    overwrite: bool = False):
     """Why writing `output` for `source` would destroy another file, or None if it is safe.
 
-    Safe: the output is the source itself (overwrite), or does not exist yet. With
-    rerun_ok (the name comes straight from the source, not overwrite mode) an existing
-    file that already contains this video is an earlier result of the same conversion.
+    Safe: the output is the source itself and `overwrite` was asked for, or the output does
+    not exist yet. Without overwrite the source itself is never a valid output, and the
+    source video never is. With rerun_ok (the name comes straight from the source, not
+    overwrite mode) an existing file that already contains this video is reported as
+    "already converted": skipped, never replaced (the user may have edited it since).
     `claimed` is a set shared by the whole run: two sources must not map to one output."""
     key = _norm_path(output)
     if claimed is not None and key in claimed:
@@ -91,11 +115,20 @@ def output_conflict(output: str, source: str, video: str = None, claimed=None, r
         same = os.path.samefile(output, source)
     except OSError:
         same = _norm_path(output) == _norm_path(source)
+    if video:
+        try:
+            if os.path.samefile(output, video):
+                return f"output would overwrite {output}, which is the source video"
+        except OSError:
+            if _norm_path(output) == _norm_path(video):
+                return f"output would overwrite {output}, which is the source video"
     if same:
-        return None
+        if overwrite:
+            return None
+        return f"output would overwrite {output}, which is the source photo itself (overwrite is off)"
     if os.path.lexists(output):
         if rerun_ok and video and input_output_binary_compare(video, output):
-            return None
+            return f"{ALREADY_CONVERTED}: {output} already exists and holds this video (never replaced)"
         return f"output would overwrite {output}, an existing file that is not this photo"
     return None
 
@@ -132,6 +165,8 @@ def exiftool_message(e) -> str:
 
 
 def is_motion_photo(fpath: str, et: exiftool.ExifToolHelper) -> bool:
+    if has_line_break(fpath):
+        raise ValueError(LINE_BREAK_REASON)    # would be read as exiftool arguments
     # 1. Samsung trailer (also what this tool writes): a few bytes from the end of
     #    the file, no exiftool and no video extraction.
     if find_embedded_video(fpath, use_xmp=False):

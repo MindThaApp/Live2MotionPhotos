@@ -62,6 +62,7 @@ def test_env_overrides(fake_bin, monkeypatch):
     assert rep["cap"] == 10 * 1024 * 1024 and not rep["ok"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows never assumes a cap")
 def test_default_cap_is_5_percent_of_drive(monkeypatch):
     monkeypatch.setattr(vr, "read_bin_settings", lambda p: {"cap": None, "nuke": False, "source": "default"})
     monkeypatch.setattr(vr, "read_bin_usage", lambda p: None)
@@ -69,6 +70,17 @@ def test_default_cap_is_5_percent_of_drive(monkeypatch):
     rep = vr.bin_report(10 * GB, 2, ".")
     assert rep["cap"] == 50 * GB and rep["cap_source"] == "default" and rep["ok"]
     assert not vr.bin_report(30 * GB, 2, ".")["ok"]
+
+
+def test_windows_unknown_cap_refuses(monkeypatch):
+    monkeypatch.setattr(vr, "is_windows", lambda: True)
+    monkeypatch.setattr(vr, "trash_unavailable_reason", lambda p: "")
+    monkeypatch.setattr(vr, "read_bin_settings", lambda p: {"cap": None, "nuke": False, "source": "default"})
+    monkeypatch.setattr(vr, "read_bin_usage", lambda p: None)
+    monkeypatch.setattr(vr, "drive_size", lambda p: 1000 * GB)
+    monkeypatch.delenv("L2M_BIN_CAP_MB", raising=False)
+    rep = vr.bin_report(1, 1, ".")
+    assert not rep["ok"] and rep["cap_source"] == "unknown"
 
 
 def test_unknown_cap_refused(monkeypatch):

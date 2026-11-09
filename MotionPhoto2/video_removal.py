@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import struct
+import tempfile
 
 from pathlib import Path
 from typing import Optional
@@ -23,8 +24,59 @@ DEFAULT_FOLDER_NAME = "_originals"
 LEGACY_FOLDER_NAMES = ("_deleted_videos",)   # previous default, still ignored by scans
 
 
+def has_line_break(path) -> bool:
+    """True if a path contains a newline or carriage return. pyexiftool passes its
+    arguments to exiftool one per line, so such a name would be read as extra
+    arguments (e.g. -overwrite_original): these files are skipped and reported."""
+    s = str(path)
+    return "\n" in s or "\r" in s
+
+
+LINE_BREAK_REASON = "file name contains a line break (not handled safely by exiftool), skipped"
+
+
 def in_docker() -> bool:
     return os.path.exists("/.dockerenv") or os.environ.get("LIVE2MOTION_DOCKER") == "1"
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+TRASH_HINT = "Use 'Move to folder' instead."
+DRIVE_FIXED = 3                  # GetDriveTypeW: a local hard disk (2 removable, 4 network, 5 CD, 6 RAM)
+
+
+def trash_unavailable_reason(path) -> str:
+    """Why "trash" must not be used for files at `path`, or "" if it is safe. The legacy
+    send2trash backend on Windows (SHFileOperation) silently deletes for good on network,
+    UNC and removable drives (no Recycle Bin there); in Docker it writes a hidden
+    .Trash-<uid> folder into the mounted photo folder. Nothing falls back silently."""
+    if in_docker():
+        return "there is no Recycle Bin in Docker (the files would land in a hidden .Trash folder of the mounted folder)"
+    if is_windows():
+        if str(path).startswith(("\\\\", "//")) or os.path.abspath(str(path)).startswith("\\\\"):
+            return "network (UNC) folders have no Recycle Bin, files would be deleted permanently"
+        p = os.path.abspath(str(path))
+        try:
+            import ctypes
+            # The real volume of the folder, not just its drive letter: a USB stick or
+            # network share can be mounted into a folder of a fixed drive (C:\\mnt\\usb).
+            buf = ctypes.create_unicode_buffer(1024)
+            if not ctypes.windll.kernel32.GetVolumePathNameW(p, buf, 1024) or not buf.value:
+                raise OSError("GetVolumePathNameW failed")
+            if buf.value.startswith("\\\\"):
+                return "network (UNC) folders have no Recycle Bin, files would be deleted permanently"
+            kind = ctypes.windll.kernel32.GetDriveTypeW(buf.value)
+        except Exception:
+            return "the drive type could not be determined, so a permanent delete cannot be ruled out"
+        if kind != DRIVE_FIXED:
+            return "only local fixed drives have a Recycle Bin (network and removable drives delete permanently)"
+    return ""
+
+
+class TrashUnavailable(Exception):
+    """Mode "trash" is refused for these files (message is user-facing)."""
 
 
 def default_mode() -> str:
@@ -45,6 +97,39 @@ def removal_folder(root, folder=None) -> Path:
         return root / DEFAULT_FOLDER_NAME
     folder = Path(folder)
     return (folder if folder.is_absolute() else root / folder).resolve()
+
+
+OWN_TEMP_PREFIXES = (".mp2tmp.", ".mp2xmp.", ".mp2mv.")     # the app's own temp files
+
+
+def is_own_temp(name: str) -> bool:
+    return str(name).lower().startswith(OWN_TEMP_PREFIXES)
+
+
+def same_folder(a, b) -> bool:
+    """Same folder? samefile when both exist (catches symlinks and case-insensitive file
+    systems such as macOS/Windows), else a normcase + resolve comparison."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+
+
+def inside_folder(path, parent) -> bool:
+    """Is path the folder `parent` or below it? Compares every ancestor with same_folder,
+    so differently-cased spellings of one folder are recognised."""
+    p = Path(path).resolve()
+    return any(same_folder(x, parent) for x in (p, *p.parents))
+
+
+def skip_dir_name(name: str) -> bool:
+    """Folder names a scan never enters at any depth: our own removal folders (and the
+    legacy one) and trash folders (.Trash-1000, .Trash, $RECYCLE.BIN) that the trash
+    backends create inside the scanned folder. Their files are already set aside."""
+    low = str(name).lower()
+    return (is_own_temp(low)
+            or low in (DEFAULT_FOLDER_NAME.lower(), *(n.lower() for n in LEGACY_FOLDER_NAMES), "$recycle.bin")
+            or low.startswith(".trash"))
 
 
 def skip_folders(root, folder=None) -> list:
@@ -431,15 +516,119 @@ def verify_embedded_video(photo_path, video_path) -> str:
     return ""
 
 
-def _unique_path(dest: Path) -> Path:
-    if not dest.exists():
-        return dest
+def numbered_name(dest: Path, n: int) -> Path:
+    """dest for attempt n: n <= 1 is dest itself, then `name (2).ext`, `name (3).ext`..."""
+    return dest if n <= 1 else dest.with_name(f"{dest.stem} ({n}){dest.suffix}")
+
+
+def publish_no_overwrite(tmp, dest, unique: bool = True) -> Path:
+    """Give the finished temp file `tmp` its final name `dest` without ever replacing an
+    existing file, and consume tmp. An os.link is atomic and fails if dest exists; where
+    hard links are unavailable, an O_EXCL placeholder claims the name before the rename.
+    unique=True picks `name (2).ext`, ... when dest is taken; unique=False raises
+    FileExistsError (tmp is then left for the caller to remove)."""
+    dest = Path(dest)
     n = 1
     while True:
-        candidate = dest.with_name(f"{dest.stem}_{n}{dest.suffix}")
-        if not candidate.exists():
-            return candidate
+        cand = numbered_name(dest, n)
         n += 1
+        try:
+            os.link(tmp, cand)
+        except FileExistsError:
+            if not unique:
+                raise
+            continue
+        except OSError:                          # no hard links on this file system
+            try:
+                os.close(os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            except FileExistsError:
+                if not unique:
+                    raise
+                continue
+            try:
+                os.replace(tmp, cand)
+            except OSError:
+                os.unlink(cand)                  # our own empty placeholder, nothing else
+                raise
+            return cand
+        os.unlink(tmp)
+        return cand
+
+
+def same_volume(a, b) -> bool:
+    return os.stat(a).st_dev == os.stat(b).st_dev
+
+
+def safe_move(src, dest) -> Path:
+    """Move a file without any chance of losing or replacing data; returns the final path.
+    The destination is never overwritten (a taken name gets `name (2).ext`).
+    Same volume: hard link under the new name, then remove the old name (the same
+    data, never a copy that could be partial). Other volume: copy to a temp file in
+    the destination folder, fsync, compare size and SHA-256 with the source, give it
+    its final name without overwriting, and only then remove the source. On any
+    failure the source is still in place."""
+    src, dest = Path(src), Path(dest)
+    if same_volume(src, dest.parent):
+        try:
+            return publish_no_overwrite_keep(src, dest)
+        except SourceNotRemoved:
+            raise                      # linking worked: copying would only leave a second copy
+        except OSError as e:
+            logger.info("Cannot link %s on this file system (%s), copying instead", src, e)
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".mp2mv.", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out, 1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, tmp)
+        if os.path.getsize(tmp) != os.path.getsize(src) or _sha256(tmp) != _sha256(src):
+            raise OSError(f"copy of {src} does not match the original; original kept")
+        final = publish_no_overwrite(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    os.unlink(src)       # copy verified and named: only now does the source go
+    return final
+
+
+def _link_free_name(src, dest) -> Path:
+    """os.link src under a free name next to dest (name (2).ext, ...).
+    Raises OSError (nothing changed) if hard links are not possible."""
+    dest = Path(dest)
+    n = 1
+    while True:
+        cand = numbered_name(dest, n)
+        n += 1
+        try:
+            os.link(src, cand)
+        except FileExistsError:
+            continue
+        return cand
+
+
+def publish_no_overwrite_keep(src, dest) -> Path:
+    """Hard link src under a free name, then remove src (a rename that never overwrites).
+    If src cannot be removed (locked), the new link is removed again, but only while it
+    is still the same file as src, and the error is raised: no second copy is left."""
+    cand = _link_free_name(src, dest)
+    try:
+        os.unlink(src)
+    except OSError:
+        try:
+            if os.path.samefile(src, cand):
+                os.unlink(cand)
+        except OSError:
+            pass
+        raise SourceNotRemoved(f"could not remove {src} after linking it to {cand}")
+    return cand
+
+
+class SourceNotRemoved(OSError):
+    """The source stayed in place (nothing lost); the move failed."""
 
 
 def _move(path: Path, root: Path, folder) -> Path:
@@ -447,10 +636,16 @@ def _move(path: Path, root: Path, folder) -> Path:
         rel = path.relative_to(root)
     except ValueError:
         rel = Path(path.name)
-    dest = _unique_path(removal_folder(root, folder) / rel)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(dest))
-    return dest
+    target = removal_folder(root, folder)
+    if not target.exists():
+        # Create the removal folder itself, never the chain above it: a missing mount
+        # point must not be filled with files that vanish when the drive is mounted.
+        if not target.parent.is_dir():
+            raise OSError(f"removal folder's parent does not exist: {target.parent}")
+        target.mkdir()
+    dest = target / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)       # sub folders inside the removal folder
+    return safe_move(path, dest)
 
 
 def dispose_file(path, mode=None, root=None, folder=None, exts=None) -> str:
@@ -469,6 +664,9 @@ def dispose_file(path, mode=None, root=None, folder=None, exts=None) -> str:
 
     mode = normalize_mode(mode)
     if mode == "trash":
+        why = trash_unavailable_reason(p)
+        if why:
+            raise TrashUnavailable(f"Cannot move {p.name} to the Recycle Bin: {why}. {TRASH_HINT}")
         try:
             from send2trash import send2trash
             send2trash(str(p))
@@ -511,7 +709,7 @@ def describe_destination(mode, root=None, folder=None) -> str:
 BIN_REFUSAL = "This run is too big for the Recycle Bin. Use 'Move to folder' instead."
 BIN_MAX_FILES = 500            # more items than this never go to the bin (override: L2M_BIN_MAX_FILES)
 BIN_MAX_FRACTION = 0.5         # estimate + current usage may use at most this share of the cap
-BIN_DEFAULT_FRACTION = 0.05    # cap assumed when the real one can't be read: 5% of the drive
+BIN_DEFAULT_FRACTION = 0.05    # non-Windows only (no per-drive cap exists there): rough limit of 5% of the drive
 
 
 class BinTooBig(Exception):
@@ -595,13 +793,23 @@ def bin_report(total_bytes: int, file_count: int, path) -> dict:
     """Judge a run that would send `total_bytes` in `file_count` items to the bin.
     Returns a dict with ok, reason (user-facing, empty if ok), estimate, cap, usage,
     nuke, cap_source. L2M_BIN_CAP_MB / L2M_BIN_MAX_FILES override cap and file limit."""
+    why = trash_unavailable_reason(path)
+    if why:
+        return {"ok": False, "estimate": total_bytes, "files": file_count, "cap": 0, "usage": None, "nuke": False,
+                "cap_source": "none", "unavailable": True,
+                "reason": f"Cannot use the Recycle Bin: {why}. {TRASH_HINT}"}
     s = read_bin_settings(path)
     cap, source = s["cap"], s["source"]
     env_cap = os.environ.get("L2M_BIN_CAP_MB")
     if env_cap and env_cap.isdigit():
         cap, source = int(env_cap) * 1024 * 1024, "override"
     if cap is None:
-        try:
+        if is_windows():
+            # The real cap is unknown: assuming one could let the bin purge or skip items
+            return {"ok": False, "estimate": total_bytes, "files": file_count, "cap": 0, "usage": None,
+                    "nuke": s["nuke"], "cap_source": "unknown",
+                    "reason": BIN_REFUSAL + " (the Recycle Bin size could not be read)"}
+        try:                       # other systems have no per-drive cap: keep a rough limit
             cap = int(drive_size(path) * BIN_DEFAULT_FRACTION)
         except OSError:
             cap = 0

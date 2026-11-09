@@ -20,7 +20,7 @@ def test_move_keeps_relative_path_and_handles_collisions(tmp_path):
     assert (tmp_path / "_originals" / "sub" / "a.MOV").read_bytes() == b"1"
     b = make(tmp_path / "sub" / "a.MOV", b"2")
     vr.remove_video(b, "move", tmp_path)
-    assert (tmp_path / "_originals" / "sub" / "a_1.MOV").read_bytes() == b"2"
+    assert (tmp_path / "_originals" / "sub" / "a (2).MOV").read_bytes() == b"2"
 
 
 def test_custom_relative_folder(tmp_path):

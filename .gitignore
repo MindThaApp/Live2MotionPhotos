@@ -6,3 +6,6 @@ config.json
 .env
 *.log
 .DS_Store
+preview.json
+*.tmp
+config.json.tmp
