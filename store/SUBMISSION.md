@@ -1,12 +1,13 @@
 # Microsoft Store submission checklist
 
-Product: **iPhone Live Photo to Android Motion Photo** (Store ID `9P8MMJZMTGSF`)
-Package type: MSIX, packaged Win32 desktop app (full trust), x64, Windows 10 1809+ / Windows 11.
+Product: **iPhone Live Photo to Android Motion Photo Converter Portal** (Store ID `9P8MMJZMTGSF`)
+Partner Center product type: **MSIX or PWA app**. Package: MSIX, packaged Win32 desktop app
+(full trust), x64, Windows 10 1809+ / Windows 11.
 
 ## 1. Partner Center account and name reservation (done)
 
 - [x] Developer account (individual or company) at https://partner.microsoft.com/dashboard
-- [x] Name reserved: **iPhone Live Photo to Android Motion Photo**
+- [x] Name reserved: **iPhone Live Photo to Android Motion Photo Converter Portal**
 - [ ] Optional: reserve a shorter extra name (e.g. "Live2Motion Photos") under
       Product management > Manage product names, in case certification objects to the
       trademarks in the current name (see step 11).
@@ -21,13 +22,16 @@ They are already in `packaging/windows/store-identity.json`:
 | Package/Identity/Name | `IdentityName` | `34458MindtheApp.iPhoneLivePhototoAndroidMotionPhot` |
 | Package/Identity/Publisher | `Publisher` | `CN=FE63C3BB-418B-484C-852F-E7985F260BC3` |
 | Package/Properties/PublisherDisplayName | `PublisherDisplayName` | `MindtheApp` |
-| Reserved app name | `DisplayName` | `iPhone Live Photo to Android Motion Photo` |
+| Reserved app name | `DisplayName` | `iPhone Live Photo to Android Motion Photo Converter Portal` |
 | Package Family Name (check) | `ExpectedPackageFamilyName` | `34458MindtheApp.iPhoneLivePhototoAndroidMotionPhot_24e29cj9741rt` |
 
 - The Identity Name is cut short by Partner Center ("...MotionPhot"). Keep it exactly
   like that.
 - `DisplayName` must be one of the names reserved for this app, or the upload is
-  rejected. Partner Center checks the manifest's `Properties/DisplayName`.
+  rejected. Partner Center checks the manifest's `Properties/DisplayName`. The build uses
+  the full reserved name (58 characters) for both `Properties/DisplayName` and the Start
+  menu name (`VisualElements/DisplayName`); both allow up to 256 characters, so nothing is
+  shortened. Tiles show the short name "Live2Motion" (`ShortName`, limit 40).
 - `Version` (now `1.1.0.0`) must have 0 as its last part and must go up for every new
   submission, for example `1.1.1.0` or `1.2.0.0`.
 - The family-name suffix `24e29cj9741rt` is derived from the Publisher value. It has been
@@ -59,7 +63,7 @@ Signed with a self-signed test certificate whose subject is the Publisher above.
 1. Double-click `sideload-test-cert.cer` > Install Certificate > **Local Machine** > Place
    all certificates in **Trusted People**. Admin rights are needed.
 2. Double-click `..._sideload.msix` > Install.
-3. Start "iPhone Live Photo to Android Motion Photo" from Start. Test it on a **copy** of
+3. Start "iPhone Live Photo to Android Motion Photo Converter Portal" from Start. Test it on a **copy** of
    a few Live Photos, never on your only originals.
 4. Afterwards, uninstall the app from Settings > Apps. You can remove the test certificate
    in `certlm.msc` > Trusted People.

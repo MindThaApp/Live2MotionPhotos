@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**App:** iPhone Live Photo to Android Motion Photo (also called Live2Motion Photos)
+**App:** iPhone Live Photo to Android Motion Photo Converter Portal (also called Live2Motion Photos)
 **Publisher:** MindtheApp
 **Last updated:** 9 November 2026
 

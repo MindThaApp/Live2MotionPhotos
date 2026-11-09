@@ -5,7 +5,7 @@ does not render Markdown.
 
 ## Product name
 
-iPhone Live Photo to Android Motion Photo
+iPhone Live Photo to Android Motion Photo Converter Portal
 
 (This is the name reserved in Partner Center. It is also the `DisplayName` in the MSIX
 manifest, set in `packaging/windows/store-identity.json`. The app's own window title is
@@ -19,7 +19,7 @@ Turn iPhone Live Photos into Motion Photos that move in Google Photos and Samsun
 
 When you copy Live Photos from an iPhone to a PC or an Android phone, each one splits into two files: a still photo (HEIC or JPEG) and a short MOV video. Google Photos and Samsung Gallery do not recognise these pairs, so your Live Photos stop moving.
 
-iPhone Live Photo to Android Motion Photo puts each pair back together as a single Motion Photo. Copy the converted photos to your phone or upload them to Google Photos, and they play just like they did on your iPhone.
+This app puts each pair back together as a single Motion Photo. Copy the converted photos to your phone or upload them to Google Photos, and they play just like they did on your iPhone.
 
 How it works
 1. Choose the folder with your photos. Your Pictures folder is suggested to start with.

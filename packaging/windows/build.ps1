@@ -82,6 +82,7 @@ if (Test-Path $Run) { throw "$Run already exists" }
 New-Item -ItemType Directory -Path $Run | Out-Null
 $Tmp = Join-Path $Run "tmp"; New-Item -ItemType Directory -Path $Tmp | Out-Null
 $env:TEMP = $Tmp; $env:TMP = $Tmp      # keep PyInstaller/pip temp files inside the run folder
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $Run "pyi-config"   # PyInstaller's cache too (not %LOCALAPPDATA%)
 Write-Host "Build folder: $Run"
 
 # ── ExifTool (verified download, cached) ───────────────────────────────────────
@@ -110,7 +111,7 @@ Invoke-Native "make_assets.py" { & $Python (Join-Path $PSScriptRoot "make_assets
 $env:L2M_ICON = Join-Path $Assets "app.ico"
 $Dist = Join-Path $Run "dist"
 Invoke-Native "PyInstaller" {
-  & $Python -m PyInstaller (Join-Path $PSScriptRoot "live2motion.spec") --noconfirm --clean `
+  & $Python -m PyInstaller (Join-Path $PSScriptRoot "live2motion.spec") --noconfirm `
     --distpath $Dist --workpath (Join-Path $Run "pyi-work")
 }
 $App = Join-Path $Dist "Live2Motion"
