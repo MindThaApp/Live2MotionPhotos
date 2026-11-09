@@ -130,24 +130,7 @@ input:disabled{opacity:.5;cursor:not-allowed}
 hr{border:none;border-top:1px solid var(--border)}
 .sub-label{font-size:11px;color:var(--muted);margin-top:4px}
 
-/* ── Cleanup banner ── */
-.cleanup-bar{background:#1a2010;border-bottom:1px solid #3fb950;padding:6px 16px;display:flex;align-items:center;gap:10px;flex-shrink:0;font-size:12px}
-
-/* ── Cleanup modal ── */
-.cu-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px;gap:12px;color:var(--muted);font-size:13px}
-.cu-spinner{width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.cu-results{padding:16px 20px;display:flex;flex-direction:column;gap:14px}
-.cu-summary{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;display:flex;align-items:center;justify-content:space-between}
-.cu-count{font-size:22px;font-weight:700;font-family:var(--mono);color:var(--text)}
-.cu-size{font-size:12px;color:var(--muted);text-align:right}
-.cu-filelist{max-height:220px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--r);font-family:var(--mono);font-size:11px}
-.cu-file{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid var(--border)}
-.cu-file:last-child{border-bottom:none}
-.cu-file:hover{background:var(--surface2)}
-.cu-file input[type=checkbox]{accent-color:var(--accent);flex-shrink:0;cursor:pointer}
-.cu-file label{flex:1;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
-.cu-file .cu-fsz{color:var(--muted);font-size:10px;flex-shrink:0}
 
 /* ── Main content ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
@@ -234,57 +217,6 @@ tr:hover td{background:var(--surface2)}
 <!-- ── Floating tooltip ── -->
 <div id="tooltip"></div>
 
-<!-- ── Cleanup modal ── -->
-<div class="modal-bg" id="cu-bg" style="display:none" onclick="if(event.target===this)closeCu()">
-  <div class="modal" style="width:520px">
-    <div class="modal-hdr">
-      <h3>🗑 Find Orphaned Videos</h3>
-      <button class="modal-close" onclick="closeCu()">✕</button>
-    </div>
-    <!-- idle -->
-    <div id="cu-idle" class="cu-state">
-      <div style="font-size:13px;text-align:center;line-height:1.6;color:var(--text)">
-        Scans the input directory for photos already converted to<br>Motion Photos and finds their original video files.
-      </div>
-      <button class="btn btn-primary" onclick="startScan()" style="margin-top:4px">🔍 Scan Now</button>
-    </div>
-    <!-- scanning -->
-    <div id="cu-scanning" class="cu-state" style="display:none">
-      <div class="cu-spinner"></div>
-      <span>Scanning with exiftool… this may take a minute.</span>
-    </div>
-    <!-- results -->
-    <div id="cu-results" class="cu-results" style="display:none">
-      <div class="cu-summary">
-        <div>
-          <div class="cu-count" id="cu-count">0</div>
-          <div style="font-size:11px;color:var(--muted)">video files found</div>
-        </div>
-        <div class="cu-size">
-          <div id="cu-total-size" style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--text)"></div>
-          <div id="cu-scanned" style="font-size:11px"></div>
-        </div>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-          <input type="checkbox" id="cu-select-all" checked onchange="toggleAll(this.checked)" style="accent-color:var(--accent)">
-          Select all
-        </label>
-        <span id="cu-sel-count" style="font-size:11px;color:var(--muted);flex:1"></span>
-        <button class="btn btn-sm" onclick="startScan()" style="font-size:11px">↺ Rescan</button>
-      </div>
-      <div class="cu-filelist" id="cu-filelist"></div>
-      <div style="font-size:11px;color:var(--muted)" id="cu-none" style="display:none"></div>
-    </div>
-    <!-- footer -->
-    <div class="modal-footer" id="cu-footer" style="display:none">
-      <span id="cu-err" style="font-size:11px;color:var(--red);flex:1"></span>
-      <button class="btn" onclick="closeCu()">Cancel</button>
-      <button class="btn btn-danger" id="cu-del-btn" onclick="doDeleteSelected()">Delete Selected</button>
-    </div>
-  </div>
-</div>
-
 <!-- ── Folder browser modal ── -->
 <div class="modal-bg" id="browser-bg" style="display:none" onclick="if(event.target===this)closeBrowser()">
   <div class="modal">
@@ -308,19 +240,10 @@ tr:hover td{background:var(--surface2)}
   <div class="spacer"></div>
   <span class="pill pill-idle" id="status-pill">Idle</span>
   <span class="pill pill-watch" id="watch-pill" style="display:none">Watching</span>
-  <button class="btn" onclick="openCu()" title="Find and delete video files for already-muxed photos">🗑 Clean Up</button>
   <button class="btn" id="preview-btn" onclick="startRun(true)" title="List what would be converted and removed, without changing any file">🔍 Preview</button>
   <button class="btn btn-primary" id="run-btn" onclick="startRun()">▶ Run Now</button>
   <button class="btn btn-danger" id="cancel-btn" onclick="cancelRun()" style="display:none">⬛ Cancel</button>
 </header>
-
-<!-- ── Cleanup notice (shown after a run when orphaned videos are found) ── -->
-<div class="cleanup-bar" id="cleanup-bar" style="display:none">
-  <span style="color:var(--green)">🗑</span>
-  <span id="cleanup-msg" style="flex:1;color:var(--text)"></span>
-  <button class="btn btn-sm btn-primary" onclick="openCu()">Review & Delete</button>
-  <button class="btn-ghost btn-sm" onclick="document.getElementById('cleanup-bar').style.display='none'" style="font-size:16px;padding:0 6px">×</button>
-</div>
 
 <div id="confirm-bg"><div id="confirm-box" role="dialog" aria-modal="true">
   <b id="confirm-title"></b><p id="confirm-text"></p><p id="confirm-dest" style="color:var(--muted)"></p>
@@ -643,6 +566,15 @@ tr:hover td{background:var(--surface2)}
 // Stored in localStorage and sent as a header on every /api call; the user is
 // asked for it the first time the server answers 401.
 const TOKEN_KEY = 'live2motion_token';
+// A link with ?token=... (printed by the server on first start) stores the token and is cleaned up.
+try {
+  const u = new URL(location.href), t = u.searchParams.get('token');
+  if (t) {
+    localStorage.setItem(TOKEN_KEY, t.trim());
+    u.searchParams.delete('token');
+    history.replaceState(null, '', u.pathname + (u.search || '') + u.hash);
+  }
+} catch {}
 const getToken = () => { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } };
 let tokenPrompt = null, tokenDeclined = false;
 function askToken() {
@@ -878,7 +810,6 @@ function connectSSE(fromLine) {
       setRunning(false);
       setStatus(d.stats?.errors > 0 ? 'error' : 'done');
       document.getElementById('sp-file').style.display = 'none';
-      if (d.stats?.skipped > 0 && !lastRunExtract) checkCleanup();
       if (!lastRunExtract) showSelBar();
       return;
     }
@@ -1368,138 +1299,6 @@ function flash(msg, err=false) {
 }
 
 init();
-
-// ── Cleanup modal ─────────────────────────────────────────────────────────────
-let cuVideos = [];
-
-function openCu() {
-  document.getElementById('cu-bg').style.display = 'flex';
-  if (cuVideos.length > 0) {
-    // Already have results (pre-loaded from run) — show them immediately
-    document.getElementById('cu-idle').style.display = 'none';
-    document.getElementById('cu-scanning').style.display = 'none';
-  } else {
-    document.getElementById('cu-idle').style.display = 'flex';
-    document.getElementById('cu-scanning').style.display = 'none';
-    document.getElementById('cu-results').style.display = 'none';
-    document.getElementById('cu-footer').style.display = 'none';
-  }
-}
-function closeCu() { document.getElementById('cu-bg').style.display = 'none'; }
-
-function _renderCuResults(d) {
-  cuVideos = d.videos ?? [];
-  document.getElementById('cu-count').textContent = d.count;
-  document.getElementById('cu-total-size').textContent = fmtBytes(d.total_bytes ?? 0);
-  const src = d.skipped_photos != null ? `from ${d.skipped_photos} skipped photos` : `from ${d.scanned ?? 0} photo-video pairs`;
-  document.getElementById('cu-scanned').textContent = src;
-  document.getElementById('cu-err').textContent = '';
-  document.getElementById('cu-del-btn').style.display = cuVideos.length ? '' : 'none';
-  document.getElementById('cu-del-btn').disabled = false;
-  document.getElementById('cu-del-btn').textContent = 'Delete Selected';
-  if (cuVideos.length === 0) {
-    document.getElementById('cu-filelist').innerHTML =
-      '<div style="padding:16px;color:var(--muted);text-align:center;font-size:12px">No orphaned videos found — all clean!</div>';
-  } else {
-    document.getElementById('cu-filelist').innerHTML = cuVideos.map((v, i) => `
-      <div class="cu-file">
-        <input type="checkbox" id="cu-f${i}" checked onchange="updateSelCount()">
-        <label for="cu-f${i}" title="${escHtml(v.path)}">${escHtml(v.name)}</label>
-        <span class="cu-fsz">${fmtBytes(v.size)}</span>
-      </div>`).join('');
-    document.getElementById('cu-select-all').checked = true;
-    updateSelCount();
-  }
-  document.getElementById('cu-idle').style.display = 'none';
-  document.getElementById('cu-scanning').style.display = 'none';
-  document.getElementById('cu-results').style.display = 'flex';
-  document.getElementById('cu-footer').style.display = 'flex';
-}
-
-async function startScan() {
-  document.getElementById('cu-idle').style.display = 'none';
-  document.getElementById('cu-results').style.display = 'none';
-  document.getElementById('cu-footer').style.display = 'none';
-  document.getElementById('cu-scanning').style.display = 'flex';
-
-  const r = await fetch('/api/cleanup-scan').catch(() => null);
-  document.getElementById('cu-scanning').style.display = 'none';
-
-  if (!r || !r.ok) {
-    const e = await r?.json().catch(() => ({}));
-    document.getElementById('cu-idle').style.display = 'flex';
-    document.getElementById('cu-err').textContent = e?.error ?? 'Scan failed';
-    document.getElementById('cu-footer').style.display = 'flex';
-    document.getElementById('cu-del-btn').style.display = 'none';
-    return;
-  }
-  _renderCuResults(await r.json());
-}
-
-async function checkCleanup() {
-  const r = await fetch('/api/cleanup-preview').catch(() => null);
-  if (!r || !r.ok) return;
-  const d = await r.json().catch(() => null);
-  if (!d || d.count === 0) return;
-  document.getElementById('cleanup-msg').textContent =
-    `${d.count} video file${d.count !== 1 ? 's' : ''} (${fmtBytes(d.total_bytes)}) can be deleted — already embedded in muxed photos.`;
-  document.getElementById('cleanup-bar').style.display = 'flex';
-  _renderCuResults(d);  // pre-load modal so clicking "Review" is instant
-}
-
-function toggleAll(checked) {
-  cuVideos.forEach((_, i) => {
-    const el = document.getElementById('cu-f' + i);
-    if (el) el.checked = checked;
-  });
-  updateSelCount();
-}
-
-function updateSelCount() {
-  const sel = cuVideos.filter((_, i) => document.getElementById('cu-f' + i)?.checked).length;
-  document.getElementById('cu-sel-count').textContent = `${sel} of ${cuVideos.length} selected`;
-  document.getElementById('cu-select-all').checked = sel === cuVideos.length;
-  document.getElementById('cu-select-all').indeterminate = sel > 0 && sel < cuVideos.length;
-  document.getElementById('cu-del-btn').disabled = sel === 0;
-}
-
-async function doDeleteSelected() {
-  const paths = cuVideos.filter((_, i) => document.getElementById('cu-f' + i)?.checked).map(v => v.path);
-  if (!paths.length) return;
-
-  const btn = document.getElementById('cu-del-btn');
-  btn.disabled = true; btn.textContent = `Deleting ${paths.length}…`;
-
-  const r = await fetch('/api/cleanup', {
-    method: 'DELETE',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({paths}),
-  }).catch(() => null);
-
-  const d = await r?.json().catch(() => null);
-  if (d?.deleted > 0) {
-    const deleted = new Set(paths.slice(0, d.deleted));
-    cuVideos = cuVideos.filter(v => !deleted.has(v.path));
-    document.getElementById('cu-count').textContent = cuVideos.length;
-    if (cuVideos.length === 0) {
-      document.getElementById('cu-filelist').innerHTML =
-        '<div style="padding:16px;color:var(--green);text-align:center;font-size:12px">✓ All done — no orphaned videos remaining.</div>';
-      btn.style.display = 'none';
-    } else {
-      document.getElementById('cu-filelist').innerHTML = cuVideos.map((v, i) => `
-        <div class="cu-file">
-          <input type="checkbox" id="cu-f${i}" checked onchange="updateSelCount()">
-          <label for="cu-f${i}" title="${escHtml(v.path)}">${escHtml(v.name)}</label>
-          <span class="cu-fsz">${fmtBytes(v.size)}</span>
-        </div>`).join('');
-      btn.disabled = false; btn.textContent = 'Delete Selected';
-      updateSelCount();
-    }
-  } else {
-    document.getElementById('cu-err').textContent = d?.errors?.[0]?.error ?? 'Delete failed';
-    btn.disabled = false; btn.textContent = 'Delete Selected';
-  }
-}
 
 function fmtBytes(b) {
   if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';

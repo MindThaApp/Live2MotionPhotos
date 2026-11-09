@@ -12,10 +12,13 @@ services:
     ports:
       # Localhost only by default. To reach it from other devices on your LAN,
       # set LIVE2MOTION_BIND=0.0.0.0 in .env (or change this to "7000:7000")
-      # AND set LIVE2MOTION_TOKEN so the UI is password protected.
+      # AND set LIVE2MOTION_TOKEN so the UI is password protected (without one,
+      # a token is generated into config.json on first start and shown in `docker compose logs`).
+      # Open the UI by DNS name? Add it to LIVE2MOTION_ALLOWED_HOSTS.
       - "${LIVE2MOTION_BIND:-127.0.0.1}:7000:7000"
     environment:
       LIVE2MOTION_TOKEN: ${LIVE2MOTION_TOKEN:-}
+      LIVE2MOTION_ALLOWED_HOSTS: ${LIVE2MOTION_ALLOWED_HOSTS:-}
       LIVE2MOTION_PUBLISH_ADDR: ${LIVE2MOTION_BIND:-127.0.0.1}
     volumes:
       - ./config.json:/app/config.json

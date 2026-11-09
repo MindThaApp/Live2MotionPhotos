@@ -32,6 +32,7 @@ def test_run_endpoint_passes_override(monkeypatch):
     seen = []
     monkeypatch.setattr(appmod, "do_run", lambda trigger="manual", dry_run=None: seen.append(dry_run))
     monkeypatch.setattr(appmod.run_state, "running", False)
+    monkeypatch.setattr(appmod, "load_config", lambda: {**appmod.DEFAULT_CONFIG, "input_directory": "/some/folder"})
     c = TestClient(appmod.app, base_url="http://localhost:7000")
     assert c.post("/api/run?dry_run=true").status_code == 200
     assert c.post("/api/run").status_code == 200

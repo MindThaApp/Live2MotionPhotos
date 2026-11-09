@@ -204,8 +204,8 @@ def test_default_input_under_home(env, monkeypatch):
     (home / "Pictures").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setattr(appmod, "windows_pictures_dir", lambda: None)
-    assert appmod.default_input_dir() == str(home / "Pictures")
-    assert appmod.load_config()["input_directory"] == str(home / "Pictures")
+    assert appmod.default_input_dir() == str(home / "Pictures")      # where the folder browser starts
+    assert appmod.load_config()["input_directory"] == ""              # but never a silent run target
     assert appmod.is_browsable(Path(appmod.default_input_dir()).resolve(), appmod.browse_roots())
 
 
@@ -223,10 +223,10 @@ def test_default_in_docker_is_data(env, monkeypatch):
     assert appmod.default_input_dir() == "/data"
 
 
-def test_empty_saved_input_resolves_to_default(env, monkeypatch):
+def test_empty_saved_input_stays_empty(env, monkeypatch):
     monkeypatch.setattr(appmod, "IN_DOCKER", True)
     (env / "config.json").write_text('{"input_directory": ""}')
-    assert appmod.load_config()["input_directory"] == "/data"
+    assert appmod.load_config()["input_directory"] == ""
 
 
 def test_last_folder_autosaved_and_reloaded(client, env, monkeypatch):
