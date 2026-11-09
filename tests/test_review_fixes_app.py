@@ -337,3 +337,14 @@ def test_suggestion_only_until_a_config_was_ever_saved(client, sec_env, monkeypa
     assert client.get("/api/config").json()["suggested_input_directory"] == str(home / "Pictures")
     (sec_env / "config.json").write_text(json.dumps({"input_directory": ""}))       # saved once, field left empty
     assert client.get("/api/config").json()["suggested_input_directory"] == ""
+
+
+def test_cleanup_movs_refused_when_the_preview_has_unreadable_rows(bin_env):
+    root, c, _, _ = bin_env
+    rows = [{"file": "p0.jpg", "status": "skipped", "kind": "motion_leftover", "video": "p0.mov"},
+            {"file": "bad.heic", "status": "skipped", "kind": "skipped", "reason": "unreadable: Error: File is empty"}]
+    appmod.set_preview(appmod.preview_fingerprint(appmod.load_config()), rows)
+    r = c.post("/api/cleanup-movs", json={"preview_id": appmod.last_preview["id"], "files": ["p0.jpg"]})
+    assert r.status_code == 409 and "unreadable" in r.json()["error"] and r.json()["unreadable"] == ["bad.heic"]
+    assert (root / "p0.mov").exists() and not (root / "_originals").exists()
+    assert appmod.run_state.running is False

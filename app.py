@@ -1384,6 +1384,13 @@ async def api_cleanup_movs(request: Request):
         msg = str(e)
         stale = "Preview" in msg or "changed" in msg
         return JSONResponse({"error": msg, "stale": stale}, status_code=409 if stale else 400)
+    unreadable = [r["file"] for r in pv.get("rows", []) if str(r.get("reason", "")).lower().startswith("unreadable")]
+    if unreadable:
+        # An unreadable photo has no known Live Photo id: no leftover video can be proven unneeded
+        shown = ", ".join(unreadable[:5]) + (", ..." if len(unreadable) > 5 else "")
+        return JSONResponse({"error": f"Cleanup refused: this Preview has {len(unreadable)} unreadable photo(s) "
+                                      f"({shown}). Fix or move them, then run Preview again.",
+                             "unreadable": unreadable}, status_code=409)
     rep = bin_check(files, pv.get("rows", []), cfg, "cleanup")
     if not rep["ok"]:
         return bin_refusal(rep)
