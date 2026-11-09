@@ -84,6 +84,10 @@ Everything — the Python runtime, dependencies, and ExifTool — lives inside t
 
 > If Windows shows a "Windows protected your PC" SmartScreen warning the first time, click **More info → Run anyway** — it appears because the file is new/unsigned, not because anything is wrong.
 
+### Option A3: Windows desktop app (Microsoft Store build)
+
+A native window instead of a browser tab: `desktop/live2motion_desktop.py` runs the same app in-process on `127.0.0.1` (random per-start access token, one instance at a time) inside Microsoft Edge WebView2, with ExifTool bundled. Settings and logs live in `%LOCALAPPDATA%\Live2Motion`. The MSIX package is built by `packaging/windows/build.ps1` (locally or by the "Microsoft Store MSIX" workflow); the Store identity is set in `packaging/windows/store-identity.json`. Store submission notes are in `store/`.
+
 ### Option B: Native (Linux / macOS / Windows)
 
 **Easiest — for running on your own computer:** get the code, either with `git clone https://github.com/ramin-azizi/Live2MotionPhotos.git`, or via GitHub's **Code → Download ZIP** button (no `git` required) — then just double-click:

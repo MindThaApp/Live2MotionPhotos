@@ -1,0 +1,90 @@
+# Store listing (Partner Center > Store listings > English)
+
+Copy each block into the matching Partner Center field. Plain text only; Partner Center
+does not render Markdown.
+
+## Product name
+
+iPhone Live Photo to Android Motion Photo
+
+(This is the name reserved in Partner Center. It is also the `DisplayName` in the MSIX
+manifest, set in `packaging/windows/store-identity.json`. The app's own window title is
+"Live2Motion Photos".)
+
+## Short description (shown on some Store surfaces; up to 1000 characters, keep it short)
+
+Turn iPhone Live Photos into Motion Photos that move in Google Photos and Samsung Gallery. Pick a folder, preview what will happen, then convert. Everything runs on your PC.
+
+## Description (up to 10,000 characters)
+
+When you copy Live Photos from an iPhone to a PC or an Android phone, each one splits into two files: a still photo (HEIC or JPEG) and a short MOV video. Google Photos and Samsung Gallery do not recognise these pairs, so your Live Photos stop moving.
+
+iPhone Live Photo to Android Motion Photo puts each pair back together as a single Motion Photo. Copy the converted photos to your phone or upload them to Google Photos, and they play just like they did on your iPhone.
+
+How it works
+1. Choose the folder with your photos. Your Pictures folder is suggested to start with.
+2. Choose an output folder for the converted photos.
+3. Click Preview to see every pair it found and what will happen to each file. Nothing is changed at this step.
+4. Click Convert, either for everything or only for the photos you selected.
+
+Your originals are safe
+- By default, converted photos go to a separate output folder and your original files are left exactly as they are.
+- Existing files are never replaced. If a name is already taken, the new file gets a numbered name such as "IMG_0001 (2).HEIC".
+- Replacing photos in place and tidying up the leftover videos are optional and off by default. When you turn them on, originals are moved to an "_originals" folder or to the Recycle Bin, and only after the new photo has been checked.
+- If a photo can't be read, its video is left alone.
+
+More features
+- Works with HEIC and JPEG photos and their MOV videos, matched by their hidden pairing ID or by file name.
+- Extract: split a Motion Photo back into a still photo and a video.
+- Live progress, a per-file results list and a history of recent runs.
+- Optional schedule and folder watching to convert new photos automatically while the app is open.
+- Works offline. No account, no sign-in, no uploads.
+
+This app is not affiliated with Apple, Google or Samsung. iPhone and Live Photos are trademarks of Apple Inc. Android and Google Photos are trademarks of Google LLC. Samsung Gallery is a trademark of Samsung Electronics Co., Ltd.
+
+## What's new in this version (1.1.0)
+
+First release in the Microsoft Store.
+- Runs in its own window. No browser or setup needed.
+- Your original photos are never overwritten unless you choose to, and then only after a checked backup exists.
+- Leftover videos are moved, not deleted, by default. Videos shared by more than one photo are never removed.
+- Output files get numbered names instead of replacing existing files.
+
+## Product features (up to 20, each up to 200 characters)
+
+- Turns iPhone Live Photo pairs (HEIC or JPEG plus MOV) into single Motion Photos
+- Motion Photos play in Google Photos and Samsung Gallery
+- Preview every pair before anything is changed
+- Originals stay untouched by default; converted photos go to a separate folder
+- Never replaces existing files; uses numbered names instead
+- Optional tidy-up moves leftover videos to an "_originals" folder or the Recycle Bin
+- Extract a Motion Photo back into a photo and a video
+- Convert all photos or only the ones you select
+- Optional schedule and folder watching while the app is open
+- Works offline, with no account and no uploads
+
+## Search terms / keywords (up to 7)
+
+1. live photo
+2. motion photo
+3. iphone to android
+4. google photos
+5. samsung gallery
+6. heic
+7. photo converter
+
+## Category
+
+Primary: Photo & video
+Subcategory: none (Photo & video has none). Secondary category (optional): Utilities & tools
+
+## Other listing fields
+
+- Copyright and trademark info: Copyright (c) 2026 Ramin Azizi (MIT License). Includes MotionPhoto2, Copyright (c) 2024 Petr Vyskocil (MIT License), and ExifTool by Phil Harvey (Perl Artistic License or GPL).
+- Additional license terms: leave empty (Standard Application License Terms), or link the MIT LICENSE from the repository.
+- Developed by: MindtheApp
+- Website: https://github.com/MindThaApp/Live2MotionPhotos
+- Support contact: the repository's Issues page, https://github.com/MindThaApp/Live2MotionPhotos/issues
+- Privacy policy: see store/PRIVACY.md and SUBMISSION.md (step 7) for the URL.
+- System requirements (minimum): Windows 10 version 1809 or later, x64, Microsoft Edge WebView2 Runtime (included with Windows 11 and current Windows 10).
+- Store logos: generated by the build (`assets/store/` in the build folder, or the `store-listing-images` CI artifact).
