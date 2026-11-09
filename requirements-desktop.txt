@@ -1,0 +1,6 @@
+# Windows desktop / Microsoft Store build only (see packaging/windows/build.ps1).
+# Not needed for the server, Docker or portable builds.
+-r requirements.txt
+pywebview==6.2.1          # native window (Microsoft Edge WebView2); pulls in pythonnet on Windows
+pyinstaller==6.22.3       # freezes desktop/live2motion_desktop.py into Live2Motion.exe
+pillow==13.0.0            # build-time only: generates the icon and MSIX tile assets

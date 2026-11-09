@@ -1,0 +1,108 @@
+name: Microsoft Store MSIX
+
+# Builds the desktop exe and the MSIX packages. Separate from the portable/release
+# workflow: it never creates or edits a GitHub release.
+on:
+  push:
+    tags: ["store-v*"]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12.8"
+  # Same pinned ExifTool and SHA-256 as portable-windows.yml (build.ps1 verifies the download)
+  EXIFTOOL_VERSION: "13.59"
+  EXIFTOOL_SHA256: "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
+
+permissions:
+  contents: read
+
+jobs:
+  msix:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-desktop.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build exe + MSIX (with smoke tests)
+        shell: pwsh
+        run: |
+          ./packaging/windows/build.ps1 -OutDir "$env:RUNNER_TEMP\store-build" -Python python -GuiSmoke
+          $run = Get-ChildItem "$env:RUNNER_TEMP\store-build" -Directory -Filter "run-*" | Sort-Object Name | Select-Object -Last 1
+          "RUN_DIR=$($run.FullName)" >> $env:GITHUB_ENV
+
+      - name: Sideload test (install signed MSIX, start packaged app, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $id = Get-Content packaging/windows/store-identity.json -Raw | ConvertFrom-Json
+          $pkgs = "$env:RUN_DIR\packages"
+          Import-Certificate -FilePath "$pkgs\sideload-test-cert.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          $msix = Get-ChildItem $pkgs -Filter "*_sideload.msix" | Select-Object -First 1
+          Add-AppxPackage -Path $msix.FullName
+          $pkg = Get-AppxPackage -Name $id.IdentityName
+          if (-not $pkg) { throw "Package not installed" }
+          Write-Host "Installed: $($pkg.PackageFullName)"
+          if ($pkg.PackageFamilyName -ne $id.ExpectedPackageFamilyName) {
+            throw "Package family name $($pkg.PackageFamilyName) != expected $($id.ExpectedPackageFamilyName)"
+          }
+          try {
+            Start-Process "shell:AppsFolder\$($pkg.PackageFamilyName)!Live2Motion"
+            $log = "$env:LOCALAPPDATA\Packages\$($pkg.PackageFamilyName)\LocalCache\Local\Live2Motion\logs\desktop.log"
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline -and -not ((Test-Path $log) -and (Select-String -Path $log -Pattern "Serving on" -Quiet))) {
+              Start-Sleep -Seconds 1
+            }
+            if (-not (Test-Path $log)) { throw "No log in the package's redirected AppData ($log)" }
+            Get-Content $log
+            if (-not (Select-String -Path $log -Pattern "packaged=True" -Quiet)) { throw "App did not detect its package identity" }
+            if (-not (Select-String -Path $log -Pattern "Serving on" -Quiet)) { throw "Packaged app did not start its server" }
+          } finally {
+            Get-Process Live2Motion -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 2
+            Remove-AppxPackage -Package $pkg.PackageFullName
+          }
+
+      - name: Upload Store package (unsigned, for Partner Center)
+        uses: actions/upload-artifact@v7
+        with:
+          name: msix-store-upload
+          path: |
+            ${{ env.RUN_DIR }}/packages/*.msixupload
+            ${{ env.RUN_DIR }}/packages/*_x64.msix
+          if-no-files-found: error
+
+      - name: Upload sideload test package
+        uses: actions/upload-artifact@v7
+        with:
+          name: msix-sideload-test
+          path: |
+            ${{ env.RUN_DIR }}/packages/*_sideload.msix
+            ${{ env.RUN_DIR }}/packages/sideload-test-cert.cer
+          if-no-files-found: error
+
+      - name: Upload Store listing logos
+        uses: actions/upload-artifact@v7
+        with:
+          name: store-listing-images
+          path: ${{ env.RUN_DIR }}/assets/store/*.png
+
+      - name: Upload smoke-test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs
+          path: |
+            ${{ env.RUN_DIR }}/smoke-data/logs/
+            ${{ env.RUN_DIR }}/gui-data/logs/
+          if-no-files-found: ignore

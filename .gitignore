@@ -9,3 +9,4 @@ config.json
 preview.json
 *.tmp
 config.json.tmp
+store-build-out/

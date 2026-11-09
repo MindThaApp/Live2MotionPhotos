@@ -1,0 +1,12 @@
+{
+  "_README": "THE ONE PLACE for the Microsoft Store identity. These values must match Partner Center > your app > Product management > Product identity exactly (Package/Identity/Name, Package/Identity/Publisher, Package/Properties/PublisherDisplayName). DisplayName must be a name reserved for this app in Partner Center. Version must be 4 parts with the last part 0, and must increase for every Store submission.",
+  "IdentityName": "34458MindtheApp.iPhoneLivePhototoAndroidMotionPhot",
+  "Publisher": "CN=FE63C3BB-418B-484C-852F-E7985F260BC3",
+  "PublisherDisplayName": "MindtheApp",
+  "DisplayName": "iPhone Live Photo to Android Motion Photo",
+  "ShortName": "Live2Motion",
+  "Description": "Turn iPhone Live Photos into Android and Samsung Motion Photos on your PC.",
+  "Version": "1.1.0.0",
+  "ExpectedPackageFamilyName": "34458MindtheApp.iPhoneLivePhototoAndroidMotionPhot_24e29cj9741rt",
+  "StoreId": "9P8MMJZMTGSF"
+}
