@@ -142,6 +142,33 @@ including `-GuiSmoke`. The frozen `Live2Motion.exe --motionphoto2` exits with 4 
 `[CANCELLED]` when the cancel-flag file exists, and exits 0 when it does not.
 `pytest -q`: 355 passed.
 
+## Re-review fixes
+
+- Watchdog: the converter writes "busy" to its per-run status file
+  (`LIVE2MOTION_STATUS_FILE`, only ever an `l2m_status_*` file) on entering one file's work
+  and "idle" on leaving it and at every checkpoint. After Cancel/close the converter is never
+  force-stopped while busy, however long the file takes, and otherwise only after
+  `LIVE2MOTION_CANCEL_TIMEOUT` (600 s) with no progress (no output line, no status update).
+  `begin_shutdown` without a timeout waits as long as needed; with one it still never kills a
+  busy converter. On POSIX no SIGKILL follows the SIGTERM while busy (SIGTERM is deferred).
+  Residual: on Windows the busy check and TerminateProcess are not atomic; reaching that
+  point needs 600 s with no output, and after the cancel flag exists a converter cannot start
+  a new file without passing a checkpoint, so the window is practically closed.
+- `do_run` clears its cancel/status file before `finish()` and only if it is still its own.
+- "Clean up MOVs" checks Cancel and closing between files; each file's copy, verify and
+  delete stays whole. A stale Cancel no longer carries into a new cleanup.
+- Store exclusions: a drive root, a relative path, or `tempfile.gettempdir()` falling back
+  to the current folder is never added; each is logged in desktop.log.
+- Symlinked files leading into an excluded folder are skipped (walks, single pair, Extract).
+- The stricter run-time path check (re-review finding 6) is kept and noted in CHANGELOG.
+
+Rebuilt locally from commit 8e1d3b7 (copy in `store-build\src-8e1d3b7\`):
+`store-build\out\run-20261109-192142\packages\`. build.ps1 (with `-GuiSmoke`) exited 0, so
+every smoke step passed. Extra check on the frozen exe (`fix-check\` in that run folder,
+copies of the generated samples, dry run): the status file reads `idle <pid>`, exit 0
+without the cancel flag, exit 4 with `[CANCELLED]` with it, samples unchanged.
+`pytest -q`: 367 passed. `ruff check .`: all checks passed.
+
 ## Tests
 
 - `pytest -q`: **333 passed** (319 existing + 14 new). `ruff check .`: all checks passed.
