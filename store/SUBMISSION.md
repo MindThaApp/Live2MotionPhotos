@@ -68,6 +68,14 @@ Signed with a self-signed test certificate whose subject is the Publisher above.
 4. Afterwards, uninstall the app from Settings > Apps. You can remove the test certificate
    in `certlm.msc` > Trusted People.
 
+About the test certificate: `build.ps1` keeps the sideload certificate's private key as
+`cert\sideload-test.pfx` in the build output folder, with its password in plain text next to
+it (`sideload-test.pfx.password.txt`). That is acceptable **only because it is a throwaway
+test certificate** for sideloading on your own PC: it is not the Store signing identity (the
+Store signs the upload itself) and must never be used to sign anything you distribute. Keep
+the build output folder out of git (the default `store-build-out/` is already ignored; if you
+pass `-OutDir` inside the repository, do not commit its `cert\` folder) and do not share it.
+
 ## 5. Pricing and availability
 
 - Markets: all, or choose.

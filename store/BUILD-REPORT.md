@@ -30,9 +30,15 @@ persistent clone `~/AI/Projects/Live2MotionPhotos`; `worktrees/` is listed in th
   checks are unchanged.
 - Single instance: named mutex `Local\MindThaApp.Live2MotionPhotos.Desktop`. A second start
   brings the first window to the front and exits with code 0.
-- Closing the window: if a run is active, the app asks "Stop it and close?". If yes, it
-  does what Cancel does (`kill_process_tree`). Then `server.should_exit`, the lifespan
-  stops the scheduler and watcher, and the process exits.
+- Closing the window: if a run is active, the app asks "A run is in progress. Stop after the
+  current file and close?". If yes, no new runs start (manual, schedule, watcher), the
+  converter is asked to stop through its cancel-flag file and finishes the file it is
+  working on, the window stays open until the run has ended, then closes. Then
+  `server.should_exit`, the lifespan stops the scheduler and watcher, and the process
+  exits. A crashed window (WebView2) takes the same cooperative path without asking. Only a
+  converter that is still running after `LIVE2MOTION_CANCEL_TIMEOUT` (600 s) is
+  force-stopped (`kill_process_tree`), and the run log then names the temp files that can
+  be left (`FORCE_KILL_LEFTOVERS` in app.py).
 - Data: `%LOCALAPPDATA%\Live2Motion\` holds config.json, preview.json, `logs\live2motion.log`
   (the existing rotating run log), `logs\desktop.log` (stdout/stderr, because the exe has
   no console) and `webview\`. The input folder is pre-filled by the existing
@@ -133,7 +139,7 @@ all untouched. The existing 319 tests still pass.
 | `open(log, "a")`, `open(…/"desktop.lock", "a")` | desktop shell | OK: append mode never truncates. Own files. |
 | `open(os.devnull, "w")` | desktop shell | OK: the null device. |
 | `open(port_file, "x")` | desktop `--smoke-test` | OK: exclusive create, so an existing file is never overwritten. |
-| `cancel_active_run` → `kill_process_tree` | desktop close | OK: same code path as the existing Cancel button. |
+| `cancel_active_run` → `request_cancel` (was `kill_process_tree`) | desktop close | OK since the review fixes: cooperative, stops between files; force-kill only for a hung converter after 600 s. |
 | `open(path, "xb")` | make_assets.py; build.ps1 sample generator | OK: exclusive create, and it refuses a non-empty output folder. |
 | `Rename-Item $part → exiftool zip` | build.ps1 cache | OK: our own download, renamed only after the SHA-256 check. Rename-Item fails if the target exists. |
 | `Rename-Item exiftool(-k).exe` | build.ps1 | OK: inside our fresh dist copy. |

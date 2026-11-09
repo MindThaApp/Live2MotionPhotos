@@ -45,6 +45,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # CI only: this step trusts a test cert machine-wide, force-stops every running
+          # Live2Motion (a conversion could be mid-run) and uninstalls the package. Never run
+          # it on a PC that has the real app installed.
+          if ($env:GITHUB_ACTIONS -ne 'true') { throw "This step only runs on GitHub Actions (GITHUB_ACTIONS is not 'true')" }
           $id = Get-Content packaging/windows/store-identity.json -Raw | ConvertFrom-Json
           $pkgs = "$env:RUN_DIR\packages"
           Import-Certificate -FilePath "$pkgs\sideload-test-cert.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
@@ -68,7 +72,9 @@ jobs:
             if (-not (Select-String -Path $log -Pattern "packaged=True" -Quiet)) { throw "App did not detect its package identity" }
             if (-not (Select-String -Path $log -Pattern "Serving on" -Quiet)) { throw "Packaged app did not start its server" }
           } finally {
-            Get-Process Live2Motion -ErrorAction SilentlyContinue | Stop-Process -Force
+            if ($env:GITHUB_ACTIONS -eq 'true') {   # ephemeral runner only: never kill a user's running app
+              Get-Process Live2Motion -ErrorAction SilentlyContinue | Stop-Process -Force
+            }
             Start-Sleep -Seconds 2
             Remove-AppxPackage -Package $pkg.PackageFullName
           }

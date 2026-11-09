@@ -10,3 +10,7 @@ preview.json
 *.tmp
 config.json.tmp
 store-build-out/
+
+# Sideload test certificate (private key + its plain-text test password): never commit
+*.pfx
+*.pfx.password.txt
