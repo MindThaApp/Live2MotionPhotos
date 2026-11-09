@@ -50,7 +50,7 @@ except ImportError:
 from Muxer import Muxer, MuxerInputError, OutputConflictError, AlreadyConvertedError
 import run_cancel
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import env_excluded_dirs, in_excluded, is_own_temp, same_folder, inside_folder, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
+from video_removal import env_excluded_dirs, in_excluded, excluded_files, EXCLUDED_FILE_REASON, is_own_temp, same_folder, inside_folder, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
 from utils import ALREADY_CONVERTED, exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
@@ -645,6 +645,15 @@ def main():
         with open(args.only_file, encoding="utf-8") as fh:
             only_images = {str(Path(x)) for x in json.load(fh)}
 
+    if args.input_image is not None:       # one pair: refuse a file that leads into an excluded folder
+        excluded = env_excluded_dirs()
+        bad = [p for p in (args.input_image, args.input_video) if p and excluded and in_excluded(p, excluded)]
+        if bad:
+            msg = f"Refusing {bad[0]}: it {EXCLUDED_FILE_REASON}"
+            print(f"[ERROR] {msg}")
+            emit_result("(run)", "error", msg, kind="error")
+            sys.exit(2)
+
     if not args.dry_run and removal_kwargs['video_removal_mode'] == "trash" and (args.delete_video or args.overwrite):
         why = trash_unavailable_reason(args.input_directory or args.input_image)
         if why:
@@ -692,6 +701,12 @@ def main():
             # A line break in a name would be read by exiftool as extra arguments: such
             # files are never handed to it. They are reported and left alone.
             files = [f for f in files if not is_own_temp(os.path.basename(f))]   # the app's own temp files
+            # A symlinked photo/video that leads into AppData/TEMP/install folder is never touched
+            refused_links = set(excluded_files(input_directory, files, env_excluded_dirs()))
+            for f in sorted(refused_links):
+                print(f"[WARNING] Skipping {f}: {EXCLUDED_FILE_REASON}")
+                emit_result(f, "skipped", EXCLUDED_FILE_REASON, kind="skipped")
+            files = [f for f in files if f not in refused_links]
             line_break_files = [f for f in files if has_line_break(f)]
             files = [f for f in files if not has_line_break(f)]
             for f in line_break_files:

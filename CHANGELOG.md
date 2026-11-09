@@ -6,9 +6,22 @@
 - Cancel no longer kills the converter mid-file on Windows. Cancel (all platforms) and
   closing the desktop app now ask the converter to stop after the file it is working on, so
   replacing an original (set aside, then put the merged photo in place) is never cut in
-  half. Only a converter that has not stopped after 10 minutes is force-stopped.
+  half. The converter tells the app when it is inside one file's work, and it is never
+  force-stopped then, however long the file takes (e.g. a multi-GB move to a slow NAS). A
+  stuck converter is force-stopped only after 10 minutes with no progress at all
+  (`LIVE2MOTION_CANCEL_TIMEOUT`, seconds), never after a fixed time.
+- "Clean up MOVs" now stops between two files on Cancel or when the app is closing; each
+  video's copy, verify and delete still completes. The rest is reported as not processed.
+- A symlinked photo or video that leads into an excluded folder (Store build: AppData, temp,
+  install folder) is skipped and left alone.
+- The Store build never excludes a drive root (C:\\), a relative path, or the current folder
+  that Python falls back to when no temp folder is usable; skipped entries are logged.
 - Every run (manual, schedule, folder watcher, Extract) re-checks the saved input, output
-  and removal folders before it starts.
+  and removal folders before it starts. This is stricter than before: on Linux/macOS (not
+  Docker) a schedule or watcher run whose output or removal folder is not under the home,
+  Pictures or input folders, or whose input folder is missing right now (e.g. an unmounted
+  drive), is now refused with "Refusing to run" where it used to run. Re-save the settings
+  with allowed folders, or mount the drive.
 - The Microsoft Store build also refuses the temp and install folders, and a recursive scan
   never enters an excluded folder (e.g. AppData when the input is the home folder).
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import run_cancel
-from video_removal import env_excluded_dirs, in_excluded, skip_dir_name, find_embedded_video, has_line_break, LINE_BREAK_REASON
+from video_removal import env_excluded_dirs, in_excluded, excluded_files, skip_dir_name, find_embedded_video, has_line_break, LINE_BREAK_REASON
 
 EXTRACT_DIRNAME = "_extracted"   # default output folder; the converter and watcher never scan it
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".avif"}
@@ -347,7 +347,11 @@ def _collect_images(root: Path, recursive: bool) -> list:
             out += [str((Path(dirpath) / f).relative_to(root)) for f in filenames]
     else:
         out = [f for f in os.listdir(root) if (root / f).is_file()]
-    return sorted(f for f in out if Path(f).suffix.lower() in IMAGE_EXTS and not Path(f).name.startswith("."))
+    out = [f for f in out if Path(f).suffix.lower() in IMAGE_EXTS and not Path(f).name.startswith(".")]
+    refused = set(excluded_files(root, out, env_excluded_dirs()))     # symlinks into AppData/TEMP/install dir
+    for f in sorted(refused):
+        print(f"[WARNING] Skipping {f}: leads into a folder the app never uses")
+    return sorted(f for f in out if f not in refused)
 
 
 def run_extract(input_directory=None, input_image=None, output_directory=None, recursive=True,
@@ -357,8 +361,10 @@ def run_extract(input_directory=None, input_image=None, output_directory=None, r
     result per file through emit(name, status, reason, output)."""
     emit = emit or (lambda *a, **k: None)
     if input_image:
-        root = Path(input_image).resolve().parent
-        files = [Path(input_image).name]
+        root = Path(input_image).resolve().parent       # resolved: a link counts where it leads
+        files = [Path(input_image).resolve().name]
+        if excluded_files(root, files, env_excluded_dirs()):
+            raise ExtractError("the photo is in a folder the app never uses (AppData, temp or install folder)")
     else:
         root = Path(input_directory).resolve()
         files = _collect_images(root, recursive)

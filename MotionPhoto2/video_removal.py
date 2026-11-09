@@ -160,6 +160,21 @@ def in_excluded(path, excluded) -> bool:
     return any(p == x or x in p.parents for x in excluded)
 
 
+EXCLUDED_FILE_REASON = "leads into a folder the app never uses (AppData, temp or install folder); left alone"
+
+
+def excluded_files(root, rel_files, excluded) -> list:
+    """The entries of rel_files (relative to root) that really live in an excluded folder.
+    Folders are already filtered during the walk (resolved), so only a root that is itself
+    excluded (then every file) and symlinked files (resolved to where they lead) can be."""
+    if not excluded:
+        return []
+    root = Path(root)
+    if in_excluded(root, excluded):
+        return list(rel_files)
+    return [f for f in rel_files if os.path.islink(root / f) and in_excluded(root / f, excluded)]
+
+
 def skip_folders(root, folder=None) -> list:
     """Folders scans/watchers must ignore: the removal folder plus legacy default."""
     root = Path(root).resolve()

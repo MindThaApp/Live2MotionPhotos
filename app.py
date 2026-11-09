@@ -35,9 +35,14 @@ import video_removal  # noqa: E402  (shared with the muxer so all video removal 
 import run_cancel  # noqa: E402  (the converter's cooperative-cancel contract)
 
 CANCEL_FILE_ENV = run_cancel.CANCEL_FILE_ENV
+STATUS_FILE_ENV = run_cancel.STATUS_FILE_ENV
 CANCELLED_EXIT = run_cancel.CANCELLED_EXIT
-# How long Cancel / closing the app waits for the converter to finish its current file
-# before force-stopping it (a hung converter). One file normally takes seconds.
+# After Cancel / closing the app, the last-resort watchdog force-stops the converter only
+# when it has shown NO progress (no output line, no status update) for this many seconds
+# AND is not inside one file's work. While the converter reports "busy" (inside one file's
+# set-aside / publish / video removal / copy) it is never force-stopped, however long that
+# file takes (a multi-GB move to a slow NAS). Default 10 minutes of silence;
+# LIVE2MOTION_CANCEL_TIMEOUT overrides it (seconds).
 COOPERATIVE_CANCEL_TIMEOUT = float(os.environ.get("LIVE2MOTION_CANCEL_TIMEOUT") or 600)
 # Where config.json, preview.json and .port live. Defaults to the app folder; the
 # desktop (Microsoft Store) build points it at %LOCALAPPDATA%\Live2Motion because its
@@ -183,6 +188,7 @@ class RunState:
         self.history: list = []
         self.cancel_requested = False
         self.cancel_file: Optional[str] = None   # the converter stops between files once this file exists
+        self.status_file: Optional[str] = None   # the converter writes "busy"/"idle" here (run_cancel)
         self.closing = False                     # app is shutting down: no new runs of any kind
         self.dry_run = False
         self._file_log: Optional[logging.Logger] = None
@@ -199,13 +205,13 @@ class RunState:
             self.running = True
             self.trigger = trigger
             self.start_time = datetime.now().isoformat()
+            self.cancel_requested = False        # also for cleanup: a stale Cancel never stops it
             if not reset:
                 return True
             self.lines.clear()
             self.line_total = 0
             self.results.clear()
             self.result_total = 0
-            self.cancel_requested = False
             self.stats = {"total": 0, "current": 0, "converted": 0, "skipped": 0, "errors": 0, "current_file": ""}
             self.skipped_files = []
             return True
@@ -803,15 +809,21 @@ FORCE_KILL_LEFTOVERS = (
     "photo is the .mp2tmp.*.part file next to where it belongs. Nothing is deleted.")
 
 
-def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
+def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0, still_busy=None):
     """Force-stop the MotionPhoto2 child and everything it started (notably its
     exiftool helper) so it leaves no orphans. Last resort only: a normal Cancel is
     cooperative (request_cancel) and waits for the current file. On Windows this is
     TerminateProcess, which gives the converter no chance to clean up; see
-    FORCE_KILL_LEFTOVERS for what that can leave behind."""
+    FORCE_KILL_LEFTOVERS for what that can leave behind.
+    still_busy(): True while the converter is inside one file's work; then it is not
+    killed (Windows) / not SIGKILLed after the SIGTERM, which it defers until that file is
+    done (POSIX)."""
+    still_busy = still_busy or (lambda: False)
     if proc.poll() is not None:
         return
     if sys.platform == "win32":
+        if still_busy():
+            return
         # /T = the whole tree; the child gets no chance to clean up on Windows
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                        capture_output=True, check=False)
@@ -829,6 +841,11 @@ def kill_process_tree(proc: subprocess.Popen, grace: float = 5.0):
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         pass
+    while proc.poll() is None and still_busy():   # SIGTERM is deferred inside one file: let it finish
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
     try:
         os.killpg(pgid, signal.SIGKILL)       # anything still in the group (exiftool)
     except ProcessLookupError:
@@ -855,29 +872,76 @@ def _raise_cancel_flag(path: str) -> bool:
     return True
 
 
-def _cancel_watchdog(proc: subprocess.Popen, timeout: float):
-    """Last resort: force-stop a converter that did not stop within `timeout` seconds."""
+def new_status_file_path() -> str:
+    """A unique path for one run's converter status file (see run_cancel)."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), f"{run_cancel.STATUS_FILE_PREFIX}{os.getpid()}_{uuid.uuid4().hex}.txt")
+
+
+def converter_status(path: Optional[str]):
+    """(state, mtime) from the converter's status file: state "busy", "idle" or None (no
+    file: an old or not yet started converter). A file caught while being rewritten
+    (empty) counts as "busy": when in doubt, never force-stop."""
+    if not path:
+        return None, None
     try:
-        proc.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
+        mtime = os.stat(path).st_mtime_ns
+        with open(path, encoding="ascii", errors="replace") as fh:
+            text = fh.read(64)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return run_cancel.BUSY, None
+    return (run_cancel.IDLE if text.startswith(run_cancel.IDLE) else run_cancel.BUSY), mtime
+
+
+def converter_busy(path: Optional[str]) -> bool:
+    return converter_status(path)[0] == run_cancel.BUSY
+
+
+def _cancel_watchdog(proc: subprocess.Popen, status_file: Optional[str], timeout: float, poll: float = 0.5):
+    """Last resort for a hung converter. Never on wall-clock time: the converter is
+    force-stopped only after `timeout` seconds with no progress (no output line, no status
+    update) while it is NOT inside one file's work. While its status says "busy" it is never
+    force-stopped, however long the file takes."""
+    last_progress = time.monotonic()
+    lines, (state, mtime) = run_state.line_total, converter_status(status_file)
+    told_busy = False
+    while True:
+        try:
+            proc.wait(timeout=poll)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        now_lines, (state, now_mtime) = run_state.line_total, converter_status(status_file)
+        if now_lines != lines or now_mtime != mtime:
+            lines, mtime, last_progress = now_lines, now_mtime, time.monotonic()
+        if state == run_cancel.BUSY:
+            last_progress = time.monotonic()
+            if not told_busy:
+                run_state.emit("⬛ Still finishing the current file; it is never force-stopped in the middle of a file.")
+                told_busy = True
+            continue
+        if time.monotonic() - last_progress >= timeout:
+            break
     if proc.poll() is None:
-        run_state.emit(f"✗ The converter did not stop within {int(timeout)} s: force-stopping it. "
-                       + FORCE_KILL_LEFTOVERS)
-        kill_process_tree(proc)
+        run_state.emit(f"✗ The converter showed no progress for {int(timeout)} s and is not inside a file: "
+                       "force-stopping it. " + FORCE_KILL_LEFTOVERS)
+        kill_process_tree(proc, still_busy=lambda: converter_busy(status_file))
 
 
 def request_cancel() -> bool:
     """Cooperative cancel (Cancel button, closing the app, all platforms): the converter
     finishes the file it is working on and stops at the next safe point, so an overwrite
     (set the original aside, put the merged photo in place) is never cut in half. It is
-    force-stopped only if it has not ended after COOPERATIVE_CANCEL_TIMEOUT seconds.
+    force-stopped (watchdog) only after COOPERATIVE_CANCEL_TIMEOUT seconds without progress,
+    and never while it reports it is inside one file's work.
     Returns True if a run was active."""
     if not run_state.running:
         return False
     run_state.cancel_requested = True       # do_run checks it before and right after starting the converter
-    proc, flag = run_state.process, run_state.cancel_file
+    # cleanup_movs (in-process, proc None) checks it between files
+    proc, flag, status = run_state.process, run_state.cancel_file, run_state.status_file
     if proc is None or flag is None or proc.poll() is not None:
         return True
     if getattr(proc, "_l2m_cancel_asked", False):
@@ -887,7 +951,7 @@ def request_cancel() -> bool:
     # If the flag cannot be created the converter will not stop by itself; it is still never
     # killed at once (that could cut an overwrite in half), only after the timeout.
     _raise_cancel_flag(flag)
-    threading.Thread(target=_cancel_watchdog, args=(proc, COOPERATIVE_CANCEL_TIMEOUT),
+    threading.Thread(target=_cancel_watchdog, args=(proc, status, COOPERATIVE_CANCEL_TIMEOUT),
                      name="live2motion-cancel-watchdog", daemon=True).start()
     return True
 
@@ -912,15 +976,19 @@ def start_closing() -> bool:
 def begin_shutdown(timeout: Optional[float] = None) -> bool:
     """The app is closing: refuse every new run (manual, schedule, watcher, cleanup),
     cooperatively cancel the active one and wait until it has ended, so the converter is
-    never left running without the app. Returns True once nothing runs."""
+    never left running without the app. Returns True once nothing runs.
+    timeout None (the app): wait as long as it takes; the cancel watchdog force-stops a
+    converter only after a long time without progress and never inside one file's work.
+    With a timeout (tests, tools): after it, a converter still running is force-stopped
+    only if it is not inside one file's work; while it is, this keeps waiting."""
     start_closing()
-    if timeout is None:
-        timeout = COOPERATIVE_CANCEL_TIMEOUT + 60    # the watchdog force-stops a hung converter before this
-    if wait_until_idle(timeout):
+    if wait_until_idle(float("inf") if timeout is None else timeout):
         return True
-    proc = run_state.process
+    proc, status = run_state.process, run_state.status_file
+    while proc is not None and proc.poll() is None and converter_busy(status):
+        time.sleep(0.2)                              # never cut one file's work in half
     if proc is not None and proc.poll() is None:     # never orphan the child
-        kill_process_tree(proc)
+        kill_process_tree(proc, still_busy=lambda: converter_busy(status))
     return wait_until_idle(15)
 
 
@@ -1224,8 +1292,18 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         run_state.emit(f"✗ MotionPhoto2 entry point not found: {entry}")
         run_state.finish(127)
         return
-    cancel_file = new_cancel_file_path()
-    run_state.cancel_file = cancel_file
+    cancel_file, status_file = new_cancel_file_path(), new_status_file_path()
+    run_state.cancel_file, run_state.status_file = cancel_file, status_file
+
+    def end_run(code: int):
+        # Forget this run's flag files BEFORE finish() gives the run lock back, and only if
+        # they are still this run's: a run started right after must keep its own.
+        with run_state._lock:
+            if run_state.cancel_file == cancel_file:
+                run_state.cancel_file = None
+            if run_state.status_file == status_file:
+                run_state.status_file = None
+        run_state.finish(code)
     try:
         # utf-8 + errors="replace": the child forces UTF-8 output, and non-ASCII
         # (e.g. Windows) filenames must not abort the read loop.
@@ -1235,7 +1313,7 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
-            env={**os.environ, CANCEL_FILE_ENV: cancel_file}, **group,
+            env={**os.environ, CANCEL_FILE_ENV: cancel_file, STATUS_FILE_ENV: status_file}, **group,
         )
         run_state.process = proc
         if run_state.cancel_requested:   # cancelled while the process was starting
@@ -1253,13 +1331,12 @@ def do_run(trigger: str = "manual", dry_run: Optional[bool] = None, extract: Opt
             # a cancelled run reports "converted" only for photos it finished completely
             mark_preview_done(preview_id, [r["file"] for _, r in run_state.read_results(0)[0]
                                            if r["status"] == "converted"])
-        run_state.finish(proc.returncode)
+        end_run(proc.returncode)
     except Exception as exc:
         run_state.emit(f"✗ Exception: {exc}")
-        run_state.finish(-1)
+        end_run(-1)
     finally:
-        run_state.cancel_file = None
-        for own in (only_path, cancel_file):     # both are this run's own temp files
+        for own in (only_path, cancel_file, status_file):     # all are this run's own temp files
             if own:
                 try:
                     os.remove(own)
@@ -1625,10 +1702,20 @@ def _after_cleanup(row: dict, kind: str):
 
 
 def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
+    """Remove verified leftover videos one by one. Cancel and closing the app are honoured
+    between two files only: each file's verify + copy + verify + delete (remove_video) is
+    never interrupted; the rest is reported as not processed."""
     cleaned, refused, errors, skipped = [], [], [], []
     mode = cfg.get("video_removal_mode")
     gone = []
-    for f in dict.fromkeys(files):
+    todo = list(dict.fromkeys(files))
+    not_processed: list = []
+    for n, f in enumerate(todo):
+        if run_state.cancel_requested or run_state.closing:      # safe point: between two files
+            not_processed = todo[n:]
+            run_state.emit(f"⬛ Cleanup stopped on request after {n} of {len(todo)} file(s); "
+                           f"{len(not_processed)} not processed (nothing was left half done).")
+            break
         row = rowmap[f]
         kind = classify_row(row)
         if kind not in ("motion_leftover", "duplicate_video") or not row.get("video") \
@@ -1673,7 +1760,8 @@ def cleanup_movs(files: list, rowmap: dict, cfg: dict, root: Path) -> dict:
         except (OSError, KeyError):
             pass
     return {"ok": True, "cleaned": len(cleaned), "details": cleaned, "refused": refused,
-            "errors": errors, "skipped": skipped}
+            "errors": errors, "skipped": skipped, "stopped": bool(not_processed),
+            "not_processed": not_processed}
 
 
 @app.post("/api/run")

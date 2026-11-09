@@ -80,15 +80,40 @@ def appdata_dirs(env=None) -> list:
     return out
 
 
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _exclusion_problem(path: str) -> str:
+    """Why `path` must not become an exclusion ("" = fine): a drive root (C:\\) or a
+    relative path would exclude far too much (every run would be refused)."""
+    p = Path(path)
+    if not p.is_absolute():
+        return "not an absolute path"
+    if p.parent == p:
+        return "a drive root"
+    return ""
+
+
 def packaged_excluded_dirs(env=None) -> list:
     """Everything the packaged app never uses as input/output and never scans into: the
     AppData folders, the temp folder(s) (may be redirected outside AppData) and the
-    read-only install folder."""
+    read-only install folder. Never added (each is logged): a drive root, a relative path,
+    and tempfile.gettempdir() when it is only its last-resort fallback, the current folder."""
     env = os.environ if env is None else env
-    out = appdata_dirs(env)
-    for c in (env.get("TEMP"), env.get("TMP"), tempfile.gettempdir(), str(install_dir())):
-        if c and c not in out:
-            out.append(c)
+    temp = tempfile.gettempdir()
+    if _same_path(temp, os.getcwd()) and not any(e and _same_path(temp, e) for e in (env.get("TEMP"), env.get("TMP"))):
+        print(f"Not excluding {temp!r}: it is the current folder (no usable temp folder)", flush=True)
+        temp = None
+    out = []
+    for c in appdata_dirs(env) + [env.get("TEMP"), env.get("TMP"), temp, str(install_dir())]:
+        if not c or c in out:
+            continue
+        why = _exclusion_problem(c)
+        if why:
+            print(f"Not excluding {c!r}: {why}", flush=True)
+            continue
+        out.append(c)
     return out
 
 

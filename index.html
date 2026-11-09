@@ -1169,7 +1169,8 @@ async function doCleanup(files) {
   let msg = `Cleaned up ${res.cleaned} MOV${res.cleaned !== 1 ? 's' : ''}`;
   if (res.refused?.length) msg += `; ${res.refused.length} refused (${res.refused[0].reason})`;
   if (res.errors?.length) msg += `; ${res.errors.length} failed`;
-  flash(msg, !!(res.refused?.length || res.errors?.length));
+  if (res.stopped) msg += `; stopped on request, ${res.not_processed.length} not processed`;
+  flash(msg, !!(res.refused?.length || res.errors?.length || res.stopped));
   await showSelBar();
 }
 function addResult(r) {

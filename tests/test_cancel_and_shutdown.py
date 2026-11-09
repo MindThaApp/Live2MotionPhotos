@@ -24,10 +24,11 @@ pytest.importorskip("lxml")
 pytest.importorskip("httpx")
 
 import extract  # noqa: E402
+import video_removal  # noqa: E402
 import Muxer as muxer_mod  # noqa: E402
 import motionphoto2 as mp  # noqa: E402
 import run_cancel  # noqa: E402
-from test_preview_filters import JPEG, VIDEO, FakeET  # noqa: E402
+from test_preview_filters import JPEG, VIDEO, FakeET, motion_photo_bytes  # noqa: E402
 
 import app as appmod  # noqa: E402
 import live2motion_desktop as desk  # noqa: E402
@@ -37,8 +38,9 @@ import live2motion_desktop as desk  # noqa: E402
 def _clean_state(monkeypatch):
     run_cancel.reset()
     monkeypatch.delenv(run_cancel.CANCEL_FILE_ENV, raising=False)
+    monkeypatch.delenv(run_cancel.STATUS_FILE_ENV, raising=False)
     monkeypatch.delenv("LIVE2MOTION_EXCLUDED_DIRS", raising=False)
-    for attr in ("closing", "running", "process", "cancel_requested", "cancel_file"):
+    for attr in ("closing", "running", "process", "cancel_requested", "cancel_file", "status_file"):
         monkeypatch.setattr(appmod.run_state, attr, getattr(appmod.run_state, attr))
     monkeypatch.setattr(appmod.run_state, "closing", False)
     yield
@@ -136,7 +138,18 @@ def test_cancel_during_overwrite_finishes_that_photo_then_stops(tmp_path, monkey
     make_pairs(root)
     flag = tmp_path / "stop.flag"
     monkeypatch.setenv(run_cancel.CANCEL_FILE_ENV, str(flag))
-    calls = _cancel_during_set_aside(monkeypatch, lambda: flag.write_text(""))
+    status = tmp_path / "l2m_status_test.txt"
+    monkeypatch.setenv(run_cancel.STATUS_FILE_ENV, str(status))
+    seen_status = []
+
+    def trigger():
+        flag.write_text("")
+        seen_status.append(status.read_text().split()[0])
+        # a safe point reached while this photo is being set aside (as if a nested helper
+        # called it): it must not stop the run here. Without critical() around the photo's
+        # work this exits mid-file and the asserts below fail.
+        run_cancel.checkpoint()
+    calls = _cancel_during_set_aside(monkeypatch, trigger)
     FakeET.ids = {f"p{i}.{e}": f"ID{i}" for i in range(3) for e in ("jpg", "mov")} if match else {}
     try:
         code, out, rows = run_engine(root, monkeypatch, capsys, "--overwrite", "--delete-video",
@@ -156,6 +169,32 @@ def test_cancel_during_overwrite_finishes_that_photo_then_stops(tmp_path, monkey
         if f"p{i}" != first:
             assert (root / f"p{i}.jpg").read_bytes() == JPEG and (root / f"p{i}.mov").read_bytes() == VIDEO
     assert no_temp_left(root)
+    assert seen_status == [run_cancel.BUSY]                       # the app was told: inside a file
+    assert status.read_text().startswith(run_cancel.IDLE)         # and told again once it was done
+
+
+def test_status_file_says_busy_only_inside_one_file(tmp_path, monkeypatch):
+    status = tmp_path / "l2m_status_test.txt"
+    monkeypatch.setenv(run_cancel.STATUS_FILE_ENV, str(status))
+    run_cancel.checkpoint()
+    assert status.read_text().startswith(run_cancel.IDLE)
+    with run_cancel.critical():
+        assert status.read_text().startswith(run_cancel.BUSY)
+        with run_cancel.critical():                               # nested: still busy
+            pass
+        assert status.read_text().startswith(run_cancel.BUSY)
+    assert status.read_text().startswith(run_cancel.IDLE)
+    assert appmod.converter_status(str(status))[0] == run_cancel.IDLE
+    status.write_text("")                                         # caught mid-rewrite: assume busy
+    assert appmod.converter_busy(str(status))
+    assert appmod.converter_status(str(tmp_path / "none.txt")) == (None, None)
+    other = tmp_path / "photo.jpg"                                # never rewrites any other file
+    other.write_bytes(JPEG)
+    monkeypatch.setenv(run_cancel.STATUS_FILE_ENV, str(other))
+    run_cancel.reset()
+    with run_cancel.critical():
+        pass
+    assert other.read_bytes() == JPEG
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal")
@@ -263,9 +302,19 @@ def test_recursive_walk_skips_a_link_into_an_excluded_dir(tmp_path, monkeypatch,
 FAKE_CONVERTER = textwrap.dedent("""
     import os, sys, time
     flag = os.environ["LIVE2MOTION_CANCEL_FILE"]
-    ignore = os.environ.get("FAKE_IGNORE_CANCEL") == "1"
+    status = os.environ.get("LIVE2MOTION_STATUS_FILE")
+    mode = os.environ.get("FAKE_MODE", "cooperative")
     for i in range(400):
-        if not ignore and os.path.exists(flag):
+        if os.path.exists(flag):
+            if mode == "hang":               # stuck between files: silent, never ends
+                while True:
+                    time.sleep(1)
+            if mode == "busy":               # one very slow file (multi-GB move): silent but busy
+                with open(status, "w") as fh:
+                    fh.write("busy")
+                time.sleep(float(os.environ.get("FAKE_BUSY_SECONDS", "3")))
+                with open(status, "w") as fh:
+                    fh.write("idle")
             print("[CANCELLED] stopped", flush=True)
             sys.exit(4)
         print(f"file {i}", flush=True)
@@ -315,7 +364,7 @@ def test_cancel_is_cooperative_and_never_force_kills(fake_app, monkeypatch):
 
 
 def test_watchdog_force_stops_only_a_hung_converter(fake_app, monkeypatch):
-    monkeypatch.setenv("FAKE_IGNORE_CANCEL", "1")
+    monkeypatch.setenv("FAKE_MODE", "hang")
     monkeypatch.setattr(appmod, "COOPERATIVE_CANCEL_TIMEOUT", 0.5)
     killed = []
     real = appmod.kill_process_tree
@@ -325,6 +374,82 @@ def test_watchdog_force_stops_only_a_hung_converter(fake_app, monkeypatch):
     t.join(20)
     assert not t.is_alive() and len(killed) == 1
     assert "force-stopping it" in "\n".join(appmod.run_state.lines)
+
+
+def test_watchdog_never_kills_during_a_long_file(fake_app, monkeypatch):
+    """No output for 3 s (6x the timeout) while the converter says it is inside one file:
+    never force-stopped; it ends by itself after that file."""
+    monkeypatch.setenv("FAKE_MODE", "busy")
+    monkeypatch.setattr(appmod, "COOPERATIVE_CANCEL_TIMEOUT", 0.5)
+    killed = []
+    monkeypatch.setattr(appmod, "kill_process_tree", lambda p, *a, **k: killed.append(p))
+    t = start_run()
+    appmod.request_cancel()
+    t.join(30)
+    assert not t.is_alive() and not killed
+    log = "\n".join(appmod.run_state.lines)
+    assert "never force-stopped in the middle of a file" in log and "force-stopping it" not in log
+    assert appmod.run_state.history[0]["exit_code"] == run_cancel.CANCELLED_EXIT
+
+
+def test_shutdown_timeout_never_kills_during_a_long_file(fake_app, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "busy")
+    monkeypatch.setattr(appmod, "COOPERATIVE_CANCEL_TIMEOUT", 60)
+    killed = []
+    monkeypatch.setattr(appmod, "kill_process_tree", lambda p, *a, **k: killed.append(p))
+    t = start_run()
+    proc = appmod.run_state.process
+    assert appmod.begin_shutdown(timeout=0.5)               # timeout passes while busy: keeps waiting
+    assert proc.returncode == run_cancel.CANCELLED_EXIT and not killed
+    t.join(5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_kill_process_tree_waits_for_a_busy_converter_after_sigterm(tmp_path):
+    """POSIX: the converter defers SIGTERM inside one file; no SIGKILL while it is busy."""
+    status = tmp_path / "l2m_status_test.txt"
+    status.write_text("busy")
+    script = tmp_path / "busy.py"
+    script.write_text(textwrap.dedent(f"""
+        import signal, sys, time
+        signal.signal(signal.SIGTERM, lambda *a: None)      # deferred, like run_cancel inside critical()
+        print("ready", flush=True)
+        time.sleep(2)
+        open({str(status)!r}, "w").write("idle")
+        sys.exit(4)
+    """))
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    assert proc.stdout.readline().strip() == "ready"
+    appmod.kill_process_tree(proc, grace=0.2, still_busy=lambda: appmod.converter_busy(str(status)))
+    assert proc.wait(5) == 4                                 # finished its file, was not SIGKILLed
+
+
+def test_finished_run_never_clears_the_next_runs_cancel_file(fake_app, monkeypatch):
+    """Finding 2: a run that starts right after finish() keeps its own cancel file."""
+    real_finish = appmod.run_state.finish
+
+    def finish(code):
+        real_finish(code)
+        appmod.run_state.cancel_file = "next-run.flag"      # the next run took the lock and set its flag
+        appmod.run_state.status_file = "next-run.status"
+    monkeypatch.setattr(appmod.run_state, "finish", finish)
+    t = start_run()
+    appmod.request_cancel()
+    t.join(20)
+    assert not t.is_alive()
+    assert appmod.run_state.cancel_file == "next-run.flag"
+    assert appmod.run_state.status_file == "next-run.status"
+
+
+def test_finished_run_clears_its_own_cancel_file_before_releasing(fake_app, monkeypatch):
+    seen = []
+    real_finish = appmod.run_state.finish
+    monkeypatch.setattr(appmod.run_state, "finish",
+                        lambda code: (seen.append(appmod.run_state.cancel_file), real_finish(code)))
+    t = start_run()
+    appmod.request_cancel()
+    t.join(20)
+    assert seen == [None] and appmod.run_state.cancel_file is None
 
 
 def test_api_cancel_does_not_kill(fake_app, monkeypatch):
@@ -359,6 +484,79 @@ def test_shutdown_refuses_new_runs_and_waits_for_the_active_one(fake_app, monkey
     with TestClient(appmod.app, base_url="http://localhost:7000") as c:
         r = c.post("/api/run")
         assert r.status_code == 409 and "closing" in r.json()["error"]
+
+
+def test_closing_while_a_schedule_run_is_starting_runs_nothing(fake_app, monkeypatch):
+    """Closing lands after the schedule run took the lock but before the converter started."""
+    spawned = []
+    monkeypatch.setattr(appmod.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    real_check = appmod.assert_run_paths
+
+    def check(cfg):
+        real_check(cfg)
+        assert appmod.start_closing()                        # the window was closed right now
+    monkeypatch.setattr(appmod, "assert_run_paths", check)
+    appmod.do_run("schedule")
+    assert not spawned and appmod.run_state.history[0]["exit_code"] == run_cancel.CANCELLED_EXIT
+    assert appmod.begin_shutdown(timeout=5)
+    appmod.do_run("watch")                                   # and nothing starts afterwards
+    assert not spawned and not appmod.run_state.running
+
+
+def test_closing_while_the_converter_is_being_started(fake_app, monkeypatch):
+    """Closing lands while Popen runs: the converter is asked to stop at once and does."""
+    killed = []
+    monkeypatch.setattr(appmod, "kill_process_tree", lambda p, *a, **k: killed.append(p))
+    real_popen = appmod.subprocess.Popen
+
+    in_popen = threading.Event()
+
+    def popen(*a, **k):
+        appmod.start_closing()                               # process not registered yet
+        in_popen.set()
+        return real_popen(*a, **k)
+    monkeypatch.setattr(appmod.subprocess, "Popen", popen)
+    t = threading.Thread(target=appmod.do_run, args=("schedule",), daemon=True)
+    t.start()
+    assert in_popen.wait(20)
+    assert appmod.begin_shutdown(timeout=20)
+    t.join(5)
+    assert appmod.run_state.history[0]["exit_code"] == run_cancel.CANCELLED_EXIT and not killed
+    assert "Cancelled: stopped after the current file" in "\n".join(appmod.run_state.lines)
+
+
+@pytest.mark.parametrize("how", ["cancel", "closing"])
+def test_cleanup_stops_between_files(tmp_path, monkeypatch, how):
+    root = tmp_path / "in"
+    root.mkdir()
+    rows = {}
+    for i in range(3):
+        (root / f"m{i}.jpg").write_bytes(motion_photo_bytes())
+        (root / f"m{i}.mov").write_bytes(VIDEO)
+        rows[f"m{i}.jpg"] = {"file": f"m{i}.jpg", "status": "skipped", "kind": "motion_leftover",
+                             "video": f"m{i}.mov", "reason": "already a motion photo"}
+    monkeypatch.setenv("LIVE2MOTION_BROWSE_ROOTS", str(tmp_path))
+    monkeypatch.setattr(appmod, "_save_preview", lambda: None)
+    real = video_removal.remove_video
+    removed = []
+
+    def remove(path, *a, **k):
+        removed.append(Path(path).name)
+        appmod.start_closing() if how == "closing" else appmod.request_cancel()   # arrives mid-file
+        return real(path, *a, **k)
+    monkeypatch.setattr(appmod.video_removal, "remove_video", remove)
+    appmod.run_state.cancel_requested = True                 # a stale Cancel from an earlier run...
+    assert appmod.run_state.start("cleanup", reset=False)    # ...is forgotten when cleanup starts
+    try:
+        res = appmod.cleanup_movs(list(rows), rows, {"video_removal_mode": "move"}, root)
+    finally:
+        appmod.run_state.release()
+    assert removed == ["m0.mov"] and res["cleaned"] == 1     # the started file went all the way
+    assert res["stopped"] and res["not_processed"] == ["m1.jpg", "m2.jpg"]
+    assert (root / "_originals" / "m0.mov").read_bytes() == VIDEO and not (root / "m0.mov").exists()
+    assert (root / "m1.mov").read_bytes() == VIDEO and (root / "m2.mov").read_bytes() == VIDEO
+    assert no_temp_left(root)
+    assert "Cleanup stopped on request after 1 of 3" in appmod.run_state.lines[-1]
 
 
 def test_cancel_before_converter_starts_runs_nothing(fake_app, monkeypatch):
@@ -478,6 +676,50 @@ def test_bind_sets_exclusive_addr_use_on_windows(monkeypatch):
     monkeypatch.setattr(desk.sys, "platform", "win32")
     desk.bind_loopback_socket(47821)
     assert opts == [(socket.SOL_SOCKET, desk.SO_EXCLUSIVEADDRUSE, 1)]
+
+
+def test_packaged_exclusions_never_add_a_root_relative_or_cwd_fallback(tmp_path, monkeypatch, capsys):
+    import tempfile
+    root = Path(tmp_path.anchor)
+    env = {"LOCALAPPDATA": str(tmp_path / "L"), "TEMP": str(root), "TMP": "relative\\tmp"}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))      # tempfile fell back to cwd
+    excluded = desk.packaged_excluded_dirs(env)
+    assert str(root) not in excluded and "relative\\tmp" not in excluded and str(tmp_path) not in excluded
+    assert str(tmp_path / "L") in excluded and str(desk.install_dir()) in excluded
+    out = capsys.readouterr().out
+    assert "a drive root" in out and "not an absolute path" in out and "current folder" in out
+    env["TEMP"] = str(tmp_path)                              # a real TEMP that happens to be cwd: kept
+    assert str(tmp_path) in desk.packaged_excluded_dirs(env)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink needs privileges on Windows")
+def test_symlinked_files_into_an_excluded_dir_are_left_alone(tmp_path, monkeypatch, capsys):
+    secret = tmp_path / "AppData"
+    secret.mkdir()
+    (secret / "s.jpg").write_bytes(JPEG)
+    (secret / "s.mov").write_bytes(VIDEO)
+    home = tmp_path / "home"
+    make_pairs(home, 1)
+    (home / "link.jpg").symlink_to(secret / "s.jpg")
+    (home / "link.mov").symlink_to(secret / "s.mov")
+    monkeypatch.setenv("LIVE2MOTION_EXCLUDED_DIRS", str(secret))
+    code, out, rows = run_engine(home, monkeypatch, capsys, "--overwrite", "--delete-video",
+                                 "--video-removal-mode", "move")
+    by = {r["file"]: r for r in rows}
+    assert by["link.jpg"]["status"] == "skipped" and "never uses" in by["link.jpg"]["reason"]
+    assert by["p0.jpg"]["status"] == "converted"
+    assert (home / "link.jpg").is_symlink() and (home / "link.mov").is_symlink()
+    assert (secret / "s.jpg").read_bytes() == JPEG and (secret / "s.mov").read_bytes() == VIDEO
+    assert extract._collect_images(home.resolve(), False) == ["p0.jpg"]
+    with pytest.raises(extract.ExtractError, match="never uses"):
+        extract.run_extract(None, str(home / "link.jpg"), None, False, dry_run=True)
+    monkeypatch.setattr(sys, "argv", ["mp", "--input-image", str(home / "link.jpg"),
+                                      "--input-video", str(home / "p0.mov"), "--dry-run"])
+    monkeypatch.setattr(mp.exiftool, "ExifToolHelper", FakeET)
+    with pytest.raises(SystemExit) as e:
+        mp.main()
+    assert e.value.code == 2 and "Refusing" in capsys.readouterr().out
 
 
 def test_packaged_exclusions_cover_temp_and_install_dir(tmp_path):
