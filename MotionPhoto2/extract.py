@@ -16,7 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from video_removal import skip_dir_name, find_embedded_video, has_line_break, LINE_BREAK_REASON
+import run_cancel
+from video_removal import env_excluded_dirs, in_excluded, skip_dir_name, find_embedded_video, has_line_break, LINE_BREAK_REASON
 
 EXTRACT_DIRNAME = "_extracted"   # default output folder; the converter and watcher never scan it
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".heif", ".avif"}
@@ -338,9 +339,11 @@ def extract_one(photo: str, out_dir: str, make_mov: bool = False, strip_still: b
 def _collect_images(root: Path, recursive: bool) -> list:
     out = []
     if recursive:
+        excluded = env_excluded_dirs()      # Store build: AppData, TEMP, install dir
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != EXTRACT_DIRNAME
-                           and not skip_dir_name(d)]
+                           and not skip_dir_name(d)
+                           and not (excluded and in_excluded(Path(dirpath) / d, excluded))]
             out += [str((Path(dirpath) / f).relative_to(root)) for f in filenames]
     else:
         out = [f for f in os.listdir(root) if (root / f).is_file()]
@@ -366,6 +369,7 @@ def run_extract(input_directory=None, input_image=None, output_directory=None, r
     if et is None and not dry_run:
         print("[INFO] exiftool not found: capture date/GPS will not be copied to the videos")
     for i, rel in enumerate(files, 1):
+        run_cancel.checkpoint()     # safe point: between two files
         photo = str(root / rel)
         print(f"=========================[{i}/{len(files)}]")
         print(f"- Processing {rel}")
@@ -381,7 +385,8 @@ def run_extract(input_directory=None, input_image=None, output_directory=None, r
             continue
         try:
             data, loc = plan_extract(photo, et)
-            res = extract_one(photo, out_dir, make_mov, strip_still, et, dry_run, data, loc)
+            with run_cancel.critical():
+                res = extract_one(photo, out_dir, make_mov, strip_still, et, dry_run, data, loc)
         except ExtractError as e:
             print(f"{rel} is not a motion photo, skipping..." if str(e) == "not a motion photo"
                   else f"[WARNING] Skipping {rel}: {e}")

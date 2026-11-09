@@ -48,8 +48,9 @@ except ImportError:
             return group
 
 from Muxer import Muxer, MuxerInputError, OutputConflictError, AlreadyConvertedError
+import run_cancel
 from extract import EXTRACT_DIRNAME, ExtractError, exiftool_available, run_extract
-from video_removal import is_own_temp, same_folder, inside_folder, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
+from video_removal import env_excluded_dirs, in_excluded, is_own_temp, same_folder, inside_folder, removal_folder, skip_dir_name, trash_unavailable_reason, TRASH_HINT, numbered_name, publish_no_overwrite, has_line_break, LINE_BREAK_REASON, normalize_mode, skip_folders, describe_destination, check_bin, BinTooBig, file_size
 from utils import ALREADY_CONVERTED, exiftool_message, enrich_fname, is_motion_photo, extract_video_from_image, input_output_binary_compare, load_defaults, save_defaults, \
     output_with_extension, output_conflict, claim_output
 
@@ -671,10 +672,13 @@ def main():
             files = []
             if args.recursive:
                 # Recursive mode: walk through all subdirectories
+                excluded = env_excluded_dirs()
                 for root, dirnames, filenames in os.walk(input_directory):
-                    # never rescan videos that were moved aside by --delete-video
+                    # never rescan videos that were moved aside by --delete-video, and never
+                    # enter a folder the app must not use (Store build: AppData, TEMP, install dir)
                     dirnames[:] = [d for d in dirnames if d != EXTRACT_DIRNAME and not skip_dir_name(d)
-                                   and str((Path(root) / d).resolve()) not in skip_folders_]
+                                   and str((Path(root) / d).resolve()) not in skip_folders_
+                                   and not (excluded and in_excluded(Path(root) / d, excluded))]
                     for filename in filenames:
                         full_path = Path(root) / filename
                         rel_path = full_path.relative_to(input_directory)
@@ -769,9 +773,11 @@ def main():
                     guard_bin(args, removal_kwargs, est_bytes, est_items, input_directory)
 
                 i = 0
+                run_cancel.checkpoint()
                 for image in images:
                     if image not in selected:
                         continue        # only counted above (photos_left), not converted
+                    run_cancel.checkpoint()     # safe point: between two files
                     i += 1
                     image_path = Path(image)
                     fname = str(image_path.with_suffix(''))
@@ -852,8 +858,9 @@ def main():
                                         verbose=args.verbose,
                                         claimed_outputs=claimed_outputs,
                                     )
-                                    muxer.mux()
-                                    after_mux(image, muxer)
+                                    with run_cancel.critical():     # set aside + publish + video removal: never interrupted
+                                        muxer.mux()
+                                        after_mux(image, muxer)
                             except AlreadyConvertedError as e:
                                 blocked_videos.add(video)
                                 print(f"Skipping {image}: {e}")
@@ -922,9 +929,11 @@ def main():
 
                 # Match images to videos
                 i = 0
+                run_cancel.checkpoint()
                 for img_idx, (img, img_meta) in enumerate(zip(images, image_metadatas)):
                     if img not in selected:
                         continue        # only counted above (photos_left), not converted
+                    run_cancel.checkpoint()     # safe point: between two files
                     i += 1
                     if img_idx in image_errors:
                         print(f"[WARNING] Cannot read {img}: {image_errors[img_idx]}")
@@ -1025,8 +1034,9 @@ def main():
                                     verbose=args.verbose,
                                     claimed_outputs=claimed_outputs,
                                 )
-                                muxer.mux()
-                                after_mux(img, muxer)
+                                with run_cancel.critical():     # set aside + publish + video removal: never interrupted
+                                    muxer.mux()
+                                    after_mux(img, muxer)
                         except AlreadyConvertedError as e:
                             blocked_videos.add(video)
                             print(f"Skipping {img}: {e}")
@@ -1056,6 +1066,7 @@ def main():
                 print("=" * 25)
                 print("Copying unmuxed files...")
                 for file in itertools.chain(unmatched_images, videos, unsupported):
+                    run_cancel.checkpoint()
                     # Handle output directory structure
                     output_subdirectory = args.output_directory
                     if output_subdirectory is not None:
@@ -1068,7 +1079,8 @@ def main():
                         print(f"[DRY-RUN] Would copy {file} to {output_subdirectory}")
                         continue
                     print(f"Copying {file} to {output_subdirectory}")
-                    copy_unmuxed_file(input_directory / file, output_subdirectory / file_path.name, args.verbose)
+                    with run_cancel.critical():
+                        copy_unmuxed_file(input_directory / file, output_subdirectory / file_path.name, args.verbose)
             print("=" * 25)
 
             if not args.dry_run:
@@ -1098,14 +1110,15 @@ def main():
                 no_xmp=args.no_xmp,
                 verbose=args.verbose,
             )
-            muxer.mux()
-            emit_result(args.input_image, "converted", output=muxer.output_fpath)
+            with run_cancel.critical():
+                muxer.mux()
+                emit_result(args.input_image, "converted", output=muxer.output_fpath)
 
 if __name__ == "__main__":
-    # Cancel from the web UI sends SIGTERM: exit normally so temp files are removed
-    # and the exiftool helper is shut down instead of being orphaned.
-    import signal
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    # The app cancels through the LIVE2MOTION_CANCEL_FILE flag (checked between files, see
+    # run_cancel.py). SIGTERM still works: between files it exits normally so temp files are
+    # removed and the exiftool helper is shut down; during one file's work it waits for it.
+    run_cancel.install_sigterm_handler()
     if len(sys.argv) == 1:
         try:
             from gooey import Gooey

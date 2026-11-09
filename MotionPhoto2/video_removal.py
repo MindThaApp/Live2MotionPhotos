@@ -132,6 +132,34 @@ def skip_dir_name(name: str) -> bool:
             or low.startswith(".trash"))
 
 
+EXCLUDED_DIRS_ENV = "LIVE2MOTION_EXCLUDED_DIRS"
+
+
+def env_excluded_dirs() -> list:
+    """Folders never used as input/output and never entered by a scan: LIVE2MOTION_EXCLUDED_DIRS
+    (os.pathsep separated, resolved). The Microsoft Store build sets it (AppData, TEMP, the
+    install folder); elsewhere it is normally empty."""
+    out = []
+    for c in os.environ.get(EXCLUDED_DIRS_ENV, "").split(os.pathsep):
+        try:
+            if c.strip():
+                p = Path(c.strip()).expanduser().resolve()
+                if p not in out:
+                    out.append(p)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return out
+
+
+def in_excluded(path, excluded) -> bool:
+    """Is path (resolved, so links/junctions count where they lead) one of `excluded` or below one?"""
+    try:
+        p = Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True          # cannot tell where it leads: do not enter it
+    return any(p == x or x in p.parents for x in excluded)
+
+
 def skip_folders(root, folder=None) -> list:
     """Folders scans/watchers must ignore: the removal folder plus legacy default."""
     root = Path(root).resolve()
